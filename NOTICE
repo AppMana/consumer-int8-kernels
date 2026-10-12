@@ -1,0 +1,15 @@
+consumer-int8-kernels
+
+The integer MMA fragment mapping in csrc/kernels.cu is adapted from
+AppMana/forks-flash-mla-int, csrc/debug_imma_sm80.cu (Apache-2.0).
+https://github.com/AppMana/forks-flash-mla-int
+
+The Gated DeltaNet decode work partition (four value rows per warp) follows
+Don-Chad/ninfer-3090, src/ops/linear_attention/gated_delta_net/recurrent.cuh
+at d7277e88cc3a56d2967d5d533f148bed36e97df5 (Apache-2.0).
+https://github.com/Don-Chad/ninfer-3090
+
+The checkpoint channel and group32 encodings match the AppMana vLLM fork's
+dsv4_int.py and common/vision_int8.py at
+899ced4cf9a4f33f6c0903f3e1858246c63f9fbd (Apache-2.0).
+https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms

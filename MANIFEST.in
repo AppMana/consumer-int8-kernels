@@ -1,0 +1,4 @@
+include LICENSE NOTICE
+recursive-include csrc *.cpp *.cu *.h
+include third_party/cutlass/LICENSE.txt
+recursive-include third_party/cutlass/include *.h *.hpp *.cuh

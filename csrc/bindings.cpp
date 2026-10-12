@@ -1,0 +1,226 @@
+// SPDX-License-Identifier: Apache-2.0
+#include <Python.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/inductor/aoti_torch/c/shim.h>
+#include <torch/headeronly/util/Exception.h>
+#include <limits>
+#include "kernels.h"
+
+using torch::stable::Tensor;
+using torch::headeronly::ScalarType;
+
+namespace {
+void check(const Tensor& t, ScalarType dtype, int device) {
+  STD_TORCH_CHECK(t.is_cuda() && t.get_device_index() == device,
+                  "All tensors must be on the same CUDA device");
+  STD_TORCH_CHECK(t.is_contiguous() && t.scalar_type() == dtype,
+                  "Unexpected dtype or noncontiguous tensor");
+}
+cudaStream_t stream_for(int device) {
+  void* stream = nullptr;
+  TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device, &stream));
+  return reinterpret_cast<cudaStream_t>(stream);
+}
+void launch_check() {
+  const auto error = cudaGetLastError();
+  STD_TORCH_CHECK(error == cudaSuccess, cudaGetErrorString(error));
+}
+void boxed_quant(StableIValue* stack, uint64_t, uint64_t) {
+  auto x = to<Tensor>(stack[0]);
+  auto codes = to<Tensor>(stack[1]);
+  auto scale = to<Tensor>(stack[2]);
+  const int device = x.get_device_index();
+  check(x, ScalarType::BFloat16, device);
+  check(codes, ScalarType::Char, device);
+  check(scale, ScalarType::Float, device);
+  STD_TORCH_CHECK(x.dim() == 2 && x.size(0) > 0 && x.size(1) > 0,
+                  "Expected a nonempty BF16 matrix");
+  STD_TORCH_CHECK(codes.sizes() == x.sizes() && scale.dim() == 1 &&
+                  scale.size(0) == x.size(0), "Wrong output shapes");
+  STD_TORCH_CHECK(x.numel() <= std::numeric_limits<int>::max(), "Matrix too large");
+  torch::stable::accelerator::DeviceGuard guard(device);
+  quantize_rows(x.data_ptr(), static_cast<int8_t*>(codes.data_ptr()),
+                static_cast<float*>(scale.data_ptr()), x.size(0), x.size(1),
+                stream_for(device));
+  launch_check();
+}
+void boxed_mm(StableIValue* stack, uint64_t, uint64_t) {
+  auto a = to<Tensor>(stack[0]);
+  auto w = to<Tensor>(stack[1]);
+  auto sa = to<Tensor>(stack[2]);
+  auto sw = to<Tensor>(stack[3]);
+  auto out = to<Tensor>(stack[4]);
+  const int device = a.get_device_index();
+  check(a, ScalarType::Char, device);
+  check(w, ScalarType::Byte, device);
+  check(sa, ScalarType::Float, device);
+  check(sw, ScalarType::BFloat16, device);
+  check(out, ScalarType::BFloat16, device);
+  STD_TORCH_CHECK(a.dim() == 2 && w.dim() == 2 && out.dim() == 2,
+                  "Expected matrices");
+  const int64_t m = a.size(0), n = w.size(0), k = a.size(1);
+  STD_TORCH_CHECK(m > 0 && n > 0 && k > 0 && k % 32 == 0 &&
+                  k <= 65536 && w.size(1) == k, "Invalid matrix geometry");
+  STD_TORCH_CHECK(sa.dim() == 1 && sa.size(0) == m && sw.dim() == 1 &&
+                  sw.size(0) == n && out.size(0) == m && out.size(1) == n,
+                  "Wrong scale or output shapes");
+  STD_TORCH_CHECK(a.numel() <= std::numeric_limits<int>::max() &&
+                  w.numel() <= std::numeric_limits<int>::max(), "Matrix too large");
+  torch::stable::accelerator::DeviceGuard guard(device);
+  channel_mm(static_cast<int8_t*>(a.data_ptr()), static_cast<uint8_t*>(w.data_ptr()),
+              static_cast<float*>(sa.data_ptr()), sw.data_ptr(), out.data_ptr(),
+              m, n, k, stream_for(device));
+  launch_check();
+}
+void boxed_gdn(StableIValue* stack, uint64_t, uint64_t) {
+  auto q = to<Tensor>(stack[0]), k = to<Tensor>(stack[1]);
+  auto v = to<Tensor>(stack[2]), g = to<Tensor>(stack[3]);
+  auto beta = to<Tensor>(stack[4]), state = to<Tensor>(stack[5]);
+  auto slots = to<Tensor>(stack[6]), out = to<Tensor>(stack[7]);
+  const int device = q.get_device_index();
+  for (const auto& t : {q, k, v, out}) check(t, ScalarType::BFloat16, device);
+  for (const auto& t : {g, beta, state}) check(t, ScalarType::Float, device);
+  check(slots, ScalarType::Long, device);
+  STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(state.data_ptr()) % 16 == 0,
+                  "GDN state requires 16-byte alignment");
+  STD_TORCH_CHECK(q.dim() == 3 && v.dim() == 3 && state.dim() == 4 &&
+                  k.sizes() == q.sizes() && out.sizes() == v.sizes(),
+                  "Invalid GDN tensor ranks or shapes");
+  const int64_t b = q.size(0), hq = q.size(1), hv = v.size(1);
+  STD_TORCH_CHECK(b > 0 && hq > 0 && hv > 0 && hv % hq == 0 &&
+                  q.size(2) == 128 && v.size(2) == 128 && v.size(0) == b &&
+                  state.size(1) == hv && state.size(2) == 128 &&
+                  state.size(3) == 128, "GDN requires head dimension 128");
+  STD_TORCH_CHECK(g.dim() == 2 && g.size(0) == b && g.size(1) == hv &&
+                  beta.sizes() == g.sizes() && slots.dim() == 1 &&
+                  slots.size(0) == b, "Wrong GDN gates or slots");
+  torch::stable::accelerator::DeviceGuard guard(device);
+  gdn_decode(q.data_ptr(), k.data_ptr(), v.data_ptr(),
+              static_cast<float*>(g.data_ptr()), static_cast<float*>(beta.data_ptr()),
+              static_cast<float*>(state.data_ptr()), static_cast<int64_t*>(slots.data_ptr()),
+              out.data_ptr(), b, hq, hv, state.size(0), stream_for(device));
+  launch_check();
+}
+void boxed_gdn_packed(StableIValue* stack, uint64_t, uint64_t) {
+  auto qkv = to<Tensor>(stack[0]), a = to<Tensor>(stack[1]);
+  auto b = to<Tensor>(stack[2]), A_log = to<Tensor>(stack[3]);
+  auto dt = to<Tensor>(stack[4]), state = to<Tensor>(stack[5]);
+  auto slots = to<Tensor>(stack[6]), out = to<Tensor>(stack[7]);
+  const int device = qkv.get_device_index();
+  for (const auto& t : {qkv, a, b}) {
+    STD_TORCH_CHECK(t.is_cuda() && t.get_device_index() == device &&
+        t.scalar_type() == ScalarType::BFloat16 && t.dim() == 2 &&
+        t.stride(1) == 1, "Expected strided CUDA BF16 packed inputs");
+  }
+  check(A_log, ScalarType::Float, device);
+  check(out, ScalarType::BFloat16, device);
+  STD_TORCH_CHECK(dt.is_cuda() && dt.get_device_index() == device &&
+      dt.is_contiguous() && dt.dim() == 1 &&
+      (dt.scalar_type() == ScalarType::Float || dt.scalar_type() == ScalarType::BFloat16),
+      "Expected BF16 or FP32 dt_bias");
+  STD_TORCH_CHECK(state.is_cuda() && state.get_device_index() == device &&
+      state.scalar_type() == ScalarType::Float && state.dim() == 4 &&
+      state.size(2) == 128 && state.size(3) == 128 && state.stride(3) == 1 &&
+      state.stride(2) == 128 && state.stride(1) == 128 * 128 &&
+      state.stride(0) % 4 == 0 && reinterpret_cast<uintptr_t>(state.data_ptr()) % 16 == 0,
+      "Expected aligned FP32 [slot,Hv,128,128] GDN state");
+  STD_TORCH_CHECK(slots.is_cuda() && slots.get_device_index() == device &&
+      slots.dim() == 1 &&
+      (slots.scalar_type() == ScalarType::Long || slots.scalar_type() == ScalarType::Int),
+      "Expected INT32 or INT64 state slots");
+  const int64_t batch = qkv.size(0), hv = state.size(1);
+  const int64_t qk_width = qkv.size(1) - hv * 128;
+  STD_TORCH_CHECK(batch > 0 && batch <= 65535 && hv > 0 && hv <= 65535 &&
+      qk_width > 0 && qk_width % 256 == 0, "Invalid packed GDN dimensions");
+  const int64_t hq = qk_width / 256;
+  STD_TORCH_CHECK(hv % hq == 0 && a.size(0) == batch && a.size(1) == hv &&
+      b.sizes() == a.sizes() && A_log.dim() == 1 && A_log.size(0) == hv &&
+      dt.size(0) == hv && slots.size(0) == batch && out.dim() == 3 &&
+      out.size(0) == batch && out.size(1) == hv && out.size(2) == 128 &&
+      state.size(0) > 0, "Mismatched GDN shapes");
+  torch::stable::accelerator::DeviceGuard guard(device);
+  gdn_packed_decode(qkv.data_ptr(), a.data_ptr(), b.data_ptr(),
+      static_cast<float*>(A_log.data_ptr()), dt.data_ptr(),
+      static_cast<float*>(state.data_ptr()), slots.data_ptr(), out.data_ptr(),
+      batch, hq, hv, state.size(0), qkv.stride(0), a.stride(0), b.stride(0),
+      state.stride(0), slots.stride(0), dt.scalar_type() == ScalarType::Float,
+      slots.scalar_type() == ScalarType::Long, stream_for(device));
+  launch_check();
+}
+void boxed_cutlass_mm(StableIValue* stack, uint64_t, uint64_t) {
+  auto a = to<Tensor>(stack[0]), w = to<Tensor>(stack[1]);
+  auto sa = to<Tensor>(stack[2]), sw = to<Tensor>(stack[3]);
+  auto workspace = to<Tensor>(stack[4]), out = to<Tensor>(stack[5]);
+  const int device = a.get_device_index();
+  check(a, ScalarType::Char, device); check(w, ScalarType::Char, device);
+  check(sa, ScalarType::Float, device); check(sw, ScalarType::BFloat16, device);
+  check(workspace, ScalarType::Int, device); check(out, ScalarType::BFloat16, device);
+  STD_TORCH_CHECK(a.dim() == 2 && w.dim() == 2 && out.dim() == 2 &&
+                  workspace.sizes() == out.sizes(), "Expected matrices and matching workspace");
+  const int64_t m = a.size(0), n = w.size(0), k = a.size(1);
+  STD_TORCH_CHECK(m > 0 && n > 0 && k > 0 && n % 4 == 0 && k % 32 == 0 &&
+                  k <= 65536 && w.size(1) == k && out.size(0) == m &&
+                  out.size(1) == n && sa.dim() == 1 && sw.dim() == 1 &&
+                  sa.size(0) == m && sw.size(0) == n, "Invalid CUTLASS geometry");
+  STD_TORCH_CHECK(a.numel() <= std::numeric_limits<int>::max() &&
+                  w.numel() <= std::numeric_limits<int>::max() &&
+                  out.numel() <= std::numeric_limits<int>::max(), "Matrix too large");
+  torch::stable::accelerator::DeviceGuard guard(device);
+  cutlass_channel_mm(static_cast<int8_t*>(a.data_ptr()), static_cast<int8_t*>(w.data_ptr()),
+      static_cast<float*>(sa.data_ptr()), sw.data_ptr(), static_cast<int32_t*>(workspace.data_ptr()),
+      out.data_ptr(), m, n, k, stream_for(device));
+  launch_check();
+}
+void boxed_kv_cache_update(StableIValue* stack, uint64_t, uint64_t) {
+  auto key = to<Tensor>(stack[0]), value = to<Tensor>(stack[1]);
+  auto cache = to<Tensor>(stack[2]), slots = to<Tensor>(stack[3]);
+  const int device = key.get_device_index();
+  for (const auto& t : {key, value}) {
+    STD_TORCH_CHECK(t.is_cuda() && t.get_device_index() == device &&
+        t.scalar_type() == ScalarType::BFloat16 && t.dim() == 3 &&
+        t.size(2) == 256 && t.stride(2) == 1, "Expected CUDA BF16 [T,H,256] keys and values");
+  }
+  check(slots, ScalarType::Long, device);
+  STD_TORCH_CHECK(value.sizes() == key.sizes() && slots.dim() == 1 &&
+      slots.size(0) == key.size(0), "Key, value and slot shapes must match");
+  STD_TORCH_CHECK(cache.is_cuda() && cache.get_device_index() == device &&
+      cache.scalar_type() == ScalarType::Char && cache.dim() == 4 &&
+      cache.size(1) == key.size(1) && cache.size(3) == 520 && cache.stride(3) == 1 &&
+      cache.size(0) > 0 && cache.size(2) > 0, "Expected packed INT8 cache [blocks,H,block_size,520]");
+  STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(cache.data_ptr()) % 4 == 0 &&
+      cache.stride(0) % 4 == 0 && cache.stride(1) % 4 == 0 && cache.stride(2) % 4 == 0,
+      "Cache scales require four-byte alignment");
+  STD_TORCH_CHECK(key.size(1) > 0 && key.numel() <= std::numeric_limits<int>::max(),
+      "Invalid key geometry");
+  if (key.size(0) == 0) return;
+  torch::stable::accelerator::DeviceGuard guard(device);
+  kv_cache_update(key.data_ptr(), value.data_ptr(), static_cast<int8_t*>(cache.data_ptr()),
+      static_cast<int64_t*>(slots.data_ptr()), key.size(0), key.size(1), cache.size(0),
+      cache.size(2), key.stride(0), key.stride(1), value.stride(0), value.stride(1),
+      cache.stride(0), cache.stride(1), cache.stride(2), stream_for(device));
+  launch_check();
+}
+}  // namespace
+
+STABLE_TORCH_LIBRARY(consumer_int8, m) {
+  m.def("quantize_rows(Tensor input, Tensor(a!) codes, Tensor(b!) scales) -> ()");
+  m.def("channel_mm(Tensor a, Tensor w, Tensor a_scale, Tensor w_scale, Tensor(a!) out) -> ()");
+  m.def("gdn_decode(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor(a!) state, Tensor slots, Tensor(b!) out) -> ()");
+  m.def("gdn_packed_decode(Tensor qkv, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, Tensor(a!) state, Tensor slots, Tensor(b!) out) -> ()");
+  m.def("cutlass_channel_mm(Tensor a, Tensor w, Tensor a_scale, Tensor w_scale, Tensor(a!) workspace, Tensor(b!) out) -> ()");
+  m.def("kv_cache_update(Tensor key, Tensor value, Tensor(a!) cache, Tensor slots) -> ()");
+}
+STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
+  m.impl("quantize_rows", &boxed_quant);
+  m.impl("channel_mm", &boxed_mm);
+  m.impl("gdn_decode", &boxed_gdn);
+  m.impl("gdn_packed_decode", &boxed_gdn_packed);
+  m.impl("cutlass_channel_mm", &boxed_cutlass_mm);
+  m.impl("kv_cache_update", &boxed_kv_cache_update);
+}
+extern "C" PyObject* PyInit__C() {
+  static PyModuleDef module = {PyModuleDef_HEAD_INIT, "_C", nullptr, -1, nullptr};
+  return PyModule_Create(&module);
+}

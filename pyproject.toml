@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77", "wheel", "torch>=2.10"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "consumer-int8-kernels"
+version = "0.1.0.dev0"
+description = "SM86 inference kernels and reproducible INT8 checkpoint encoding"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.10", "safetensors>=0.5"]
+license = "Apache-2.0"
+
+[project.scripts]
+consumer-int8-encode = "consumer_int8.checkpoint:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
