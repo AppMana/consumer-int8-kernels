@@ -118,9 +118,21 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--port", type=int, default=18082)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--max-num-batched-tokens", type=int, default=1024)
     parser.add_argument("--speculative-tokens", type=int, default=1)
+    parser.add_argument(
+        "--linear-backend",
+        choices=[
+            "allspark",
+            "consumer_int8",
+            "consumer_int8_hybrid",
+            "consumer_int8_prefill",
+        ],
+    )
+    parser.add_argument("--gdn-backend", choices=["triton", "consumer_int8"])
+    parser.add_argument("--kv-writer", choices=["triton", "consumer_int8"])
+    parser.add_argument("--gdn-spec-kernel", choices=["cuda", "triton"], default="cuda")
     parser.add_argument(
         "--topology", nargs="+", choices=["tp2", "pp2"], default=["tp2", "pp2"]
     )
@@ -144,6 +156,14 @@ def main():
             )
     config_bytes = (args.model / "config.json").read_bytes()
     config = json.loads(config_bytes)
+    quantization_config = dict(config["quantization_config"])
+    for key, value in (
+        ("linear_backend", args.linear_backend),
+        ("gdn_decode_backend", args.gdn_backend),
+        ("kv_cache_backend", args.kv_writer),
+    ):
+        if value is not None:
+            quantization_config[key] = value
     base_url = f"http://127.0.0.1:{args.port}"
     provenance = dict(
         vllm_commit=git_head(args.vllm_repo),
@@ -151,6 +171,7 @@ def main():
         checkpoint=str(args.model),
         config_sha256=hashlib.sha256(config_bytes).hexdigest(),
         quantization_config=config.get("quantization_config"),
+        effective_quantization_config=quantization_config,
         python=sys.executable,
         python_version=sys.version,
         packages={
@@ -194,6 +215,8 @@ def main():
                 str(args.model),
                 "--served-model-name",
                 "qwen3.8-27b-int8",
+                "--hf-overrides",
+                json.dumps({"quantization_config": quantization_config}),
                 "--tensor-parallel-size",
                 str(tp),
                 "--pipeline-parallel-size",
@@ -246,6 +269,7 @@ def main():
                 CUDA_VISIBLE_DEVICES="0,1",
                 CUDA_DEVICE_ORDER="PCI_BUS_ID",
                 VLLM_USE_V2_MODEL_RUNNER="1",
+                VLLM_GDN_DECODE_KERNEL=args.gdn_spec_kernel,
                 PYTHONUNBUFFERED="1",
                 PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
                 PYTHONPATH=str(package / "src")
@@ -264,6 +288,7 @@ def main():
                         "CUDA_VISIBLE_DEVICES",
                         "CUDA_DEVICE_ORDER",
                         "VLLM_USE_V2_MODEL_RUNNER",
+                        "VLLM_GDN_DECODE_KERNEL",
                     )
                 },
             )
