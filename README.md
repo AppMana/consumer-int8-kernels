@@ -8,8 +8,9 @@ The checkpoint encoder, CUDA kernels and vLLM adapter are implemented. The
 [two-A5000 evaluation](docs/a5000-2026-10-12.md) covers text and vision quality,
 TP=2 and PP=2, MTP off/on, and all 36 long-context retrieval/throughput cells.
 The selected configuration uses AllSpark projections with native GDN decode
-and INT8 cache insertion. W8A8 prefill remains experimental after a vision
-regression. Hardware release gates remain pending, so the checkpoint is an
+and INT8 cache insertion. A later [Nsight investigation](docs/prefill-2026-10-12.md)
+fixed the W8A8 dispatch bug behind the reported vision regression; renewed
+throughput validation is in progress. Hardware release gates remain pending, so the checkpoint is an
 unreleased candidate. Its immutable encoder report retains
 `encoded_unvalidated`; the separate validation report records completed gates.
 
@@ -116,14 +117,17 @@ second weight copy. These are CUDA-graph kernel timings, not serving rates.
 The first complete 65,504-token quality run measured BF16 mean NLL 1.951675.
 AllSpark INT8 increased NLL by 0.005659 and scored 85/100 vision fixtures at
 both C=1 and C=4, with no newly incorrect cases against BF16's 82/100.
-AllSpark plus native GDN/cache also passed these checks. Applying W8A8 prefill
-to all language projections passed NLL but regressed one vision case at C=4;
-that mode remains experimental. The `consumer_int8_mlp_prefill` candidate
-restricts activation quantization to MLP gate/up projections, preserving BF16
-activations in attention, MLP down and MTP input projections. The MLP-wide
-candidate still regressed the same C=4 vision case. Restricting W8A8 to gate/up
-projections also regressed that case, despite passing NLL (+0.005424). All
-tested W8A8 prefill modes remain experimental. The selected serving candidate
+AllSpark plus native GDN/cache also passed these checks. Initial W8A8 prefill
+configurations passed NLL but regressed an OCR case at C=4. Nsight subsequently
+showed that guard-free AOT graph reuse had frozen the Python prefill branch:
+W8A8 ran at 1–729 rows despite the intended 1,024-row minimum. vLLM commit
+`7b5d852899` moves dispatch inside a runtime custom operator. The corrected
+all-projection prefill policy passes NLL (+0.0075165) and all per-case vision
+comparisons, scoring 85/100 at both C=1 and C=4. A second captured C=4 replay
+also passes, with zero unintended W8A8 launches. These results supersede the
+earlier attribution of this OCR failure to prefill activation quantization.
+Throughput and broader configuration validation remain in progress.
+The configuration used for the original 36-cell serving matrix
 uses AllSpark projections with native GDN decode and native cache insertion;
 its NLL increase was 0.004887, with 85/100 vision cases at both concurrencies
 and no new failures against BF16.
