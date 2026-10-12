@@ -51,6 +51,7 @@ quantization format.
 | `cutlass_channel_mm` | Signed INT8 activations/weights | SM86 tiled integer MMA, caller-owned INT32 workspace, BF16 output |
 | `gdn_decode` | BF16 Q/K/V, FP32 log decay and sigmoid gates | Head dimensions 128, normalized Q/K, FP32 recurrent update |
 | `gdn_packed_decode` | Strided BF16 QKV and raw gates | Fused gating and FP32 recurrence, INT32/INT64 slot indices |
+| `gdn_prefill` | Normalized BF16 Q/K, BF16 V, FP32 gates and initial state | Chunked BF16/TF32 attention with FP32 final state |
 | `kv_cache_update` | BF16 K/V with head dimension 256 | Packed INT8 cache and inline FP32 scales, HND or NHD strides |
 
 `gdn_decode` accepts `[batch,key_heads,128]` Q/K,
@@ -62,6 +63,15 @@ slots. `A_log` is FP32; `dt_bias` may be BF16 or FP32. State rows require
 16-byte alignment. It matches vLLM's non-speculative packed decode contract;
 multi-token speculative verification continues to use the engine's existing
 implementation until separately validated.
+
+`gdn_prefill` accepts one contiguous sequence of 64–32768 tokens, in multiples
+of 64, with `(key_heads,value_heads)` equal to `(8,24)` or `(16,48)`. Initial
+and final states have shape `[value_heads,128,128]`, ordered value then key.
+The caller provides all intermediate buffers and the device's actual SM count.
+It wraps the pinned NInfer preparation, state propagation and output kernels;
+it does not yet support variable-length batches or unaligned tails. CUDA-graph
+correctness against FLA has passed for 64, 256 and 1024 tokens on an RTX A5000.
+Serving dispatch and model-level quality validation remain pending.
 
 `kv_cache_update` writes logical `[blocks,kv_heads,block_size,520]` cache rows
 containing `[K256, K_scale4, V256, V_scale4]` bytes. Slot zero is valid; negative

@@ -16,8 +16,16 @@ setup(
     ext_modules=[
         CUDAExtension(
             "consumer_int8._C",
-            ["csrc/bindings.cpp", "csrc/kernels.cu", "csrc/cutlass_mm.cu"],
-            include_dirs=[str(Path("third_party/cutlass/include").resolve())],
+            [
+                "csrc/bindings.cpp",
+                "csrc/kernels.cu",
+                "csrc/cutlass_mm.cu",
+                "csrc/gdn_prefill.cu",
+            ],
+            include_dirs=[
+                str(Path("third_party/cutlass/include").resolve()),
+                str(Path("third_party/ninfer/src").resolve()),
+            ],
             py_limited_api=True,
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17", *defines],

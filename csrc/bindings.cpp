@@ -202,6 +202,45 @@ void boxed_kv_cache_update(StableIValue* stack, uint64_t, uint64_t) {
       cache.stride(0), cache.stride(1), cache.stride(2), stream_for(device));
   launch_check();
 }
+void boxed_gdn_prefill(StableIValue* stack, uint64_t, uint64_t) {
+  auto q = to<Tensor>(stack[0]), k = to<Tensor>(stack[1]), v = to<Tensor>(stack[2]);
+  auto g = to<Tensor>(stack[3]), beta = to<Tensor>(stack[4]);
+  auto initial = to<Tensor>(stack[5]), final = to<Tensor>(stack[6]);
+  auto out = to<Tensor>(stack[7]), cumulative = to<Tensor>(stack[8]);
+  auto w = to<Tensor>(stack[9]), u = to<Tensor>(stack[10]);
+  auto v_new = to<Tensor>(stack[11]), h_chunk = to<Tensor>(stack[12]);
+  const int64_t num_sms = to<int64_t>(stack[13]);
+  const int device = q.get_device_index();
+  for (const auto& t : {q, k, v, out, w, u, v_new, h_chunk}) {
+    check(t, ScalarType::BFloat16, device);
+    STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+                    "Prefill BF16 buffers require 16-byte alignment");
+  }
+  for (const auto& t : {g, beta, initial, final, cumulative}) check(t, ScalarType::Float, device);
+  STD_TORCH_CHECK(q.dim() == 3 && v.dim() == 3 && k.sizes() == q.sizes(),
+                  "Expected normalized Q/K and V as [T,H,128]");
+  const int64_t tokens = q.size(0), hq = q.size(1), hv = v.size(1);
+  STD_TORCH_CHECK(tokens > 0 && tokens <= 32768 && tokens % 64 == 0 &&
+      q.size(2) == 128 && v.size(2) == 128 && v.size(0) == tokens &&
+      ((hq == 8 && hv == 24) || (hq == 16 && hv == 48)) &&
+      num_sms > 0 && num_sms <= 1024, "Unsupported Qwen GDN prefill geometry");
+  STD_TORCH_CHECK(g.dim() == 2 && g.size(0) == tokens && g.size(1) == hv &&
+      beta.sizes() == g.sizes() && cumulative.sizes() == g.sizes(), "Invalid gate/scan workspace shape");
+  STD_TORCH_CHECK(initial.dim() == 3 && initial.size(0) == hv &&
+      initial.size(1) == 128 && initial.size(2) == 128 && final.sizes() == initial.sizes(),
+      "Expected FP32 [Hv,V128,K128] initial and final states");
+  STD_TORCH_CHECK(out.sizes() == v.sizes() && w.sizes() == v.sizes() &&
+      u.sizes() == v.sizes() && v_new.sizes() == v.sizes() && h_chunk.dim() == 4 &&
+      h_chunk.size(0) == tokens / 64 && h_chunk.size(1) == hv &&
+      h_chunk.size(2) == 128 && h_chunk.size(3) == 128, "Invalid prefill workspace shape");
+  torch::stable::accelerator::DeviceGuard guard(device);
+  const auto status = gdn_prefill(q.data_ptr(), k.data_ptr(), v.data_ptr(),
+      static_cast<float*>(g.data_ptr()), static_cast<float*>(beta.data_ptr()),
+      static_cast<float*>(initial.data_ptr()), static_cast<float*>(final.data_ptr()),
+      out.data_ptr(), static_cast<float*>(cumulative.data_ptr()), w.data_ptr(), u.data_ptr(),
+      v_new.data_ptr(), h_chunk.data_ptr(), tokens, hq, hv, num_sms, stream_for(device));
+  STD_TORCH_CHECK(status == cudaSuccess, cudaGetErrorString(status));
+}
 }  // namespace
 
 STABLE_TORCH_LIBRARY(consumer_int8, m) {
@@ -211,6 +250,7 @@ STABLE_TORCH_LIBRARY(consumer_int8, m) {
   m.def("gdn_packed_decode(Tensor qkv, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, Tensor(a!) state, Tensor slots, Tensor(b!) out) -> ()");
   m.def("cutlass_channel_mm(Tensor a, Tensor w, Tensor a_scale, Tensor w_scale, Tensor(a!) workspace, Tensor(b!) out) -> ()");
   m.def("kv_cache_update(Tensor key, Tensor value, Tensor(a!) cache, Tensor slots) -> ()");
+  m.def("gdn_prefill(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor initial, Tensor(a!) final, Tensor(b!) out, Tensor(c!) cumulative, Tensor(d!) w, Tensor(e!) u, Tensor(f!) v_new, Tensor(g!) h_chunk, int num_sms) -> ()");
 }
 STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
   m.impl("quantize_rows", &boxed_quant);
@@ -219,6 +259,7 @@ STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
   m.impl("gdn_packed_decode", &boxed_gdn_packed);
   m.impl("cutlass_channel_mm", &boxed_cutlass_mm);
   m.impl("kv_cache_update", &boxed_kv_cache_update);
+  m.impl("gdn_prefill", &boxed_gdn_prefill);
 }
 extern "C" PyObject* PyInit__C() {
   static PyModuleDef module = {PyModuleDef_HEAD_INIT, "_C", nullptr, -1, nullptr};

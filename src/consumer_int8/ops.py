@@ -44,8 +44,29 @@ def _kv_cache_update_fake(key, value, cache, slots):
 
 
 gdn_packed_decode = torch.ops.consumer_int8.gdn_packed_decode
+gdn_prefill = torch.ops.consumer_int8.gdn_prefill
 
 
 @torch.library.register_fake("consumer_int8::gdn_packed_decode")
 def _gdn_packed_decode_fake(qkv, a, b, A_log, dt_bias, state, slots, out):
+    return None
+
+
+@torch.library.register_fake("consumer_int8::gdn_prefill")
+def _gdn_prefill_fake(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    initial,
+    final,
+    out,
+    cumulative,
+    w,
+    u,
+    v_new,
+    h_chunk,
+    num_sms,
+):
     return None

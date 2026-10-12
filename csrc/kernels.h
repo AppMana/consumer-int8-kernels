@@ -3,6 +3,11 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+cudaError_t gdn_prefill(const void* q, const void* k, const void* v,
+    const float* g, const float* beta, const float* initial, float* final,
+    void* out, float* cumulative, void* w, void* u, void* v_new, void* h_chunk,
+    int tokens, int hq, int hv, int num_sms, cudaStream_t stream);
+
 void quantize_rows(const void* input, int8_t* codes, float* scales,
                    int rows, int cols, cudaStream_t stream);
 void channel_mm(const int8_t* a, const uint8_t* w, const float* a_scale,

@@ -2,3 +2,6 @@ include LICENSE NOTICE
 recursive-include csrc *.cpp *.cu *.h
 include third_party/cutlass/LICENSE.txt
 recursive-include third_party/cutlass/include *.h *.hpp *.cuh
+include third_party/ninfer/LICENSE
+recursive-include third_party/ninfer/src/ops/common *.h *.cuh
+recursive-include third_party/ninfer/src/ops/linear_attention/gated_delta_net *.h *.cuh

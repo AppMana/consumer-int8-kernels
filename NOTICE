@@ -9,6 +9,11 @@ Don-Chad/ninfer-3090, src/ops/linear_attention/gated_delta_net/recurrent.cuh
 at d7277e88cc3a56d2967d5d533f148bed36e97df5 (Apache-2.0).
 https://github.com/Don-Chad/ninfer-3090
 
+The chunked GDN prefill adapter instantiates NInfer's prepare_wy_wu,
+state_passing and output kernels from the same pinned revision. Their
+source and license remain in the third_party/ninfer submodule; the launch
+adapter adjusts the scheduling for the actual SM86 device.
+
 The checkpoint channel and group32 encodings match the AppMana vLLM fork's
 dsv4_int.py and common/vision_int8.py at
 899ced4cf9a4f33f6c0903f3e1858246c63f9fbd (Apache-2.0).
