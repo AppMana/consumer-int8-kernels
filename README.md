@@ -7,10 +7,12 @@ vLLM. The serving engine owns allocation, cache scheduling and backend selection
 The checkpoint encoder, CUDA kernels and vLLM adapter are implemented. The
 [two-A5000 evaluation](docs/a5000-2026-10-12.md) covers text and vision quality,
 TP=2 and PP=2, MTP off/on, and all 36 long-context retrieval/throughput cells.
-The selected configuration uses AllSpark projections with native GDN decode
-and INT8 cache insertion. A later [Nsight investigation](docs/prefill-2026-10-12.md)
-fixed the W8A8 dispatch bug behind the reported vision regression; renewed
-throughput validation is in progress. Hardware release gates remain pending, so the checkpoint is an
+That original configuration uses AllSpark projections with native GDN decode
+and INT8 cache insertion. The [Nsight investigation](docs/prefill-2026-10-12.md)
+fixed the W8A8 dispatch bug behind the vision regression and qualified a faster
+MTP-off configuration across all 18 TP=2/PP=2 retrieval cells. It uses fused
+integer prefill GEMMs and native INT8-cache conversion plus FlashAttention 2.
+Hardware release gates remain pending, so the checkpoint is an
 unreleased candidate. Its immutable encoder report retains
 `encoded_unvalidated`; the separate validation report records completed gates.
 
@@ -98,8 +100,8 @@ and HND/NHD caches are supported. Its 64-query, 64-key tiles use 94,464 bytes
 of shared memory on SM86. K scales apply after QK, and V scales apply before
 PV, preserving the serving kernel's scale placement. With corrected W8A8
 prefill and native GDN/cache, this candidate passes text NLL (+0.0079994)
-and vision (85/100 at C=1 and C=4, no new BF16 failures). End-to-end throughput
-validation remains in progress.
+and vision (85/100 at C=1 and C=4, no new BF16 failures). The qualified
+serving configuration uses this implementation as its scratch-limit fallback.
 
 `unpack_kv_cache` produces `[sequences,capacity,kv_heads,256]` BF16 K/V buffers
 for existing attention implementations. It honors HND/NHD cache strides and
@@ -108,7 +110,7 @@ each sequence's length are written; the caller must provide valid pages and
 capacity at least as large as every sequence. It applies each FP32 scale
 before rounding to BF16, which differs numerically from scaling QK/PV.
 
-The vLLM `attention_backend=consumer_fa2` experiment combines this converter
+The vLLM `attention_backend=consumer_fa2` adapter combines this converter
 with the installed FlashAttention 2. It limits transient K/V scratch to
 512 MiB per layer/rank and uses the direct packed CUDA kernel above that
 bound. Decode and unsupported attention modes retain Triton. In the isolated
@@ -116,8 +118,10 @@ bound. Decode and unsupported attention modes retain Triton. In the isolated
 the original Triton kernel; the conversion is included and takes 0.72 ms.
 `benchmarks/microbench_attention.py` reproduces these kernel comparisons.
 The FA2 configuration passes NLL (+0.0070924) and scores 85/100 vision cases
-at C=1 and C=4 with no new BF16 failures. Serving memory/throughput validation
-is in progress.
+at C=1 and C=4 with no new BF16 failures. The final fused-GEMM/4096-token
+configuration passes NLL (+0.0125091 TP=2, +0.0052642 PP=2), the same vision
+checks, and all 18 serving timing cells with no new retrieval errors. Full
+phase rates and memory conditions are in the [report](docs/prefill-2026-10-12.md).
 
 `fused_channel_mm` retains row-first FP32 scaling and BF16 channel scales.
 It matches the separate INT32 GEMM plus rescale bit for bit, including CUDA
@@ -163,7 +167,8 @@ all-projection prefill policy passes NLL (+0.0075165) and all per-case vision
 comparisons, scoring 85/100 at both C=1 and C=4. A second captured C=4 replay
 also passes, with zero unintended W8A8 launches. These results supersede the
 earlier attribution of this OCR failure to prefill activation quantization.
-Throughput and broader configuration validation remain in progress.
+The optimized MTP-off TP=2/PP=2 throughput matrix is complete, with zero
+new retrieval errors. Other hardware and optimized MTP-on remain unqualified.
 The configuration used for the original 36-cell serving matrix
 uses AllSpark projections with native GDN decode and native cache insertion;
 its NLL increase was 0.004887, with 85/100 vision cases at both concurrencies
