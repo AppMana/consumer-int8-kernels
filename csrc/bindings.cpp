@@ -74,6 +74,29 @@ void boxed_mm(StableIValue* stack, uint64_t, uint64_t) {
               m, n, k, stream_for(device));
   launch_check();
 }
+void boxed_unpack_allspark(StableIValue* stack, uint64_t, uint64_t) {
+  auto packed = to<Tensor>(stack[0]), packed_scales = to<Tensor>(stack[1]);
+  auto weight = to<Tensor>(stack[2]), scales = to<Tensor>(stack[3]);
+  const int device = packed.get_device_index();
+  check(packed, ScalarType::Byte, device);
+  check(packed_scales, ScalarType::BFloat16, device);
+  check(weight, ScalarType::Char, device);
+  check(scales, ScalarType::BFloat16, device);
+  STD_TORCH_CHECK(packed.dim() == 2 && weight.dim() == 2 &&
+      packed_scales.dim() == 1 && scales.dim() == 1, "Wrong tensor ranks");
+  const int64_t n = weight.size(0), k = weight.size(1), padded_n = (n + 31) / 32 * 32;
+  STD_TORCH_CHECK(n > 0 && n % 16 == 0 && k > 0 && k <= 65536 && k % 16 == 0 &&
+      packed.size(0) == padded_n && packed.size(1) == k &&
+      packed_scales.size(0) == padded_n && scales.size(0) == n,
+      "Expected AllSpark N32K16 weights and channel scales");
+  STD_TORCH_CHECK(packed.numel() <= std::numeric_limits<int>::max(), "Weight too large");
+  STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(packed.data_ptr()) % 4 == 0 &&
+      reinterpret_cast<uintptr_t>(weight.data_ptr()) % 16 == 0, "Unaligned weights");
+  torch::stable::accelerator::DeviceGuard guard(device);
+  unpack_allspark(static_cast<uint8_t*>(packed.data_ptr()), packed_scales.data_ptr(),
+      static_cast<int8_t*>(weight.data_ptr()), scales.data_ptr(), n, k, stream_for(device));
+  launch_check();
+}
 void boxed_gemv(StableIValue* stack, uint64_t, uint64_t) {
   auto x = to<Tensor>(stack[0]), w = to<Tensor>(stack[1]);
   auto scale = to<Tensor>(stack[2]), out = to<Tensor>(stack[3]);
@@ -269,6 +292,7 @@ STABLE_TORCH_LIBRARY(consumer_int8, m) {
   m.def("quantize_rows(Tensor input, Tensor(a!) codes, Tensor(b!) scales) -> ()");
   m.def("channel_mm(Tensor a, Tensor w, Tensor a_scale, Tensor w_scale, Tensor(a!) out) -> ()");
   m.def("channel_gemv(Tensor x, Tensor w, Tensor scale, Tensor(a!) out) -> ()");
+  m.def("unpack_allspark(Tensor packed, Tensor packed_scales, Tensor(a!) weight, Tensor(b!) scales) -> ()");
   m.def("gdn_decode(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor(a!) state, Tensor slots, Tensor(b!) out) -> ()");
   m.def("gdn_packed_decode(Tensor qkv, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, Tensor(a!) state, Tensor slots, Tensor(b!) out) -> ()");
   m.def("cutlass_channel_mm(Tensor a, Tensor w, Tensor a_scale, Tensor w_scale, Tensor(a!) workspace, Tensor(b!) out) -> ()");
@@ -279,6 +303,7 @@ STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
   m.impl("quantize_rows", &boxed_quant);
   m.impl("channel_mm", &boxed_mm);
   m.impl("channel_gemv", &boxed_gemv);
+  m.impl("unpack_allspark", &boxed_unpack_allspark);
   m.impl("gdn_decode", &boxed_gdn);
   m.impl("gdn_packed_decode", &boxed_gdn_packed);
   m.impl("cutlass_channel_mm", &boxed_cutlass_mm);

@@ -43,10 +43,16 @@ def _quantized_mm(implementation, x, a, sa, weights, scales, *outputs):
     implementation(a, weights, sa, scales, *outputs)
 
 
+def _unpack_mm(x, a, sa, packed, packed_scale, weights, scales, workspace, out):
+    ops.unpack_allspark(packed, packed_scale, weights, scales)
+    _quantized_mm(ops.cutlass_channel_mm, x, a, sa, weights, scales, workspace, out)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True)
     parser.add_argument("--kind", choices=["gdn", "linear", "all"], default="all")
+    parser.add_argument("--prefill-only", action="store_true")
     args = parser.parse_args()
     torch.manual_seed(20261011)
     results = {
@@ -167,7 +173,7 @@ def main():
             packed, packed_scale, _ = vops.allspark_repack_weight(
                 codes.T.contiguous(), scale[None].contiguous(), None, False
             )
-            for m in (1, 2, 4, 16, 256, 1024):
+            for m in (256, 1024) if args.prefill_only else (1, 2, 4, 16, 256, 1024):
                 x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
                 a = torch.empty_like(x, dtype=torch.int8)
                 sa = torch.empty(m, device="cuda")
@@ -216,9 +222,33 @@ def main():
                         "m": m,
                         "n": n,
                         "k": k,
-                        "native_w8a8": time_us(native),
+                        **(
+                            {}
+                            if args.prefill_only
+                            else {"native_w8a8": time_us(native)}
+                        ),
                         "cutlass_w8a8": time_us(cutlass),
                         "allspark_w8a16": time_us(allspark),
+                        **(
+                            {
+                                "unpack_cutlass_w8a8": time_us(
+                                    partial(
+                                        _unpack_mm,
+                                        x,
+                                        a,
+                                        sa,
+                                        packed,
+                                        packed_scale.flatten(),
+                                        signed,
+                                        scale,
+                                        workspace,
+                                        out,
+                                    )
+                                )
+                            }
+                            if m >= 256
+                            else {}
+                        ),
                         **(
                             {
                                 "canonical_gemv_w8a16": time_us(

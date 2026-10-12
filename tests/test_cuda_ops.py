@@ -63,6 +63,40 @@ def test_packed_gdn_matches_serving_kernel_with_strided_inputs(
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+@pytest.mark.parametrize("n,k", [(16, 16), (48, 80), (128, 512), (5120, 3072)])
+def test_allspark_unpack_preserves_every_code_and_scale_in_graph(n, k):
+    from vllm import _custom_ops as vops
+
+    generator = torch.Generator(device="cuda").manual_seed(319)
+    codes = torch.randint(
+        0, 256, (n, k), device="cuda", dtype=torch.uint8, generator=generator
+    )
+    scales = torch.randn(n, device="cuda", dtype=torch.bfloat16, generator=generator)
+    packed, packed_scales, _ = vops.allspark_repack_weight(
+        codes.T.contiguous(), scales[None], None, False
+    )
+    restored = torch.empty_like(codes, dtype=torch.int8)
+    restored_scales = torch.empty_like(scales)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ops.unpack_allspark(packed, packed_scales.flatten(), restored, restored_scales)
+    for _ in range(2):
+        restored.zero_()
+        restored_scales.zero_()
+        graph.replay()
+        torch.testing.assert_close(
+            restored, (codes.short() - 128).char(), atol=0, rtol=0
+        )
+        torch.testing.assert_close(restored_scales, scales, atol=0, rtol=0)
+        codes.bitwise_xor_(255)
+        scales.neg_()
+        changed, changed_scales, _ = vops.allspark_repack_weight(
+            codes.T.contiguous(), scales[None], None, False
+        )
+        packed.copy_(changed)
+        packed_scales.copy_(changed_scales)
+
+
 @pytest.mark.parametrize("m,n,k", [(1, 5120, 5120), (4, 2560, 3072), (17, 37, 128)])
 def test_channel_mm_matches_integer_product_with_output_tails(m, n, k):
     generator = torch.Generator(device="cuda").manual_seed(17)

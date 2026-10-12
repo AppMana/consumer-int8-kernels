@@ -50,6 +50,7 @@ quantization format.
 | `channel_mm` | Signed INT8 activations, biased UINT8 weights | `m16n8k32` integer MMA, BF16 output; diagnostic candidate |
 | `cutlass_channel_mm` | Signed INT8 activations/weights | SM86 tiled integer MMA, caller-owned INT32 workspace, BF16 output |
 | `channel_gemv` | BF16 activations, canonical signed INT8 weights | Small-batch W8A16 with BF16 dequantized multiplicands and FP32 accumulation |
+| `unpack_allspark` | AllSpark N32K16 UINT8 weights and permuted BF16 scales | Lossless restoration of signed row-major INT8 weights and channel scales |
 | `gdn_decode` | BF16 Q/K/V, FP32 log decay and sigmoid gates | Head dimensions 128, normalized Q/K, FP32 recurrent update |
 | `gdn_packed_decode` | Strided BF16 QKV and raw gates | Fused gating and FP32 recurrence, INT32/INT64 slot indices |
 | `gdn_prefill` | Normalized BF16 Q/K, BF16 V, FP32 gates and initial state | Chunked BF16/TF32 attention with FP32 final state |
@@ -88,6 +89,15 @@ it uses CUDA or integer arithmetic; numerical and performance gates apply.
 `benchmarks/microbench.py` compares CUDA-graph timings with the installed vLLM
 FLA and AllSpark implementations. Performance measurements require exclusive
 GPUs; records taken alongside another GPU workload must be discarded.
+
+On one idle RTX A5000, the 2026-10-11 sweep of twelve Qwen projection shapes
+found CUTLASS W8A8 1.68x faster than AllSpark at 1024 rows (geometric mean).
+Restoring AllSpark's packed weights on every call reduces that gain to 1.41x,
+with all twelve shapes still faster. At 256 rows, restoration erases the gain.
+This supports a candidate dispatch that retains AllSpark for small batches
+and restores one transient layer for 1024-row prefill, without a persistent
+second weight copy. These are CUDA-graph kernel timings, not serving rates;
+activation quantization still needs the model NLL and retrieval gates.
 
 `benchmarks/needle_matrix.py` targets one explicitly configured TP/PP/MTP
 server per invocation. It runs C=1/2/4 and 8k/16k/32k prompts with a 1k-token

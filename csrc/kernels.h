@@ -10,6 +10,8 @@ cudaError_t gdn_prefill(const void* q, const void* k, const void* v,
 
 void quantize_rows(const void* input, int8_t* codes, float* scales,
                    int rows, int cols, cudaStream_t stream);
+void unpack_allspark(const uint8_t* packed, const void* scales, int8_t* weight,
+                     void* restored_scales, int n, int k, cudaStream_t stream);
 void channel_gemv(const void* x, const int8_t* weight, const void* scales,
                   void* out, int m, int n, int k, cudaStream_t stream);
 void channel_mm(const int8_t* a, const uint8_t* w, const float* a_scale,

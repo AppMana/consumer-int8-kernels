@@ -22,6 +22,7 @@ setup(
                 "csrc/cutlass_mm.cu",
                 "csrc/gdn_prefill.cu",
                 "csrc/gemv.cu",
+                "csrc/allspark_layout.cu",
             ],
             include_dirs=[
                 str(Path("third_party/cutlass/include").resolve()),
