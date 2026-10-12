@@ -19,6 +19,12 @@ gdn_decode = torch.ops.consumer_int8.gdn_decode
 cutlass_channel_mm = torch.ops.consumer_int8.cutlass_channel_mm
 kv_cache_update = torch.ops.consumer_int8.kv_cache_update
 paged_attention = torch.ops.consumer_int8.paged_attention
+unpack_kv_cache = torch.ops.consumer_int8.unpack_kv_cache
+
+
+@torch.library.register_fake("consumer_int8::unpack_kv_cache")
+def _unpack_kv_cache_fake(cache, table, lengths, key, value):
+    return None
 
 
 @torch.library.register_fake("consumer_int8::paged_attention")

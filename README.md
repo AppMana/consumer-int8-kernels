@@ -61,6 +61,7 @@ quantization format.
 | `gdn_prefill` | Normalized BF16 Q/K, BF16 V, FP32 gates and initial state | Chunked BF16/TF32 attention with FP32 final state |
 | `kv_cache_update` | BF16 K/V with head dimension 256 | Packed INT8 cache and inline FP32 scales, HND or NHD strides |
 | `paged_attention` | BF16 Q, packed INT8 paged K/V, device sequence metadata | Experimental D256/GQA6 causal prefill with BF16 tensor cores and FP32 softmax |
+| `unpack_kv_cache` | Packed INT8 K/V, page table and device sequence lengths | BF16 active cache rows in caller-owned contiguous scratch pages |
 
 `gdn_decode` accepts `[batch,key_heads,128]` Q/K,
 `[batch,value_heads,128]` V, and FP32
@@ -94,8 +95,26 @@ valid pages and disjoint output rows; each query length must be at most the
 provided `max_query`, with a KV length at least as large. Strided BF16 queries
 and HND/NHD caches are supported. Its 64-query, 64-key tiles use 94,464 bytes
 of shared memory on SM86. K scales apply after QK, and V scales apply before
-PV, preserving the serving kernel's scale placement. This candidate is opt-in
-and has not yet passed model-level quality or end-to-end performance gates.
+PV, preserving the serving kernel's scale placement. With corrected W8A8
+prefill and native GDN/cache, this candidate passes text NLL (+0.0079994)
+and vision (85/100 at C=1 and C=4, no new BF16 failures). End-to-end throughput
+validation remains in progress.
+
+`unpack_kv_cache` produces `[sequences,capacity,kv_heads,256]` BF16 K/V buffers
+for existing attention implementations. It honors HND/NHD cache strides and
+device page-table/length updates during CUDA graph replay. Only rows below
+each sequence's length are written; the caller must provide valid pages and
+capacity at least as large as every sequence. It applies each FP32 scale
+before rounding to BF16, which differs numerically from scaling QK/PV.
+
+The vLLM `attention_backend=consumer_fa2` experiment combines this converter
+with the installed FlashAttention 2. It limits transient K/V scratch to
+512 MiB per layer/rank and uses the direct packed CUDA kernel above that
+bound. Decode and unsupported attention modes retain Triton. In the isolated
+32k TP=2/C=4 shape, conversion plus FA2 takes 6.66 ms versus 43.00 ms for
+the original Triton kernel; the conversion is included and takes 0.72 ms.
+`benchmarks/microbench_attention.py` reproduces these kernel comparisons.
+Model quality and serving memory/throughput validation for FA2 are pending.
 
 GDN decode is floating-point arithmetic. INT8 cache storage does not imply
 integer attention arithmetic. The two matmul operators actually use integer

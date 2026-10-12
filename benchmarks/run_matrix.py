@@ -136,6 +136,9 @@ def main():
     )
     parser.add_argument("--gdn-backend", choices=["triton", "consumer_int8"])
     parser.add_argument("--kv-writer", choices=["triton", "consumer_int8"])
+    parser.add_argument(
+        "--attention-backend", choices=["triton", "consumer_int8", "consumer_fa2"]
+    )
     parser.add_argument("--gdn-spec-kernel", choices=["cuda", "triton"], default="cuda")
     parser.add_argument(
         "--topology", nargs="+", choices=["tp2", "pp2"], default=["tp2", "pp2"]
@@ -165,6 +168,7 @@ def main():
         ("linear_backend", args.linear_backend),
         ("gdn_decode_backend", args.gdn_backend),
         ("kv_cache_backend", args.kv_writer),
+        ("attention_backend", args.attention_backend),
     ):
         if value is not None:
             quantization_config[key] = value

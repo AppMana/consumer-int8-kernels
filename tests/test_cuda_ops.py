@@ -330,3 +330,59 @@ def test_cache_writer_matches_per_head_encoding_and_preserves_padding(layout, he
         for offset in range(4):
             if (block, offset) not in touched:
                 assert (cache[block, :, offset] == 55).all()
+
+
+@pytest.mark.parametrize("heads,layout", [(2, "HND"), (4, "NHD")])
+def test_unpack_kv_cache_preserves_scales_pages_and_graph_updates(heads, layout):
+    """FlashAttention's BF16 scratch pages must reflect current device metadata."""
+    torch.manual_seed(181)
+    block_size, blocks, capacity = 32, 32, 512
+    shape = (blocks, heads, block_size, 520)
+    cache = torch.empty(
+        shape if layout == "HND" else (blocks, block_size, heads, 520),
+        device="cuda",
+        dtype=torch.int8,
+    )
+    if layout == "NHD":
+        cache = cache.transpose(1, 2)
+    source_key = torch.randn(
+        blocks * block_size, heads, 256, device="cuda", dtype=torch.bfloat16
+    )
+    source_value = torch.randn_like(source_key)
+    ops.kv_cache_update(
+        source_key,
+        source_value,
+        cache,
+        torch.arange(blocks * block_size, device="cuda"),
+    )
+    table = torch.randperm(blocks, device="cuda", dtype=torch.int32).reshape(2, 16)
+    lengths = torch.tensor([97, 499], device="cuda", dtype=torch.int32)
+    key = torch.full(
+        (2, capacity, heads, 256), -100.0, device="cuda", dtype=torch.bfloat16
+    )
+    value = torch.full_like(key, -100.0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ops.unpack_kv_cache(cache, table, lengths, key, value)
+    for seq_lengths in ([97, 499], [33, 255]):
+        lengths.copy_(torch.tensor(seq_lengths, device="cuda", dtype=torch.int32))
+        key.fill_(-100.0)
+        value.fill_(-100.0)
+        graph.replay()
+        for seq, length in enumerate(seq_lengths):
+            packed = (
+                cache[table[seq].long()]
+                .transpose(1, 2)
+                .reshape(-1, heads, 520)[:length]
+            )
+            for got, codes, scale in (
+                (key[seq, :length], packed[..., :256], packed[..., 256:260]),
+                (value[seq, :length], packed[..., 260:516], packed[..., 516:520]),
+            ):
+                expected = (
+                    codes.float() * scale.contiguous().view(torch.float32)
+                ).bfloat16()
+                torch.testing.assert_close(got, expected, atol=0, rtol=0)
+            assert (key[seq, length:] == -100.0).all()
+            assert (value[seq, length:] == -100.0).all()
+        table.copy_(table.flip(1))

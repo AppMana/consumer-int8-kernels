@@ -52,7 +52,9 @@ def main():
     )
     parser.add_argument("--vision-repo", type=Path)
     parser.add_argument(
-        "--attention-backend", choices=["triton", "consumer_int8"], default="triton"
+        "--attention-backend",
+        choices=["triton", "consumer_int8", "consumer_fa2"],
+        default="triton",
     )
     parser.add_argument("--vision-concurrency", type=int, nargs="+", default=[1])
     parser.add_argument("--port", type=int, default=18083)

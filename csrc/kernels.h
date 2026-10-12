@@ -3,6 +3,11 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+void unpack_kv_cache(const int8_t* cache, const int32_t* table,
+    const int32_t* lengths, void* key, void* value, int heads, int capacity,
+    int sequences, int block_size, int table_stride,
+    int64_t cb, int64_t ch, int64_t ct, cudaStream_t stream);
+
 void paged_attention(const void* query, const int8_t* cache,
     const int32_t* table, const int32_t* offsets, const int32_t* lengths, void* out,
     int heads, int kv_heads, int block_size, int table_stride, int sequences, int max_query,
