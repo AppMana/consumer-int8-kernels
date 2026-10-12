@@ -5,8 +5,9 @@ ABI bindings targeting torch 2.10 and Python 3.10 or newer. It does not import
 vLLM. The serving engine owns allocation, cache scheduling and backend selection.
 
 This is an implementation in progress. The checkpoint encoder, CUDA kernels and
-vLLM adapter are implemented; model quality, serving performance selection and
-release validation are pending. An encoded checkpoint
+vLLM adapter are implemented. Initial text and vision checks pass with AllSpark
+linears, including the optional native GDN/cache path. Long-context retrieval,
+MTP, serving performance selection and release validation are pending. An encoded checkpoint
 is marked `encoded_unvalidated` until those gates pass.
 
 ## Build and test
@@ -96,8 +97,17 @@ Restoring AllSpark's packed weights on every call reduces that gain to 1.41x,
 with all twelve shapes still faster. At 256 rows, restoration erases the gain.
 This supports a candidate dispatch that retains AllSpark for small batches
 and restores one transient layer for 1024-row prefill, without a persistent
-second weight copy. These are CUDA-graph kernel timings, not serving rates;
-activation quantization still needs the model NLL and retrieval gates.
+second weight copy. These are CUDA-graph kernel timings, not serving rates.
+
+The first complete 65,504-token quality run measured BF16 mean NLL 1.951675.
+AllSpark INT8 increased NLL by 0.005659 and scored 85/100 vision fixtures at
+both C=1 and C=4, with no newly incorrect cases against BF16's 82/100.
+AllSpark plus native GDN/cache also passed these checks. Applying W8A8 prefill
+to all language projections passed NLL but regressed one vision case at C=4;
+that mode remains experimental. The `consumer_int8_mlp_prefill` candidate
+restricts activation quantization to MLP projections, preserving BF16
+activations in attention projections and the MTP input projection. It must
+pass the same quality and retrieval checks before performance selection.
 
 `benchmarks/microbench_cache.py` compares the native paged INT8 cache writer
 against vLLM's Triton writer using Qwen's strided projection output, two/four

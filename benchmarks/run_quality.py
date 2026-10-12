@@ -39,7 +39,7 @@ def main():
     parser.add_argument("--cpu-offload-gb", type=float, default=12)
     parser.add_argument(
         "--linear-backend",
-        choices=["allspark", "consumer_int8_prefill"],
+        choices=["allspark", "consumer_int8_prefill", "consumer_int8_mlp_prefill"],
         default="allspark",
     )
     parser.add_argument(

@@ -130,6 +130,7 @@ def main():
             "consumer_int8",
             "consumer_int8_hybrid",
             "consumer_int8_prefill",
+            "consumer_int8_mlp_prefill",
         ],
     )
     parser.add_argument("--gdn-backend", choices=["triton", "consumer_int8"])
