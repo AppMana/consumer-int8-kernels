@@ -99,6 +99,14 @@ and restores one transient layer for 1024-row prefill, without a persistent
 second weight copy. These are CUDA-graph kernel timings, not serving rates;
 activation quantization still needs the model NLL and retrieval gates.
 
+`benchmarks/microbench_cache.py` compares the native paged INT8 cache writer
+against vLLM's Triton writer using Qwen's strided projection output, two/four
+KV heads, HND/NHD layouts, and padded slots. All 24 A5000 cases match the
+entire cache byte-for-byte, including FP32 scales. Small-batch writes are
+1.05–1.08x faster; 256-row and 1024-row writes are about 2.0x and 3.2x faster.
+The native writer uses the same PTX division rounding as Triton. These
+measurements cover cache insertion only, not attention or model throughput.
+
 `benchmarks/needle_matrix.py` targets one explicitly configured TP/PP/MTP
 server per invocation. It runs C=1/2/4 and 8k/16k/32k prompts with a 1k-token
 needle, one warmup and three measured cohorts per cell. Early/middle/late
