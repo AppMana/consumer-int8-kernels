@@ -15,6 +15,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+VISION_LIMITS = {"image": {"count": 1, "width": 1024, "height": 768}, "video": 0}
+
 
 def write_json(path, value):
     pending = path.with_suffix(".json.tmp")
@@ -233,6 +235,8 @@ def main():
                 "float32",
                 "--mm-encoder-tp-mode",
                 "data",
+                "--limit-mm-per-prompt",
+                json.dumps(VISION_LIMITS),
                 "--attention-backend",
                 "TRITON_ATTN",
                 "--max-model-len",

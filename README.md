@@ -131,6 +131,9 @@ It saves launch commands, package versions, checkpoint configuration and GPU
 telemetry. Foreign compute processes invalidate performance selection. The
 optional `benchmark` dependencies cover the HTTP clients and corpus preparation;
 serving still requires the separately built vLLM integration.
+Both launchers retain the vision tower and allow one image per request, with
+a 1024-by-768 dummy image for memory profiling; video is disabled for these
+text/image evaluations. The 100 vision fixtures are at most 800 by 548 pixels.
 
 `benchmarks/quality_nll.py` prepares 32 fixed, disjoint 2048-token windows from
 the pinned WikiText-2 raw test split, scores their teacher-forced likelihoods

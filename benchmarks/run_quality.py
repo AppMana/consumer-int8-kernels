@@ -13,7 +13,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from run_matrix import GpuMonitor, git_head, stop_server, write_json
+from run_matrix import VISION_LIMITS, GpuMonitor, git_head, stop_server, write_json
 
 
 def vision_fixture_digest(repo):
@@ -115,6 +115,8 @@ def main():
         "float32",
         "--mm-encoder-tp-mode",
         "data",
+        "--limit-mm-per-prompt",
+        json.dumps(VISION_LIMITS),
         "--attention-backend",
         "TRITON_ATTN",
         "--max-model-len",
