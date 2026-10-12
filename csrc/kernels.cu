@@ -130,6 +130,13 @@ __global__ void gdn_decode_kernel(const __nv_bfloat16* q, const __nv_bfloat16* k
   }
 }
 
+// Match Triton's per-token-head cache encoding, including scale rounding.
+__device__ __forceinline__ float cache_divide(float x, float y) {
+  float result;
+  asm("div.full.f32 %0, %1, %2;" : "=f"(result) : "f"(x), "f"(y));
+  return result;
+}
+
 __global__ void kv_cache_update_kernel(
     const __nv_bfloat16* key, const __nv_bfloat16* value, int8_t* cache,
     const int64_t* slots, int tokens, int heads, int blocks, int block_size,
@@ -151,8 +158,9 @@ __global__ void kv_cache_update_kernel(
     km = fmaxf(km, __shfl_xor_sync(0xffffffff, km, mask));
     vm = fmaxf(vm, __shfl_xor_sync(0xffffffff, vm, mask));
   }
-  const float ks = fmaxf(km / 127.f, 1e-6f), vs = fmaxf(vm / 127.f, 1e-6f);
-  const float ki = 1.f / ks, vi = 1.f / vs;
+  const float ks = fmaxf(cache_divide(km, 127.f), 1e-6f);
+  const float vs = fmaxf(cache_divide(vm, 127.f), 1e-6f);
+  const float ki = cache_divide(1.f, ks), vi = cache_divide(1.f, vs);
   int8_t* destination = cache + (slot / block_size) * cb + head * ch + (slot % block_size) * ct;
   if (!lane) {
     *reinterpret_cast<float*>(destination + 256) = ks;
