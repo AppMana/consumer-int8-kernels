@@ -39,6 +39,7 @@ def main():
     parser.add_argument("--topology", choices=["tp2", "pp2"], default="tp2")
     parser.add_argument("--mtp", choices=["off", "on"], default="off")
     parser.add_argument("--cpu-offload-gb", type=float, default=12)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=1024)
     parser.add_argument(
         "--linear-backend",
         choices=["allspark", "consumer_int8_prefill", "consumer_int8_mlp_prefill"],
@@ -134,7 +135,7 @@ def main():
         "--max-num-seqs",
         str(1 if args.reference else max(args.vision_concurrency)),
         "--max-num-batched-tokens",
-        "1024",
+        str(args.max_num_batched_tokens),
         "--enable-chunked-prefill",
         "--gpu-memory-utilization",
         "0.85",

@@ -54,6 +54,7 @@ quantization format.
 | `quantize_rows` | BF16 `[M,K]` | Dynamic signed INT8 activations and FP32 row scales |
 | `channel_mm` | Signed INT8 activations, biased UINT8 weights | `m16n8k32` integer MMA, BF16 output; diagnostic candidate |
 | `cutlass_channel_mm` | Signed INT8 activations/weights | SM86 tiled integer MMA, caller-owned INT32 workspace, BF16 output |
+| `fused_channel_mm` | Signed INT8 activations/weights | SM86 integer MMA with fused row/channel scaling to BF16, no INT32 output workspace |
 | `channel_gemv` | BF16 activations, canonical signed INT8 weights | Small-batch W8A16 with BF16 dequantized multiplicands and FP32 accumulation |
 | `unpack_allspark` | AllSpark N32K16 UINT8 weights and permuted BF16 scales | Lossless restoration of signed row-major INT8 weights and channel scales |
 | `gdn_decode` | BF16 Q/K/V, FP32 log decay and sigmoid gates | Head dimensions 128, normalized Q/K, FP32 recurrent update |
@@ -114,7 +115,17 @@ bound. Decode and unsupported attention modes retain Triton. In the isolated
 32k TP=2/C=4 shape, conversion plus FA2 takes 6.66 ms versus 43.00 ms for
 the original Triton kernel; the conversion is included and takes 0.72 ms.
 `benchmarks/microbench_attention.py` reproduces these kernel comparisons.
-Model quality and serving memory/throughput validation for FA2 are pending.
+The FA2 configuration passes NLL (+0.0070924) and scores 85/100 vision cases
+at C=1 and C=4 with no new BF16 failures. Serving memory/throughput validation
+is in progress.
+
+`fused_channel_mm` retains row-first FP32 scaling and BF16 channel scales.
+It matches the separate INT32 GEMM plus rescale bit for bit, including CUDA
+graph replay and partial tiles. Across ten actual TP=2/PP=2 projection shapes
+on one A5000, it is 1.17x faster at M=1024 and 1.21x faster at M=4096
+(geometric means, excluding activation quantization and weight restoration).
+All twenty shape/row combinations match the previous outputs exactly. The
+largest PP=2 MLP projection at M=4096 avoids a 544-MiB INT32 output buffer.
 
 GDN decode is floating-point arithmetic. INT8 cache storage does not imply
 integer attention arithmetic. The two matmul operators actually use integer

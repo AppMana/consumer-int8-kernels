@@ -25,6 +25,7 @@ setup(
                 "csrc/allspark_layout.cu",
                 "csrc/paged_attention.cu",
                 "csrc/kv_unpack.cu",
+                "csrc/fused_mm.cu",
             ],
             include_dirs=[
                 str(Path("third_party/cutlass/include").resolve()),

@@ -276,21 +276,30 @@ def test_channel_mm_rejects_unaligned_k_before_launch():
         )
 
 
-@pytest.mark.parametrize("m", [1, 17, 64, 256])
-def test_cutlass_schedules_match_integer_products_and_capture(m):
+@pytest.mark.parametrize("m", [1, 17, 64, 256, 1024, 1041])
+@pytest.mark.parametrize("fused", [False, True])
+def test_cutlass_schedules_match_integer_products_and_capture(m, fused):
     a = torch.randint(-127, 128, (m, 512), device="cuda", dtype=torch.int8)
     w = torch.randint(-127, 128, (128, 512), device="cuda", dtype=torch.int8)
     sa = torch.rand(m, device="cuda") / 127
     sw = (torch.rand(128, device="cuda") / 127).bfloat16()
     workspace = torch.empty(m, 128, device="cuda", dtype=torch.int32)
     out = torch.empty(m, 128, device="cuda", dtype=torch.bfloat16)
-    ops.cutlass_channel_mm(a, w, sa, sw, workspace, out)
+
+    def run():
+        if fused:
+            ops.fused_channel_mm(a, w, sa, sw, out)
+        else:
+            ops.cutlass_channel_mm(a, w, sa, sw, workspace, out)
+
+    run()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        ops.cutlass_channel_mm(a, w, sa, sw, workspace, out)
+        run()
     graph.replay()
     integer = a.cpu().int() @ w.cpu().int().T
-    torch.testing.assert_close(workspace.cpu(), integer, atol=0, rtol=0)
+    if not fused:
+        torch.testing.assert_close(workspace.cpu(), integer, atol=0, rtol=0)
     expected = (integer.float().cuda() * sa[:, None] * sw.float()[None, :]).bfloat16()
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
 

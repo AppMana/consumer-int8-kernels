@@ -48,11 +48,17 @@ def _unpack_mm(x, a, sa, packed, packed_scale, weights, scales, workspace, out):
     _quantized_mm(ops.cutlass_channel_mm, x, a, sa, weights, scales, workspace, out)
 
 
+def _unpack_fused_mm(x, a, sa, packed, packed_scale, weights, scales, out):
+    ops.unpack_allspark(packed, packed_scale, weights, scales)
+    _quantized_mm(ops.fused_channel_mm, x, a, sa, weights, scales, out)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True)
     parser.add_argument("--kind", choices=["gdn", "linear", "all"], default="all")
     parser.add_argument("--prefill-only", action="store_true")
+    parser.add_argument("--linear-rows", type=int, nargs="+")
     args = parser.parse_args()
     torch.manual_seed(20261011)
     results = {
@@ -173,7 +179,10 @@ def main():
             packed, packed_scale, _ = vops.allspark_repack_weight(
                 codes.T.contiguous(), scale[None].contiguous(), None, False
             )
-            for m in (256, 1024) if args.prefill_only else (1, 2, 4, 16, 256, 1024):
+            rows = args.linear_rows or (
+                (256, 1024) if args.prefill_only else (1, 2, 4, 16, 256, 1024)
+            )
+            for m in rows:
                 x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
                 a = torch.empty_like(x, dtype=torch.int8)
                 sa = torch.empty(m, device="cuda")
@@ -215,6 +224,14 @@ def main():
                     workspace,
                     out,
                 )
+                fused = partial(
+                    _quantized_mm, ops.fused_channel_mm, x, a, sa, signed, scale, out
+                )
+                cutlass()
+                expected = out.clone()
+                fused()
+                torch.testing.assert_close(out, expected, atol=0, rtol=0)
+                del expected
 
                 record(
                     {
@@ -228,9 +245,24 @@ def main():
                             else {"native_w8a8": time_us(native)}
                         ),
                         "cutlass_w8a8": time_us(cutlass),
+                        "fused_w8a8": time_us(fused),
+                        "fused_matches_separate_exactly": True,
                         "allspark_w8a16": time_us(allspark),
                         **(
                             {
+                                "unpack_fused_w8a8": time_us(
+                                    partial(
+                                        _unpack_fused_mm,
+                                        x,
+                                        a,
+                                        sa,
+                                        packed,
+                                        packed_scale.flatten(),
+                                        signed,
+                                        scale,
+                                        out,
+                                    )
+                                ),
                                 "unpack_cutlass_w8a8": time_us(
                                     partial(
                                         _unpack_mm,
@@ -244,7 +276,7 @@ def main():
                                         workspace,
                                         out,
                                     )
-                                )
+                                ),
                             }
                             if m >= 256
                             else {}

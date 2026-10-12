@@ -18,3 +18,11 @@ The checkpoint channel and group32 encodings match the AppMana vLLM fork's
 dsv4_int.py and common/vision_int8.py at
 899ced4cf9a4f33f6c0903f3e1858246c63f9fbd (Apache-2.0).
 https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms
+
+The SM80 CUTLASS visitor construction in csrc/fused_mm.cu follows vLLM's
+csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_c2x.cuh and
+cutlass_extensions/epilogue/scaled_mm_epilogues_c2x.hpp at
+bfa7e5b7afe40ebe48288801a2baf5c1135cd881 (Apache-2.0).
+https://github.com/vllm-project/vllm
+The adapter uses ordinary tiled scheduling, BF16 channel scales, and
+row-first scaling without an INT32 output workspace.

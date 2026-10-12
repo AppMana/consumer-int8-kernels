@@ -6,6 +6,7 @@
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
 #include <torch/headeronly/util/Exception.h>
 #include <limits>
+#include <optional>
 #include "kernels.h"
 
 using torch::stable::Tensor;
@@ -194,16 +195,21 @@ void boxed_gdn_packed(StableIValue* stack, uint64_t, uint64_t) {
       slots.scalar_type() == ScalarType::Long, stream_for(device));
   launch_check();
 }
-void boxed_cutlass_mm(StableIValue* stack, uint64_t, uint64_t) {
+void boxed_cutlass_mm_impl(StableIValue* stack, bool fused) {
   auto a = to<Tensor>(stack[0]), w = to<Tensor>(stack[1]);
   auto sa = to<Tensor>(stack[2]), sw = to<Tensor>(stack[3]);
-  auto workspace = to<Tensor>(stack[4]), out = to<Tensor>(stack[5]);
+  auto out = to<Tensor>(stack[fused ? 4 : 5]);
   const int device = a.get_device_index();
   check(a, ScalarType::Char, device); check(w, ScalarType::Char, device);
   check(sa, ScalarType::Float, device); check(sw, ScalarType::BFloat16, device);
-  check(workspace, ScalarType::Int, device); check(out, ScalarType::BFloat16, device);
-  STD_TORCH_CHECK(a.dim() == 2 && w.dim() == 2 && out.dim() == 2 &&
-                  workspace.sizes() == out.sizes(), "Expected matrices and matching workspace");
+  check(out, ScalarType::BFloat16, device);
+  STD_TORCH_CHECK(a.dim() == 2 && w.dim() == 2 && out.dim() == 2, "Expected matrices");
+  std::optional<Tensor> workspace;
+  if (!fused) {
+    workspace.emplace(to<Tensor>(stack[4]));
+    check(*workspace, ScalarType::Int, device);
+    STD_TORCH_CHECK(workspace->sizes() == out.sizes(), "Expected matching workspace");
+  }
   const int64_t m = a.size(0), n = w.size(0), k = a.size(1);
   STD_TORCH_CHECK(m > 0 && n > 0 && k > 0 && n % 4 == 0 && k % 32 == 0 &&
                   k <= 65536 && w.size(1) == k && out.size(0) == m &&
@@ -213,10 +219,21 @@ void boxed_cutlass_mm(StableIValue* stack, uint64_t, uint64_t) {
                   w.numel() <= std::numeric_limits<int>::max() &&
                   out.numel() <= std::numeric_limits<int>::max(), "Matrix too large");
   torch::stable::accelerator::DeviceGuard guard(device);
-  cutlass_channel_mm(static_cast<int8_t*>(a.data_ptr()), static_cast<int8_t*>(w.data_ptr()),
-      static_cast<float*>(sa.data_ptr()), sw.data_ptr(), static_cast<int32_t*>(workspace.data_ptr()),
-      out.data_ptr(), m, n, k, stream_for(device));
+  if (fused) {
+    fused_channel_mm(static_cast<int8_t*>(a.data_ptr()), static_cast<int8_t*>(w.data_ptr()),
+        static_cast<float*>(sa.data_ptr()), sw.data_ptr(), out.data_ptr(), m, n, k, stream_for(device));
+  } else {
+    cutlass_channel_mm(static_cast<int8_t*>(a.data_ptr()), static_cast<int8_t*>(w.data_ptr()),
+        static_cast<float*>(sa.data_ptr()), sw.data_ptr(), static_cast<int32_t*>(workspace->data_ptr()),
+        out.data_ptr(), m, n, k, stream_for(device));
+  }
   launch_check();
+}
+void boxed_cutlass_mm(StableIValue* stack, uint64_t, uint64_t) {
+  boxed_cutlass_mm_impl(stack, false);
+}
+void boxed_fused_mm(StableIValue* stack, uint64_t, uint64_t) {
+  boxed_cutlass_mm_impl(stack, true);
 }
 void boxed_kv_cache_update(StableIValue* stack, uint64_t, uint64_t) {
   auto key = to<Tensor>(stack[0]), value = to<Tensor>(stack[1]);
@@ -361,6 +378,7 @@ void boxed_paged_attention(StableIValue* stack, uint64_t, uint64_t) {
 }  // namespace
 
 STABLE_TORCH_LIBRARY(consumer_int8, m) {
+  m.def("fused_channel_mm(Tensor a, Tensor w, Tensor a_scale, Tensor w_scale, Tensor(a!) out) -> ()");
   m.def("unpack_kv_cache(Tensor cache, Tensor table, Tensor lengths, Tensor(a!) key, Tensor(b!) value) -> ()");
   m.def("paged_attention(Tensor query, Tensor cache, Tensor table, Tensor offsets, Tensor lengths, Tensor(a!) out, int max_query, float scale) -> ()");
   m.def("quantize_rows(Tensor input, Tensor(a!) codes, Tensor(b!) scales) -> ()");
@@ -374,6 +392,7 @@ STABLE_TORCH_LIBRARY(consumer_int8, m) {
   m.def("gdn_prefill(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor initial, Tensor(a!) final, Tensor(b!) out, Tensor(c!) cumulative, Tensor(d!) w, Tensor(e!) u, Tensor(f!) v_new, Tensor(g!) h_chunk, int num_sms) -> ()");
 }
 STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
+  m.impl("fused_channel_mm", &boxed_fused_mm);
   m.impl("unpack_kv_cache", &boxed_unpack_kv_cache);
   m.impl("paged_attention", &boxed_paged_attention);
   m.impl("quantize_rows", &boxed_quant);

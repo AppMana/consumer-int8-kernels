@@ -20,6 +20,12 @@ cutlass_channel_mm = torch.ops.consumer_int8.cutlass_channel_mm
 kv_cache_update = torch.ops.consumer_int8.kv_cache_update
 paged_attention = torch.ops.consumer_int8.paged_attention
 unpack_kv_cache = torch.ops.consumer_int8.unpack_kv_cache
+fused_channel_mm = torch.ops.consumer_int8.fused_channel_mm
+
+
+@torch.library.register_fake("consumer_int8::fused_channel_mm")
+def _fused_channel_mm_fake(a, w, a_scale, w_scale, out):
+    return None
 
 
 @torch.library.register_fake("consumer_int8::unpack_kv_cache")
