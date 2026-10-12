@@ -126,9 +126,16 @@ on one A5000, it is 1.17x faster at M=1024 and 1.21x faster at M=4096
 (geometric means, excluding activation quantization and weight restoration).
 All twenty shape/row combinations match the previous outputs exactly. The
 largest PP=2 MLP projection at M=4096 avoids a 544-MiB INT32 output buffer.
+The automatic schedule uses a 128x256x64 tile with eight warps and four
+pipeline stages at M>=2048; smaller inputs retain the original schedules.
+Against the fused 128x128x64 five-stage tile, this improves ten-shape
+geometric means by 1.05x/1.08x/1.15x at M=2048/3328/4096, with all outputs
+bitwise unchanged. `microbench.py --fused-schedule 5` selects the original
+schedule for comparison; 0 selects automatic dispatch. Values 1–4 expose
+the measured tuning candidates.
 
 GDN decode is floating-point arithmetic. INT8 cache storage does not imply
-integer attention arithmetic. The two matmul operators actually use integer
+integer attention arithmetic. The three matmul operators actually use integer
 tensor-core instructions. No candidate is selected for serving solely because
 it uses CUDA or integer arithmetic; numerical and performance gates apply.
 

@@ -276,7 +276,7 @@ def test_channel_mm_rejects_unaligned_k_before_launch():
         )
 
 
-@pytest.mark.parametrize("m", [1, 17, 64, 256, 1024, 1041])
+@pytest.mark.parametrize("m", [1, 17, 64, 256, 1024, 1041, 2048, 2057])
 @pytest.mark.parametrize("fused", [False, True])
 def test_cutlass_schedules_match_integer_products_and_capture(m, fused):
     a = torch.randint(-127, 128, (m, 512), device="cuda", dtype=torch.int8)

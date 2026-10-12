@@ -48,9 +48,9 @@ def _unpack_mm(x, a, sa, packed, packed_scale, weights, scales, workspace, out):
     _quantized_mm(ops.cutlass_channel_mm, x, a, sa, weights, scales, workspace, out)
 
 
-def _unpack_fused_mm(x, a, sa, packed, packed_scale, weights, scales, out):
+def _unpack_fused_mm(x, a, sa, packed, packed_scale, weights, scales, out, schedule):
     ops.unpack_allspark(packed, packed_scale, weights, scales)
-    _quantized_mm(ops.fused_channel_mm, x, a, sa, weights, scales, out)
+    _quantized_mm(ops.fused_channel_mm, x, a, sa, weights, scales, out, schedule)
 
 
 def main():
@@ -59,6 +59,7 @@ def main():
     parser.add_argument("--kind", choices=["gdn", "linear", "all"], default="all")
     parser.add_argument("--prefill-only", action="store_true")
     parser.add_argument("--linear-rows", type=int, nargs="+")
+    parser.add_argument("--fused-schedule", type=int, choices=range(6), default=0)
     args = parser.parse_args()
     torch.manual_seed(20261011)
     results = {
@@ -225,7 +226,15 @@ def main():
                     out,
                 )
                 fused = partial(
-                    _quantized_mm, ops.fused_channel_mm, x, a, sa, signed, scale, out
+                    _quantized_mm,
+                    ops.fused_channel_mm,
+                    x,
+                    a,
+                    sa,
+                    signed,
+                    scale,
+                    out,
+                    args.fused_schedule,
                 )
                 cutlass()
                 expected = out.clone()
@@ -246,6 +255,7 @@ def main():
                         ),
                         "cutlass_w8a8": time_us(cutlass),
                         "fused_w8a8": time_us(fused),
+                        "fused_schedule": args.fused_schedule,
                         "fused_matches_separate_exactly": True,
                         "allspark_w8a16": time_us(allspark),
                         **(
@@ -261,6 +271,7 @@ def main():
                                         signed,
                                         scale,
                                         out,
+                                        args.fused_schedule,
                                     )
                                 ),
                                 "unpack_cutlass_w8a8": time_us(

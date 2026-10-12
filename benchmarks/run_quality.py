@@ -2,6 +2,7 @@
 """Own an isolated two-GPU server for fixed-corpus NLL and vision validation."""
 
 import argparse
+import asyncio
 import hashlib
 import importlib.metadata
 import json
@@ -14,6 +15,39 @@ import urllib.request
 from pathlib import Path
 
 from run_matrix import VISION_LIMITS, GpuMonitor, git_head, stop_server, write_json
+
+
+async def capacity_smoke(base_url, model, output):
+    from needle_matrix import make_prompt, run_request
+    from openai import AsyncOpenAI
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+    async with AsyncOpenAI(
+        base_url=base_url + "/v1", api_key="none", timeout=900, max_retries=0
+    ) as client:
+        prompts = [
+            make_prompt(tokenizer, 32000, 1000, 20261012, i, (0.1, 0.5, 0.9)[i % 3])
+            for i in range(4)
+        ]
+        rows = await asyncio.gather(
+            *[run_request(client, "qwen-quality", *prompt, 16) for prompt in prompts]
+        )
+    write_json(
+        output,
+        dict(
+            purpose="C=4 x 32k capacity/scheduling check; not a retrieval or throughput gate",
+            results=rows,
+        ),
+    )
+    for row in rows:
+        if (
+            row["prompt_tokens"] != 32000
+            or row["cached_tokens"]
+            or not row["engine_phase_timing"]
+            or row["engine_phase_timing"]["num_preemptions"]
+        ):
+            raise RuntimeError("Capacity smoke failed token/cache/preemption checks")
 
 
 def vision_fixture_digest(repo):
@@ -40,6 +74,9 @@ def main():
     parser.add_argument("--mtp", choices=["off", "on"], default="off")
     parser.add_argument("--cpu-offload-gb", type=float, default=12)
     parser.add_argument("--max-num-batched-tokens", type=int, default=1024)
+    parser.add_argument("--max-model-len", type=int, default=8192)
+    parser.add_argument("--kv-cache-memory-bytes", type=int, default=1073741824)
+    parser.add_argument("--capacity-smoke", action="store_true")
     parser.add_argument(
         "--linear-backend",
         choices=["allspark", "consumer_int8_prefill", "consumer_int8_mlp_prefill"],
@@ -60,6 +97,10 @@ def main():
     parser.add_argument("--vision-concurrency", type=int, nargs="+", default=[1])
     parser.add_argument("--port", type=int, default=18083)
     args = parser.parse_args()
+    if args.capacity_smoke and (
+        args.reference or args.max_model_len < 32016 or max(args.vision_concurrency) < 4
+    ):
+        parser.error("Capacity smoke requires a resident model, length >=32016 and C=4")
     tp, pp = (2, 1) if args.topology == "tp2" else (1, 2)
     repo = args.vllm_repo.resolve()
     model = args.model.resolve()
@@ -131,7 +172,7 @@ def main():
         "--attention-backend",
         "TRITON_ATTN",
         "--max-model-len",
-        "8192",
+        str(args.max_model_len),
         "--max-num-seqs",
         str(1 if args.reference else max(args.vision_concurrency)),
         "--max-num-batched-tokens",
@@ -140,7 +181,7 @@ def main():
         "--gpu-memory-utilization",
         "0.85",
         "--kv-cache-memory-bytes",
-        "1073741824",
+        str(args.kv_cache_memory_bytes),
         "--no-enable-prefix-caching",
         "--enable-per-request-metrics",
         "--async-scheduling",
@@ -284,6 +325,12 @@ def main():
                     report = json.loads(report_path.read_text())
                     report["fixture_sha256"] = digest
                     write_json(report_path, report)
+            if args.capacity_smoke:
+                asyncio.run(
+                    capacity_smoke(
+                        base_url, model, args.output_dir / "capacity-smoke.json"
+                    )
+                )
             manifest["status"] = "completed"
         except Exception as exc:
             manifest.update(status="failed", error=repr(exc))

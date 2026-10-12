@@ -220,8 +220,10 @@ void boxed_cutlass_mm_impl(StableIValue* stack, bool fused) {
                   out.numel() <= std::numeric_limits<int>::max(), "Matrix too large");
   torch::stable::accelerator::DeviceGuard guard(device);
   if (fused) {
+    const int64_t schedule = to<int64_t>(stack[5]);
+    STD_TORCH_CHECK(schedule >= 0 && schedule <= 5, "Invalid fused GEMM schedule");
     fused_channel_mm(static_cast<int8_t*>(a.data_ptr()), static_cast<int8_t*>(w.data_ptr()),
-        static_cast<float*>(sa.data_ptr()), sw.data_ptr(), out.data_ptr(), m, n, k, stream_for(device));
+        static_cast<float*>(sa.data_ptr()), sw.data_ptr(), out.data_ptr(), m, n, k, schedule, stream_for(device));
   } else {
     cutlass_channel_mm(static_cast<int8_t*>(a.data_ptr()), static_cast<int8_t*>(w.data_ptr()),
         static_cast<float*>(sa.data_ptr()), sw.data_ptr(), static_cast<int32_t*>(workspace->data_ptr()),
@@ -378,7 +380,7 @@ void boxed_paged_attention(StableIValue* stack, uint64_t, uint64_t) {
 }  // namespace
 
 STABLE_TORCH_LIBRARY(consumer_int8, m) {
-  m.def("fused_channel_mm(Tensor a, Tensor w, Tensor a_scale, Tensor w_scale, Tensor(a!) out) -> ()");
+  m.def("fused_channel_mm(Tensor a, Tensor w, Tensor a_scale, Tensor w_scale, Tensor(a!) out, int schedule=0) -> ()");
   m.def("unpack_kv_cache(Tensor cache, Tensor table, Tensor lengths, Tensor(a!) key, Tensor(b!) value) -> ()");
   m.def("paged_attention(Tensor query, Tensor cache, Tensor table, Tensor offsets, Tensor lengths, Tensor(a!) out, int max_query, float scale) -> ()");
   m.def("quantize_rows(Tensor input, Tensor(a!) codes, Tensor(b!) scales) -> ()");

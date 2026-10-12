@@ -4,7 +4,7 @@
 #include <cstdint>
 
 void fused_channel_mm(const int8_t* a, const int8_t* w, const float* sa,
-    const void* sw, void* out, int m, int n, int k, cudaStream_t stream);
+    const void* sw, void* out, int m, int n, int k, int schedule, cudaStream_t stream);
 
 void unpack_kv_cache(const int8_t* cache, const int32_t* table,
     const int32_t* lengths, void* key, void* value, int heads, int capacity,

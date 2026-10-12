@@ -24,7 +24,7 @@ fused_channel_mm = torch.ops.consumer_int8.fused_channel_mm
 
 
 @torch.library.register_fake("consumer_int8::fused_channel_mm")
-def _fused_channel_mm_fake(a, w, a_scale, w_scale, out):
+def _fused_channel_mm_fake(a, w, a_scale, w_scale, out, schedule=0):
     return None
 
 
