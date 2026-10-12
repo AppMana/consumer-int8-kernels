@@ -4,11 +4,14 @@ An independent AOT CUDA package for Qwen3.8-27B on SM86 GPUs, with torch stable
 ABI bindings targeting torch 2.10 and Python 3.10 or newer. It does not import
 vLLM. The serving engine owns allocation, cache scheduling and backend selection.
 
-This is an implementation in progress. The checkpoint encoder, CUDA kernels and
-vLLM adapter are implemented. Initial text and vision checks pass with AllSpark
-linears, including the optional native GDN/cache path. Long-context retrieval,
-MTP, serving performance selection and release validation are pending. An encoded checkpoint
-is marked `encoded_unvalidated` until those gates pass.
+The checkpoint encoder, CUDA kernels and vLLM adapter are implemented. The
+[two-A5000 evaluation](docs/a5000-2026-10-12.md) covers text and vision quality,
+TP=2 and PP=2, MTP off/on, and all 36 long-context retrieval/throughput cells.
+The selected configuration uses AllSpark projections with native GDN decode
+and INT8 cache insertion. W8A8 prefill remains experimental after a vision
+regression. Hardware release gates remain pending, so the checkpoint is an
+unreleased candidate. Its immutable encoder report retains
+`encoded_unvalidated`; the separate validation report records completed gates.
 
 ## Build and test
 
@@ -192,3 +195,10 @@ Its documented causal mode requires equal Q and KV sequence lengths, so it
 does not directly replace paged attention or continuation-prefill attention.
 Backend selection still requires shape, cache-layout, quality and serving
 measurements; the presence of an SM80 build alone is insufficient.
+
+[HyperQwen's INT8 prefill patch](https://github.com/syv-ai/HyperQwen/blob/95ee3b64b0df7014ee2626529524d6b99c3dcdd1/patches/prefill-attn-int8.patch)
+is another useful reference: INT8 QK and BF16 PV over paged BF16 KV. Its
+serving gate is one sequence with 24 query heads, four KV heads and dimension
+256. Adapting it would require this package's packed INT8 cache and TP=2 head
+geometry, followed by matching quality and serving measurements. Its INT4
+weight recipes and optional FP16 recurrent state are different formats.
