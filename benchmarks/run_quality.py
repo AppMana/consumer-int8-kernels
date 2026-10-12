@@ -76,6 +76,7 @@ def main():
     ):
         raise RuntimeError("Quality validation requires otherwise idle GPUs")
     with socket.socket() as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         probe.bind(("127.0.0.1", args.port))
     args.output_dir.mkdir(parents=True, exist_ok=False)
     config_bytes = (model / "config.json").read_bytes()
