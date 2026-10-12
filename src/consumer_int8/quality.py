@@ -37,6 +37,15 @@ def compare_nll(reference: dict, candidate: dict, limit: float = 0.02) -> dict:
     if not reference.get("corpus_sha256"):
         raise ValueError("Missing evaluation corpus identity")
     ref_rows, got_rows = reference.get("rows", []), candidate.get("rows", [])
+    for result in (reference, candidate):
+        expected = result.get("expected_windows")
+        if (
+            result.get("complete") is not True
+            or not isinstance(expected, int)
+            or expected < 2
+            or len(result.get("rows", [])) != expected
+        ):
+            raise ValueError("Incomplete evaluation: every planned window must finish")
     if not ref_rows or len(ref_rows) != len(got_rows):
         raise ValueError("Both models must score every evaluation window")
     totals = [0.0, 0.0]

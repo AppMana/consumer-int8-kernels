@@ -62,6 +62,8 @@ def score(args):
         model=args.model,
         server=args.base_url,
         provenance=json.loads(args.provenance.read_text()),
+        expected_windows=len(corpus["windows"]),
+        complete=False,
         rows=[],
     )
     for index, tokens in enumerate(corpus["windows"]):

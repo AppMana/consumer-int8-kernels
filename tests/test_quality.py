@@ -43,6 +43,8 @@ def test_fail_closed_on_changed_or_missing_evaluation_likelihoods(fault):
 def test_weight_by_scored_tokens_and_reject_mismatched_windows():
     reference = dict(
         corpus_sha256="corpus",
+        expected_windows=2,
+        complete=True,
         rows=[
             dict(token_ids_sha256="a", scored_tokens=1, nll_sum=0.5),
             dict(token_ids_sha256="b", scored_tokens=9, nll_sum=9.0),
@@ -57,3 +59,17 @@ def test_weight_by_scored_tokens_and_reject_mismatched_windows():
     candidate["rows"][1]["token_ids_sha256"] = "changed"
     with pytest.raises(ValueError):
         compare_nll(reference, candidate)
+
+
+def test_equal_partial_runs_cannot_pass_quality_gate():
+    partial = dict(
+        corpus_sha256="corpus",
+        expected_windows=32,
+        complete=False,
+        rows=[dict(token_ids_sha256="a", scored_tokens=2047, nll_sum=1000.0)],
+    )
+    with pytest.raises(ValueError, match="Incomplete"):
+        compare_nll(partial, partial)
+    partial["complete"] = True
+    with pytest.raises(ValueError, match="Incomplete"):
+        compare_nll(partial, partial)
