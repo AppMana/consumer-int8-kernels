@@ -103,3 +103,12 @@ request's first output token. These are elapsed request-phase rates, including
 scheduling gaps inside a phase, rather than isolated GPU kernel throughput.
 Client TTFT, end-to-end latency and stream chunk gaps are recorded separately.
 The harness fails closed if engine timing or actual token usage is missing.
+
+`benchmarks/quality_nll.py` prepares 32 fixed, disjoint 2048-token windows from
+the pinned WikiText-2 raw test split, scores their teacher-forced likelihoods
+through `/v1/completions`, and compares mean NLL with a BF16 reference.
+The default allowed increase is 0.02 nats per scored token. The first token
+of each window is excluded; token identity, likelihood completeness and corpus
+checksums are checked before comparison. Save each server's launch manifest as
+the scoring run's provenance. This text check does not replace the vision,
+needle-retrieval or MTP checks.

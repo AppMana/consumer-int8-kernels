@@ -158,7 +158,8 @@ def main():
             (5120, 8704),  # MLP down, TP2 (output dimension stays replicated)
             (5120, 6144),  # Attention output, PP2
             (5120, 3072),  # Attention output, TP2
-            (5120, 10240),  # MTP fusion (replicated)
+            (5120, 10240),  # MTP fusion, PP2
+            (2560, 10240),  # MTP fusion, TP2 (column parallel + gather)
         ]:
             weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.01
             codes, scale = quantize_channel(weight)
