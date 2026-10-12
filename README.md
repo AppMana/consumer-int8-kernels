@@ -162,13 +162,15 @@ checksums are checked before comparison. Save each server's launch manifest as
 the scoring run's provenance. This text check does not replace the vision,
 needle-retrieval or MTP checks.
 
-`benchmarks/run_quality.py` owns a TP=2 server, records GPU interference, runs
+`benchmarks/run_quality.py` owns a TP=2 server by default, records GPU interference, runs
 the fixed NLL corpus and optionally the AppMana 100-image fixture set. Use
 `--reference --cpu-offload-gb 12` with the original BF16 snapshot for the
 reference on two 24-GB GPUs. Quantized candidates use the same corpus and
 vision fixtures. The runner fingerprints image contents as well as prompts;
 `benchmarks/compare_vision.py` rejects every newly incorrect answer, even if
 other improvements leave aggregate accuracy unchanged.
+Use `--topology pp2` and `--mtp on` to validate pipeline parallelism and MTP
+with the same corpus and fixtures before promoting those serving configurations.
 
 ## Existing full-attention implementations
 

@@ -36,6 +36,8 @@ def main():
     parser.add_argument("--corpus", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--reference", action="store_true")
+    parser.add_argument("--topology", choices=["tp2", "pp2"], default="tp2")
+    parser.add_argument("--mtp", choices=["off", "on"], default="off")
     parser.add_argument("--cpu-offload-gb", type=float, default=12)
     parser.add_argument(
         "--linear-backend",
@@ -52,6 +54,7 @@ def main():
     parser.add_argument("--vision-concurrency", type=int, nargs="+", default=[1])
     parser.add_argument("--port", type=int, default=18083)
     args = parser.parse_args()
+    tp, pp = (2, 1) if args.topology == "tp2" else (1, 2)
     repo = args.vllm_repo.resolve()
     model = args.model.resolve()
     package = Path(__file__).resolve().parents[1]
@@ -101,9 +104,9 @@ def main():
         "--served-model-name",
         "qwen-quality",
         "--tensor-parallel-size",
-        "2",
+        str(tp),
         "--pipeline-parallel-size",
-        "1",
+        str(pp),
         "--distributed-executor-backend",
         "mp",
         "--safetensors-load-strategy",
@@ -145,6 +148,11 @@ def main():
         command += ["--cpu-offload-gb", str(args.cpu_offload_gb), "--enforce-eager"]
     else:
         command += ["--hf-overrides", json.dumps(overrides)]
+    if args.mtp == "on":
+        command += [
+            "--speculative-config",
+            json.dumps(dict(method="mtp", num_speculative_tokens=1)),
+        ]
     manifest = dict(
         vllm_commit=git_head(repo),
         kernels_commit=git_head(package),
@@ -152,6 +160,9 @@ def main():
         config_sha256=hashlib.sha256(config_bytes).hexdigest(),
         hf_overrides=overrides,
         reference=args.reference,
+        tp=tp,
+        pp=pp,
+        mtp=args.mtp,
         command=command,
         cpu_offload_gb=args.cpu_offload_gb if args.reference else 0,
         python=sys.executable,
