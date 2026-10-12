@@ -70,3 +70,42 @@ def compare_nll(reference: dict, candidate: dict, limit: float = 0.02) -> dict:
         mean_nll_delta_limit=limit,
         passed=delta <= limit,
     )
+
+
+def compare_vision(reference: dict, candidate: dict, expected_cases: int = 100) -> dict:
+    """Reject any newly incorrect fixture, even when total accuracy is unchanged."""
+    if not reference.get("fixture_sha256") or (
+        reference["fixture_sha256"] != candidate.get("fixture_sha256")
+    ):
+        raise ValueError("Vision fixture contents differ or lack a checksum")
+    indexed = []
+    for report in (reference, candidate):
+        rows = report.get("results", [])
+        if report.get("cases") != expected_cases or len(rows) != expected_cases:
+            raise ValueError("Incomplete vision evaluation")
+        cases = {}
+        for row in rows:
+            if "error" in row:
+                raise ValueError("Vision evaluation contains request errors")
+            key = (row["image"], row["prompt"], row["answer"])
+            if key in cases:
+                raise ValueError("Duplicate vision fixture")
+            correct = (
+                row["text"].strip().strip("`\"' .\n").casefold()
+                == row["answer"].casefold()
+            )
+            if row.get("correct") is not correct:
+                raise ValueError("Vision score disagrees with the recorded answer")
+            cases[key] = correct
+        indexed.append(cases)
+    ref, got = indexed
+    if ref.keys() != got.keys():
+        raise ValueError("Vision fixture identities differ")
+    regressions = [key[0] for key in ref if ref[key] and not got[key]]
+    return dict(
+        cases=expected_cases,
+        reference_correct=sum(ref.values()),
+        candidate_correct=sum(got.values()),
+        regressions=regressions,
+        passed=not regressions,
+    )

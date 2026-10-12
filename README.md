@@ -4,9 +4,9 @@ An independent AOT CUDA package for Qwen3.8-27B on SM86 GPUs, with torch stable
 ABI bindings targeting torch 2.10 and Python 3.10 or newer. It does not import
 vLLM. The serving engine owns allocation, cache scheduling and backend selection.
 
-This is an implementation in progress. The checkpoint encoder and initial
-matmul/GDN correctness tests have run; serving integration, model quality,
-performance selection and release validation are pending. An encoded checkpoint
+This is an implementation in progress. The checkpoint encoder, CUDA kernels and
+vLLM adapter are implemented; model quality, serving performance selection and
+release validation are pending. An encoded checkpoint
 is marked `encoded_unvalidated` until those gates pass.
 
 ## Build and test
@@ -16,7 +16,7 @@ With a CUDA-enabled torch environment and CUDA toolkit installed:
 ```sh
 git submodule update --init --recursive
 TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=2 uv pip install -e . --no-build-isolation --no-deps
-python -m pytest tests
+.venv/bin/python -m pytest tests
 ```
 
 Importing `consumer_int8.ops` loads the compiled extension; it never invokes a
@@ -140,3 +140,32 @@ of each window is excluded; token identity, likelihood completeness and corpus
 checksums are checked before comparison. Save each server's launch manifest as
 the scoring run's provenance. This text check does not replace the vision,
 needle-retrieval or MTP checks.
+
+`benchmarks/run_quality.py` owns a TP=2 server, records GPU interference, runs
+the fixed NLL corpus and optionally the AppMana 100-image fixture set. Use
+`--reference --cpu-offload-gb 12` with the original BF16 snapshot for the
+reference on two 24-GB GPUs. Quantized candidates use the same corpus and
+vision fixtures. The runner fingerprints image contents as well as prompts;
+`benchmarks/compare_vision.py` rejects every newly incorrect answer, even if
+other improvements leave aggregate accuracy unchanged.
+
+## Existing full-attention implementations
+
+The full-attention layers have no sparse indexer. Their serving baseline is
+vLLM's paged Triton attention, which supports the packed INT8 per-token/head
+cache. The GDN recurrent layers have separate kernels and keep FP32 state.
+
+At FlashAttention revision
+[`94e22c9066`](https://github.com/Dao-AILab/flash-attention/tree/94e22c906678e5483fa0e9e24d8e787bc2c0ed4c),
+the FA3 build includes an SM80 FP16/BF16 forward fallback, including paged and
+split variants. FA4's CuTe implementation also dispatches to SM80, but that
+path explicitly rejects paged KV and split-KV. These are Ampere-compatible
+paths, not implementations of this package's INT8 cache format.
+
+The existing AppMana SageAttention stable-ABI fork at
+[`30a3583bb6`](https://github.com/AppMana/forks-sageattention-stable-abi/tree/30a3583bb66a62f5c3805520782d8ba488020a78)
+supports SM86 and head dimensions through 256, using INT8 QK with FP16 PV.
+Its documented causal mode requires equal Q and KV sequence lengths, so it
+does not directly replace paged attention or continuation-prefill attention.
+Backend selection still requires shape, cache-layout, quality and serving
+measurements; the presence of an SM80 build alone is insufficient.

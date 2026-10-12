@@ -16,6 +16,19 @@ from pathlib import Path
 from run_matrix import GpuMonitor, git_head, stop_server, write_json
 
 
+def vision_fixture_digest(repo):
+    fixtures = repo / "src/appmana_inference_benchmarks/vision/fixtures"
+    cases = json.loads((fixtures / "cases.json").read_text())[:100]
+    if len(cases) != 100:
+        raise ValueError("Expected all 100 vision fixtures")
+    files = {"cases.json"} | {case["image"] for case in cases}
+    hashes = {
+        name: hashlib.sha256((fixtures / name).read_bytes()).hexdigest()
+        for name in sorted(files)
+    }
+    return hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vllm-repo", type=Path, required=True)
@@ -147,6 +160,9 @@ def main():
             if dist.metadata["Name"]
         },
     )
+    if args.vision_repo:
+        manifest["vision_repository_commit"] = git_head(args.vision_repo)
+        manifest["vision_fixture_sha256"] = vision_fixture_digest(args.vision_repo)
     manifest_path = args.output_dir / "manifest.json"
     write_json(manifest_path, manifest)
     env = dict(
@@ -209,7 +225,6 @@ def main():
                 vision_env = dict(
                     env, PYTHONPATH=str(args.vision_repo.resolve() / "src")
                 )
-                manifest["vision_repository_commit"] = git_head(args.vision_repo)
                 for concurrency in args.vision_concurrency:
                     if args.reference and concurrency != 1:
                         raise ValueError("CPU-offloaded reference vision uses C=1")
@@ -239,6 +254,15 @@ def main():
                             stderr=subprocess.STDOUT,
                             check=True,
                         )
+                    digest = vision_fixture_digest(args.vision_repo)
+                    if digest != manifest["vision_fixture_sha256"]:
+                        raise ValueError("Vision fixtures changed during evaluation")
+                    report_path = (
+                        args.output_dir / f"vision-c{concurrency}-evaluation.json"
+                    )
+                    report = json.loads(report_path.read_text())
+                    report["fixture_sha256"] = digest
+                    write_json(report_path, report)
             manifest["status"] = "completed"
         except Exception as exc:
             manifest.update(status="failed", error=repr(exc))

@@ -3,7 +3,7 @@ import copy
 
 import pytest
 
-from consumer_int8.quality import compare_nll, prompt_nll
+from consumer_int8.quality import compare_nll, compare_vision, prompt_nll
 
 
 def response():
@@ -73,3 +73,46 @@ def test_equal_partial_runs_cannot_pass_quality_gate():
     partial["complete"] = True
     with pytest.raises(ValueError, match="Incomplete"):
         compare_nll(partial, partial)
+
+
+def test_equal_vision_accuracy_cannot_hide_a_newly_wrong_answer():
+    reference = dict(
+        cases=2,
+        fixture_sha256="images-and-prompts",
+        results=[
+            dict(image="a.png", prompt="read", answer="a", text="a", correct=True),
+            dict(image="b.png", prompt="read", answer="b", text="c", correct=False),
+        ],
+    )
+    candidate = copy.deepcopy(reference)
+    candidate["results"][0].update(text="c", correct=False)
+    candidate["results"][1].update(text="b", correct=True)
+    result = compare_vision(reference, candidate, expected_cases=2)
+    assert result["reference_correct"] == result["candidate_correct"] == 1
+    assert result["regressions"] == ["a.png"]
+    assert not result["passed"]
+    assert compare_vision(reference, reference, expected_cases=2)["passed"]
+
+
+@pytest.mark.parametrize("fault", ["partial", "error", "changed", "score", "image"])
+def test_vision_quality_rejects_incomplete_or_incompatible_runs(fault):
+    reference = dict(
+        cases=1,
+        fixture_sha256="images-and-prompts",
+        results=[
+            dict(image="a.png", prompt="read", answer="a", text="a", correct=True)
+        ],
+    )
+    candidate = copy.deepcopy(reference)
+    if fault == "partial":
+        candidate["results"] = []
+    elif fault == "error":
+        candidate["results"][0]["error"] = "timeout"
+    elif fault == "changed":
+        candidate["results"][0]["prompt"] = "different"
+    elif fault == "image":
+        candidate["fixture_sha256"] = "different-image-bytes"
+    else:
+        candidate["results"][0]["correct"] = False
+    with pytest.raises(ValueError):
+        compare_vision(reference, candidate, expected_cases=1)
