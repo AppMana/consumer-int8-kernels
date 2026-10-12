@@ -7,10 +7,10 @@ from functools import partial
 
 import torch
 from microbench import time_us
-from vllm.v1.attention.backends.utils import KVQuantMode
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash_per_token_head_quant,
 )
+from vllm.v1.kv_cache_interface import KVQuantMode
 
 from consumer_int8 import ops
 
