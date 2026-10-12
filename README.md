@@ -105,8 +105,9 @@ both C=1 and C=4, with no newly incorrect cases against BF16's 82/100.
 AllSpark plus native GDN/cache also passed these checks. Applying W8A8 prefill
 to all language projections passed NLL but regressed one vision case at C=4;
 that mode remains experimental. The `consumer_int8_mlp_prefill` candidate
-restricts activation quantization to MLP projections, preserving BF16
-activations in attention projections and the MTP input projection. It must
+restricts activation quantization to MLP gate/up projections, preserving BF16
+activations in attention, MLP down and MTP input projections. The MLP-wide
+candidate still regressed the same C=4 vision case. The narrower mode must
 pass the same quality and retrieval checks before performance selection.
 
 `benchmarks/microbench_cache.py` compares the native paged INT8 cache writer
