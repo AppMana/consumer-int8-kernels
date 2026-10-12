@@ -36,7 +36,10 @@ async def capacity_smoke(base_url, model, output):
     write_json(
         output,
         dict(
-            purpose="C=4 x 32k capacity/scheduling check; not a retrieval or throughput gate",
+            purpose=(
+                "C=4 x 32k capacity/scheduling check; "
+                "not a retrieval or throughput gate"
+            ),
             results=rows,
         ),
     )
