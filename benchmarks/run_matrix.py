@@ -121,6 +121,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--port", type=int, default=18082)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument("--kv-cache-memory-bytes", type=int)
     parser.add_argument("--max-num-batched-tokens", type=int, default=1024)
     parser.add_argument("--speculative-tokens", type=int, default=1)
     parser.add_argument(
@@ -268,6 +269,11 @@ def main():
                             num_speculative_tokens=args.speculative_tokens,
                         )
                     ),
+                ]
+            if args.kv_cache_memory_bytes is not None:
+                command += [
+                    "--kv-cache-memory-bytes",
+                    str(args.kv_cache_memory_bytes),
                 ]
             env = dict(
                 os.environ,

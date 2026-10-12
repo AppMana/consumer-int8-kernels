@@ -107,8 +107,12 @@ to all language projections passed NLL but regressed one vision case at C=4;
 that mode remains experimental. The `consumer_int8_mlp_prefill` candidate
 restricts activation quantization to MLP gate/up projections, preserving BF16
 activations in attention, MLP down and MTP input projections. The MLP-wide
-candidate still regressed the same C=4 vision case. The narrower mode must
-pass the same quality and retrieval checks before performance selection.
+candidate still regressed the same C=4 vision case. Restricting W8A8 to gate/up
+projections also regressed that case, despite passing NLL (+0.005424). All
+tested W8A8 prefill modes remain experimental. The selected serving candidate
+uses AllSpark projections with native GDN decode and native cache insertion;
+its NLL increase was 0.004887, with 85/100 vision cases at both concurrencies
+and no new failures against BF16.
 
 `benchmarks/microbench_cache.py` compares the native paged INT8 cache writer
 against vLLM's Triton writer using Qwen's strided projection output, two/four
@@ -140,7 +144,10 @@ Run it with the vLLM checkout's `.venv/bin/python` and provide `--vllm-repo`,
 `--model` and a new `--output-dir`. Both source repositories must be committed.
 It saves launch commands, package versions, checkpoint configuration and GPU
 telemetry. Foreign compute processes invalidate performance selection. The
-optional `benchmark` dependencies cover the HTTP clients and corpus preparation;
+optional `--kv-cache-memory-bytes` fixes the per-GPU cache reservation; validate
+peak memory and C=4 capacity with the same model, topology and MTP settings
+before using it. It overrides automatic cache sizing from memory utilization.
+The optional `benchmark` dependencies cover HTTP clients and corpus preparation;
 serving still requires the separately built vLLM integration.
 Both launchers retain the vision tower and allow one image per request, with
 a 1024-by-768 dummy image for memory profiling; video is disabled for these
