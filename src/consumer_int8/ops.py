@@ -18,6 +18,12 @@ unpack_allspark = torch.ops.consumer_int8.unpack_allspark
 gdn_decode = torch.ops.consumer_int8.gdn_decode
 cutlass_channel_mm = torch.ops.consumer_int8.cutlass_channel_mm
 kv_cache_update = torch.ops.consumer_int8.kv_cache_update
+paged_attention = torch.ops.consumer_int8.paged_attention
+
+
+@torch.library.register_fake("consumer_int8::paged_attention")
+def _paged_attention_fake(query, cache, table, offsets, lengths, out, max_query, scale):
+    return None
 
 
 @torch.library.register_fake("consumer_int8::quantize_rows")

@@ -3,6 +3,12 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+void paged_attention(const void* query, const int8_t* cache,
+    const int32_t* table, const int32_t* offsets, const int32_t* lengths, void* out,
+    int heads, int kv_heads, int block_size, int table_stride, int sequences, int max_query,
+    int64_t qt, int64_t qh, int64_t cb, int64_t ch, int64_t ct,
+    int64_t ot, int64_t oh, float scale, cudaStream_t stream);
+
 cudaError_t gdn_prefill(const void* q, const void* k, const void* v,
     const float* g, const float* beta, const float* initial, float* final,
     void* out, float* cumulative, void* w, void* u, void* v_new, void* h_chunk,

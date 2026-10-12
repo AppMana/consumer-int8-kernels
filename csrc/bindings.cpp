@@ -286,9 +286,49 @@ void boxed_gdn_prefill(StableIValue* stack, uint64_t, uint64_t) {
       v_new.data_ptr(), h_chunk.data_ptr(), tokens, hq, hv, num_sms, stream_for(device));
   STD_TORCH_CHECK(status == cudaSuccess, cudaGetErrorString(status));
 }
+void boxed_paged_attention(StableIValue* stack, uint64_t, uint64_t) {
+  auto q = to<Tensor>(stack[0]), cache = to<Tensor>(stack[1]);
+  auto table = to<Tensor>(stack[2]), offsets = to<Tensor>(stack[3]);
+  auto lengths = to<Tensor>(stack[4]), out = to<Tensor>(stack[5]);
+  const int64_t max_query = to<int64_t>(stack[6]);
+  const double scale = to<double>(stack[7]);
+  const int device = q.get_device_index();
+  for (const auto& t : {q, out}) {
+    STD_TORCH_CHECK(t.is_cuda() && t.get_device_index() == device &&
+        t.scalar_type() == ScalarType::BFloat16 && t.dim() == 3 &&
+        t.size(2) == 256 && t.stride(2) == 1 && t.stride(1) >= 256 &&
+        t.stride(0) >= t.size(1) * t.stride(1), "Expected BF16 [T,H,256] query/output");
+  }
+  STD_TORCH_CHECK(q.size(0) > 0 && q.sizes() == out.sizes() &&
+      (q.size(1) == 12 || q.size(1) == 24) && max_query > 0 && max_query <= q.size(0),
+      "Unsupported Qwen query geometry");
+  STD_TORCH_CHECK(cache.is_cuda() && cache.get_device_index() == device &&
+      cache.scalar_type() == ScalarType::Char && cache.dim() == 4 &&
+      cache.size(0) > 0 && cache.size(1) * 6 == q.size(1) && cache.size(2) > 0 &&
+      cache.size(3) == 520 && cache.stride(3) == 1 &&
+      cache.stride(0) % 4 == 0 && cache.stride(1) % 4 == 0 && cache.stride(2) % 4 == 0 &&
+      reinterpret_cast<uintptr_t>(cache.data_ptr()) % 4 == 0,
+      "Expected aligned packed INT8 [pages,Hkv,block_size,520] cache");
+  check(offsets, ScalarType::Int, device);
+  check(lengths, ScalarType::Int, device);
+  STD_TORCH_CHECK(table.is_cuda() && table.get_device_index() == device &&
+      table.scalar_type() == ScalarType::Int && table.dim() == 2 && table.stride(1) == 1 &&
+      lengths.dim() == 1 && offsets.dim() == 1 && lengths.size(0) > 0 && lengths.size(0) <= 65535 &&
+      table.size(0) == lengths.size(0) && table.size(1) > 0 &&
+      offsets.size(0) == lengths.size(0) + 1, "Invalid page/sequence metadata");
+  torch::stable::accelerator::DeviceGuard guard(device);
+  paged_attention(q.data_ptr(), static_cast<int8_t*>(cache.data_ptr()),
+      static_cast<int32_t*>(table.data_ptr()), static_cast<int32_t*>(offsets.data_ptr()),
+      static_cast<int32_t*>(lengths.data_ptr()), out.data_ptr(),
+      q.size(1), cache.size(1), cache.size(2), table.stride(0), lengths.size(0), max_query,
+      q.stride(0), q.stride(1), cache.stride(0), cache.stride(1), cache.stride(2),
+      out.stride(0), out.stride(1), scale, stream_for(device));
+  launch_check();
+}
 }  // namespace
 
 STABLE_TORCH_LIBRARY(consumer_int8, m) {
+  m.def("paged_attention(Tensor query, Tensor cache, Tensor table, Tensor offsets, Tensor lengths, Tensor(a!) out, int max_query, float scale) -> ()");
   m.def("quantize_rows(Tensor input, Tensor(a!) codes, Tensor(b!) scales) -> ()");
   m.def("channel_mm(Tensor a, Tensor w, Tensor a_scale, Tensor w_scale, Tensor(a!) out) -> ()");
   m.def("channel_gemv(Tensor x, Tensor w, Tensor scale, Tensor(a!) out) -> ()");
@@ -300,6 +340,7 @@ STABLE_TORCH_LIBRARY(consumer_int8, m) {
   m.def("gdn_prefill(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor initial, Tensor(a!) final, Tensor(b!) out, Tensor(c!) cumulative, Tensor(d!) w, Tensor(e!) u, Tensor(f!) v_new, Tensor(g!) h_chunk, int num_sms) -> ()");
 }
 STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
+  m.impl("paged_attention", &boxed_paged_attention);
   m.impl("quantize_rows", &boxed_quant);
   m.impl("channel_mm", &boxed_mm);
   m.impl("channel_gemv", &boxed_gemv);

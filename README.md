@@ -59,6 +59,7 @@ quantization format.
 | `gdn_packed_decode` | Strided BF16 QKV and raw gates | Fused gating and FP32 recurrence, INT32/INT64 slot indices |
 | `gdn_prefill` | Normalized BF16 Q/K, BF16 V, FP32 gates and initial state | Chunked BF16/TF32 attention with FP32 final state |
 | `kv_cache_update` | BF16 K/V with head dimension 256 | Packed INT8 cache and inline FP32 scales, HND or NHD strides |
+| `paged_attention` | BF16 Q, packed INT8 paged K/V, device sequence metadata | Experimental D256/GQA6 causal prefill with BF16 tensor cores and FP32 softmax |
 
 `gdn_decode` accepts `[batch,key_heads,128]` Q/K,
 `[batch,value_heads,128]` V, and FP32
@@ -84,6 +85,16 @@ containing `[K256, K_scale4, V256, V_scale4]` bytes. Slot zero is valid; negativ
 slots are padding. Slots must be unique and in range. Input token/head strides
 are honored. Quantization uses a scale floor of `1e-6`, round-half-away-from-zero
 and saturation to `[-128,127]`, matching vLLM's Triton cache writer.
+
+`paged_attention` reads this packed cache directly, without expanding a BF16
+pool. It accepts 12/24 query heads and 2/4 KV heads, INT32 page tables and
+cumulative query offsets, and device sequence lengths. Metadata must describe
+valid pages and disjoint output rows; each query length must be at most the
+provided `max_query`, with a KV length at least as large. Strided BF16 queries
+and HND/NHD caches are supported. Its 64-query, 64-key tiles use 94,464 bytes
+of shared memory on SM86. K scales apply after QK, and V scales apply before
+PV, preserving the serving kernel's scale placement. This candidate is opt-in
+and has not yet passed model-level quality or end-to-end performance gates.
 
 GDN decode is floating-point arithmetic. INT8 cache storage does not imply
 integer attention arithmetic. The two matmul operators actually use integer

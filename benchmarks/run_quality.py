@@ -51,6 +51,9 @@ def main():
         "--kv-writer", choices=["triton", "consumer_int8"], default="triton"
     )
     parser.add_argument("--vision-repo", type=Path)
+    parser.add_argument(
+        "--attention-backend", choices=["triton", "consumer_int8"], default="triton"
+    )
     parser.add_argument("--vision-concurrency", type=int, nargs="+", default=[1])
     parser.add_argument("--port", type=int, default=18083)
     args = parser.parse_args()
@@ -91,6 +94,7 @@ def main():
             linear_backend=args.linear_backend,
             gdn_decode_backend=args.gdn_backend,
             kv_cache_backend=args.kv_writer,
+            attention_backend=args.attention_backend,
         )
         overrides["quantization_config"] = quantization
     elif config.get("quantization_config"):

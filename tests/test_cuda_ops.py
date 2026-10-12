@@ -63,6 +63,92 @@ def test_packed_gdn_matches_serving_kernel_with_strided_inputs(
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+@pytest.mark.parametrize(
+    "query_lens,seq_lens,heads",
+    [
+        ([33], [97], 2),
+        ([1, 17, 49, 4], [65, 255, 511, 99], 4),
+    ],
+)
+@pytest.mark.parametrize("layout", ["HND", "NHD"])
+def test_paged_attention_handles_gqa_tails_and_graph_metadata(
+    query_lens, seq_lens, heads, layout
+):
+    """D256 INT8 attention must preserve causal masking and changing page tables."""
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+    from vllm.v1.kv_cache_interface import KVQuantMode
+
+    torch.manual_seed(761)
+    tokens, block_size = sum(query_lens), 32
+    pages_per_seq = (max(seq_lens) + block_size - 1) // block_size
+    blocks = len(seq_lens) * pages_per_seq
+    shape = (blocks, heads, block_size, 520)
+    cache = torch.empty(
+        shape if layout == "HND" else (blocks, block_size, heads, 520),
+        device="cuda",
+        dtype=torch.int8,
+    )
+    if layout == "NHD":
+        cache = cache.transpose(1, 2)
+    key = torch.randn(
+        blocks * block_size, heads, 256, device="cuda", dtype=torch.bfloat16
+    )
+    value = torch.randn_like(key)
+    ops.kv_cache_update(key, value, cache, torch.arange(key.shape[0], device="cuda"))
+    table = torch.randperm(blocks, device="cuda", dtype=torch.int32).reshape(
+        len(seq_lens), -1
+    )
+    offsets = torch.tensor(
+        [0, *torch.tensor(query_lens).cumsum(0).tolist()],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    lengths = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
+    # Qwen's query is a strided view into its gated projection.
+    query = torch.randn(tokens, heads * 12, 256, device="cuda", dtype=torch.bfloat16)[
+        :, : heads * 6
+    ]
+    out, expected = torch.empty_like(query), torch.empty_like(query)
+    views = cache.transpose(1, 2)
+
+    def native():
+        ops.paged_attention(
+            query, cache, table, offsets, lengths, out, max(query_lens), 1 / 16
+        )
+
+    native()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        native()
+    for _ in range(2):
+        out.fill_(float("nan"))
+        graph.replay()
+        unified_attention(
+            q=query,
+            k=views[..., :256],
+            v=views[..., 260:516],
+            out=expected,
+            cu_seqlens_q=offsets,
+            max_seqlen_q=max(query_lens),
+            seqused_k=lengths,
+            max_seqlen_k=max(seq_lens),
+            softmax_scale=1 / 16,
+            causal=True,
+            window_size=(-1, -1),
+            block_table=table,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
+            k_scale_cache=views[..., 256:260].view(torch.float32).squeeze(-1),
+            v_scale_cache=views[..., 516:520].view(torch.float32).squeeze(-1),
+        )
+        torch.testing.assert_close(out, expected, atol=0.002, rtol=0.008)
+        table.copy_(table.flip(1))
+        query.mul_(0.75)
+
+
 @pytest.mark.parametrize("n,k", [(16, 16), (48, 80), (128, 512), (5120, 3072)])
 def test_allspark_unpack_preserves_every_code_and_scale_in_graph(n, k):
     from vllm import _custom_ops as vops
