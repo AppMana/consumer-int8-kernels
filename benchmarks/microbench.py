@@ -219,6 +219,15 @@ def main():
                         "native_w8a8": time_us(native),
                         "cutlass_w8a8": time_us(cutlass),
                         "allspark_w8a16": time_us(allspark),
+                        **(
+                            {
+                                "canonical_gemv_w8a16": time_us(
+                                    partial(ops.channel_gemv, x, signed, scale, out)
+                                )
+                            }
+                            if m <= 8
+                            else {}
+                        ),
                     }
                 )
             del weight, codes, scale, packed, packed_scale

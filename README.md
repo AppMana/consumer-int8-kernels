@@ -49,6 +49,7 @@ quantization format.
 | `quantize_rows` | BF16 `[M,K]` | Dynamic signed INT8 activations and FP32 row scales |
 | `channel_mm` | Signed INT8 activations, biased UINT8 weights | `m16n8k32` integer MMA, BF16 output; diagnostic candidate |
 | `cutlass_channel_mm` | Signed INT8 activations/weights | SM86 tiled integer MMA, caller-owned INT32 workspace, BF16 output |
+| `channel_gemv` | BF16 activations, canonical signed INT8 weights | Small-batch W8A16 with BF16 dequantized multiplicands and FP32 accumulation |
 | `gdn_decode` | BF16 Q/K/V, FP32 log decay and sigmoid gates | Head dimensions 128, normalized Q/K, FP32 recurrent update |
 | `gdn_packed_decode` | Strided BF16 QKV and raw gates | Fused gating and FP32 recurrence, INT32/INT64 slot indices |
 | `gdn_prefill` | Normalized BF16 Q/K, BF16 V, FP32 gates and initial state | Chunked BF16/TF32 attention with FP32 final state |
@@ -103,6 +104,15 @@ request's first output token. These are elapsed request-phase rates, including
 scheduling gaps inside a phase, rather than isolated GPU kernel throughput.
 Client TTFT, end-to-end latency and stream chunk gaps are recorded separately.
 The harness fails closed if engine timing or actual token usage is missing.
+
+`benchmarks/run_matrix.py` launches four fresh servers for TP=2/PP=1 and
+TP=1/PP=2, each with MTP off and on, then runs all nine cells on each server.
+Run it with the vLLM checkout's `.venv/bin/python` and provide `--vllm-repo`,
+`--model` and a new `--output-dir`. Both source repositories must be committed.
+It saves launch commands, package versions, checkpoint configuration and GPU
+telemetry. Foreign compute processes invalidate performance selection. The
+optional `benchmark` dependencies cover the HTTP clients and corpus preparation;
+serving still requires the separately built vLLM integration.
 
 `benchmarks/quality_nll.py` prepares 32 fixed, disjoint 2048-token windows from
 the pinned WikiText-2 raw test split, scores their teacher-forced likelihoods

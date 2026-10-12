@@ -74,6 +74,28 @@ void boxed_mm(StableIValue* stack, uint64_t, uint64_t) {
               m, n, k, stream_for(device));
   launch_check();
 }
+void boxed_gemv(StableIValue* stack, uint64_t, uint64_t) {
+  auto x = to<Tensor>(stack[0]), w = to<Tensor>(stack[1]);
+  auto scale = to<Tensor>(stack[2]), out = to<Tensor>(stack[3]);
+  const int device = x.get_device_index();
+  check(x, ScalarType::BFloat16, device);
+  check(w, ScalarType::Char, device);
+  check(scale, ScalarType::BFloat16, device);
+  check(out, ScalarType::BFloat16, device);
+  STD_TORCH_CHECK(x.dim() == 2 && w.dim() == 2 && out.dim() == 2 && scale.dim() == 1,
+                  "Expected input/weight/output matrices and channel scales");
+  const int64_t m = x.size(0), n = w.size(0), k = x.size(1);
+  STD_TORCH_CHECK(m > 0 && m <= 8 && n > 0 && k > 0 && k <= 65536 && k % 16 == 0 &&
+      w.size(1) == k && scale.size(0) == n && out.size(0) == m && out.size(1) == n,
+      "Unsupported W8A16 GEMV geometry");
+  STD_TORCH_CHECK(w.numel() <= std::numeric_limits<int>::max(), "Weight matrix too large");
+  STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(x.data_ptr()) % 4 == 0, "Unaligned vector inputs");
+  torch::stable::accelerator::DeviceGuard guard(device);
+  channel_gemv(x.data_ptr(), static_cast<int8_t*>(w.data_ptr()), scale.data_ptr(),
+                out.data_ptr(), m, n, k, stream_for(device));
+  launch_check();
+}
 void boxed_gdn(StableIValue* stack, uint64_t, uint64_t) {
   auto q = to<Tensor>(stack[0]), k = to<Tensor>(stack[1]);
   auto v = to<Tensor>(stack[2]), g = to<Tensor>(stack[3]);
@@ -246,6 +268,7 @@ void boxed_gdn_prefill(StableIValue* stack, uint64_t, uint64_t) {
 STABLE_TORCH_LIBRARY(consumer_int8, m) {
   m.def("quantize_rows(Tensor input, Tensor(a!) codes, Tensor(b!) scales) -> ()");
   m.def("channel_mm(Tensor a, Tensor w, Tensor a_scale, Tensor w_scale, Tensor(a!) out) -> ()");
+  m.def("channel_gemv(Tensor x, Tensor w, Tensor scale, Tensor(a!) out) -> ()");
   m.def("gdn_decode(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor(a!) state, Tensor slots, Tensor(b!) out) -> ()");
   m.def("gdn_packed_decode(Tensor qkv, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, Tensor(a!) state, Tensor slots, Tensor(b!) out) -> ()");
   m.def("cutlass_channel_mm(Tensor a, Tensor w, Tensor a_scale, Tensor w_scale, Tensor(a!) workspace, Tensor(b!) out) -> ()");
@@ -255,6 +278,7 @@ STABLE_TORCH_LIBRARY(consumer_int8, m) {
 STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
   m.impl("quantize_rows", &boxed_quant);
   m.impl("channel_mm", &boxed_mm);
+  m.impl("channel_gemv", &boxed_gemv);
   m.impl("gdn_decode", &boxed_gdn);
   m.impl("gdn_packed_decode", &boxed_gdn_packed);
   m.impl("cutlass_channel_mm", &boxed_cutlass_mm);

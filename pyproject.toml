@@ -11,6 +11,15 @@ dependencies = ["torch>=2.10", "safetensors>=0.5"]
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "third_party/cutlass/LICENSE.txt", "third_party/ninfer/LICENSE"]
 
+[project.optional-dependencies]
+benchmark = [
+    "openai>=2.25",
+    "transformers>=5.16.1,<5.20",
+    "huggingface-hub>=1.31",
+    "pyarrow>=19",
+]
+test = ["pytest>=8"]
+
 [project.scripts]
 consumer-int8-encode = "consumer_int8.checkpoint:main"
 

@@ -13,6 +13,7 @@ from . import _C  # noqa: F401
 
 quantize_rows = torch.ops.consumer_int8.quantize_rows
 channel_mm = torch.ops.consumer_int8.channel_mm
+channel_gemv = torch.ops.consumer_int8.channel_gemv
 gdn_decode = torch.ops.consumer_int8.gdn_decode
 cutlass_channel_mm = torch.ops.consumer_int8.cutlass_channel_mm
 kv_cache_update = torch.ops.consumer_int8.kv_cache_update
@@ -25,6 +26,11 @@ def _quantize_rows_fake(input, codes, scales):
 
 @torch.library.register_fake("consumer_int8::channel_mm")
 def _channel_mm_fake(a, w, a_scale, w_scale, out):
+    return None
+
+
+@torch.library.register_fake("consumer_int8::channel_gemv")
+def _channel_gemv_fake(x, w, scale, out):
     return None
 
 
