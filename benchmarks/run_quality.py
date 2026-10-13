@@ -79,6 +79,7 @@ def main():
     parser.add_argument("--max-num-batched-tokens", type=int, default=1024)
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--kv-cache-memory-bytes", type=int, default=1073741824)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--capacity-smoke", action="store_true")
     parser.add_argument(
         "--linear-backend",
@@ -189,7 +190,7 @@ def main():
         str(args.max_num_batched_tokens),
         "--enable-chunked-prefill",
         "--gpu-memory-utilization",
-        "0.85",
+        str(args.gpu_memory_utilization),
         "--kv-cache-memory-bytes",
         str(args.kv_cache_memory_bytes),
         "--no-enable-prefix-caching",
