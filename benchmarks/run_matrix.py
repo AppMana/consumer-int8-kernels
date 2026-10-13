@@ -175,6 +175,7 @@ def main():
     parser.add_argument(
         "--mtp", nargs="+", choices=["off", "on"], default=["off", "on"]
     )
+    parser.add_argument("--compilation-config", type=json.loads)
     args = parser.parse_args()
     args.model = args.model.resolve()
     args.vllm_repo = args.vllm_repo.resolve()
@@ -309,6 +310,8 @@ def main():
                     "--kv-cache-memory-bytes",
                     str(args.kv_cache_memory_bytes),
                 ]
+            if args.compilation_config is not None:
+                command += ["--compilation-config", json.dumps(args.compilation_config)]
             env = dict(
                 os.environ,
                 CUDA_VISIBLE_DEVICES="0,1",
@@ -336,6 +339,9 @@ def main():
                         "VLLM_GDN_DECODE_KERNEL",
                     )
                 },
+            )
+            manifest["environment"].update(
+                {key: value for key, value in env.items() if key.startswith("NCCL_")}
             )
             with (out / "server.log").open("w") as stream:
                 process = subprocess.Popen(

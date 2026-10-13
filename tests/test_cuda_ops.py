@@ -435,7 +435,7 @@ def test_channel_mm_rejects_unaligned_k_before_launch():
 
 
 @pytest.mark.parametrize("m", [1, 17, 64, 256, 1024, 1041, 2048, 2057])
-@pytest.mark.parametrize("fused", [None, 0, 1, 2, 3, 4, 5])
+@pytest.mark.parametrize("fused", [None, 0, 1, 2, 3, 4, 5, 6])
 @pytest.mark.parametrize("n,k", [(128, 512), (132, 544)])
 def test_gemm_schedules_match_integer_products_and_capture(m, fused, n, k):
     a = torch.randint(-127, 128, (m, k), device="cuda", dtype=torch.int8)
@@ -636,3 +636,52 @@ def test_fa2_prefill_preserves_ragged_causality_and_graph_metadata(heads, schedu
                 rtol=2e-5,
             )
             start += count
+
+
+@torch.compile(fullgraph=True, dynamic=True)
+def _compiled_swiglu(x):
+    k = x.shape[-1] // 2
+    return torch.nn.functional.silu(x[:, :k]) * x[:, k:]
+
+
+@pytest.mark.parametrize("rows", [0, 1, 4, 1024, 3904, 4096])
+@pytest.mark.parametrize("width", [8704, 17408])
+def test_swiglu_quantization_preserves_compiled_bf16_rounding(rows, width):
+    torch.manual_seed(775 + rows + width)
+    x = torch.randn(rows, 2 * width, device="cuda", dtype=torch.bfloat16) * 3
+    if rows:
+        x[0].zero_()
+    activated = torch.empty(rows, width, device="cuda", dtype=x.dtype)
+    codes = torch.empty(rows, width, device="cuda", dtype=torch.int8)
+    scales = torch.empty(rows, device="cuda")
+    ops.silu_mul(x, activated)
+    ops.silu_mul_quantize(x, codes, scales)
+    if not rows:
+        return
+    expected = _compiled_swiglu(x)
+    reference_codes = torch.empty_like(codes)
+    reference_scales = torch.empty_like(scales)
+    ops.quantize_rows(expected, reference_codes, reference_scales)
+    torch.testing.assert_close(activated, expected, atol=0, rtol=0)
+    torch.testing.assert_close(codes, reference_codes, atol=0, rtol=0)
+    torch.testing.assert_close(scales, reference_scales, atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ops.silu_mul(x, activated)
+        ops.silu_mul_quantize(x, codes, scales)
+    x.mul_(0.75)
+    graph.replay()
+    expected = _compiled_swiglu(x)
+    ops.quantize_rows(expected, reference_codes, reference_scales)
+    torch.testing.assert_close(activated, expected, atol=0, rtol=0)
+    torch.testing.assert_close(codes, reference_codes, atol=0, rtol=0)
+    torch.testing.assert_close(scales, reference_scales, atol=0, rtol=0)
+
+
+def test_swiglu_quantization_rejects_unaligned_input_before_vector_load():
+    width = 8704
+    x = torch.empty(2 * width + 1, device="cuda", dtype=torch.bfloat16)[1:]
+    codes = torch.empty(1, width, device="cuda", dtype=torch.int8)
+    scales = torch.empty(1, device="cuda")
+    with pytest.raises(RuntimeError, match="aligned buffers"):
+        ops.silu_mul_quantize(x.view(1, -1), codes, scales)

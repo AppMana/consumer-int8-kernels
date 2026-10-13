@@ -14,7 +14,7 @@
 
 namespace {
 using namespace cute;
-template<int M, int N, int K, int WM, int WN, int Stages>
+template<int M, int N, int K, int WM, int WN, int Stages, int Swizzle = 1>
 void fused_run(const int8_t* a, const int8_t* w, const float* sa,
                const void* sw, void* out, int m, int n, int k,
                cudaStream_t stream) {
@@ -42,7 +42,7 @@ void fused_run(const int8_t* a, const int8_t* w, const float* sa,
       float, cutlass::layout::RowMajor, 4, int32_t, float,
       cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
       Tile, Warp, cutlass::gemm::GemmShape<16, 8, 32>, EVT,
-      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<Swizzle>,
       Stages, cutlass::arch::OpMultiplyAddSaturate, 1>::GemmKernel;
   static_assert(sizeof(typename Kernel::SharedStorage) <= 101376,
                 "SM86 shared-memory limit");
@@ -85,6 +85,7 @@ void fused_channel_mm(const int8_t* a, const int8_t* w, const float* sa,
   if (schedule == 2) return fused_run<128, 256, 64, 64, 64, 3>(a, w, sa, sw, out, m, n, k, stream);
   if (schedule == 3) return fused_run<256, 128, 64, 64, 64, 3>(a, w, sa, sw, out, m, n, k, stream);
   if (schedule == 4) return fused_run<128, 256, 64, 64, 64, 4>(a, w, sa, sw, out, m, n, k, stream);
+  if (schedule == 6) return fused_run<128, 256, 64, 64, 64, 4, 8>(a, w, sa, sw, out, m, n, k, stream);
   if (m <= 16) fused_run<16, 64, 128, 16, 64, 5>(a, w, sa, sw, out, m, n, k, stream);
   else if (m <= 32) fused_run<32, 64, 128, 32, 64, 4>(a, w, sa, sw, out, m, n, k, stream);
   else if (m <= 128) fused_run<64, 128, 64, 32, 64, 4>(a, w, sa, sw, out, m, n, k, stream);

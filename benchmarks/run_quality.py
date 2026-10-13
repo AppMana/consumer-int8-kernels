@@ -104,6 +104,7 @@ def main():
     )
     parser.add_argument("--vision-concurrency", type=int, nargs="+", default=[1])
     parser.add_argument("--port", type=int, default=18083)
+    parser.add_argument("--compilation-config", type=json.loads)
     args = parser.parse_args()
     if args.capacity_smoke and (
         args.reference or args.max_model_len < 32016 or max(args.vision_concurrency) < 4
@@ -210,6 +211,8 @@ def main():
             "--speculative-config",
             json.dumps(dict(method="mtp", num_speculative_tokens=1)),
         ]
+    if args.compilation_config is not None:
+        command += ["--compilation-config", json.dumps(args.compilation_config)]
     manifest = dict(
         vllm_commit=git_head(repo),
         kernels_commit=git_head(package),
@@ -246,6 +249,10 @@ def main():
         VIRTUAL_ENV=str(repo / ".venv"),
         PYTHONUNBUFFERED="1",
     )
+    manifest["environment"] = {
+        key: value for key, value in env.items() if key.startswith("NCCL_")
+    }
+    write_json(manifest_path, manifest)
     base_url = f"http://127.0.0.1:{args.port}"
     with (args.output_dir / "server.log").open("w") as log:
         process = subprocess.Popen(

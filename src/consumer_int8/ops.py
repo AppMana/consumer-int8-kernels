@@ -11,6 +11,8 @@ import torch
 
 from . import _C, _fa2  # noqa: F401
 
+silu_mul = torch.ops.consumer_int8.silu_mul
+silu_mul_quantize = torch.ops.consumer_int8.silu_mul_quantize
 quantize_rows = torch.ops.consumer_int8.quantize_rows
 channel_mm = torch.ops.consumer_int8.channel_mm
 channel_gemv = torch.ops.consumer_int8.channel_gemv
@@ -211,3 +213,13 @@ def gdn_conv_prep(
         max_query,
     )
     return buffers
+
+
+@torch.library.register_fake("consumer_int8::silu_mul")
+def _silu_mul_fake(input, out):
+    return None
+
+
+@torch.library.register_fake("consumer_int8::silu_mul_quantize")
+def _silu_mul_quantize_fake(input, codes, scales):
+    return None

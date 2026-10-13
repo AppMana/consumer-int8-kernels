@@ -8,6 +8,7 @@
 #include <limits>
 #include <optional>
 #include "kernels.h"
+#include "silu_quant.h"
 
 using torch::stable::Tensor;
 using torch::headeronly::ScalarType;
@@ -28,6 +29,41 @@ void launch_check() {
   const auto error = cudaGetLastError();
   STD_TORCH_CHECK(error == cudaSuccess, cudaGetErrorString(error));
 }
+void boxed_silu_mul(StableIValue* stack, uint64_t, uint64_t) {
+  auto x = to<Tensor>(stack[0]), out = to<Tensor>(stack[1]);
+  const int device = x.get_device_index();
+  check(x, ScalarType::BFloat16, device);
+  check(out, ScalarType::BFloat16, device);
+  STD_TORCH_CHECK(x.dim() == 2 && out.dim() == 2 &&
+      (out.size(1) == 8704 || out.size(1) == 17408) &&
+      x.size(1) == 2 * out.size(1) && x.size(0) == out.size(0) &&
+      x.numel() <= std::numeric_limits<int>::max(), "Unsupported SwiGLU shape");
+  torch::stable::accelerator::DeviceGuard guard(device);
+  silu_mul(x.data_ptr(), out.data_ptr(), x.size(0), out.size(1), stream_for(device));
+  launch_check();
+}
+
+void boxed_silu_quant(StableIValue* stack, uint64_t, uint64_t) {
+  auto x = to<Tensor>(stack[0]), codes = to<Tensor>(stack[1]);
+  auto scales = to<Tensor>(stack[2]);
+  const int device = x.get_device_index();
+  check(x, ScalarType::BFloat16, device);
+  check(codes, ScalarType::Char, device);
+  check(scales, ScalarType::Float, device);
+  STD_TORCH_CHECK(x.dim() == 2 && codes.dim() == 2 && scales.dim() == 1 &&
+      (codes.size(1) == 8704 || codes.size(1) == 17408) &&
+      x.size(1) == 2 * codes.size(1) && x.size(0) == codes.size(0) &&
+      scales.size(0) == x.size(0) && x.numel() <= std::numeric_limits<int>::max(),
+      "Unsupported SwiGLU quantization shape");
+  STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(codes.data_ptr()) % 8 == 0,
+      "SwiGLU quantization requires aligned buffers");
+  torch::stable::accelerator::DeviceGuard guard(device);
+  silu_mul_quantize(x.data_ptr(), static_cast<int8_t*>(codes.data_ptr()),
+      static_cast<float*>(scales.data_ptr()), x.size(0), codes.size(1), stream_for(device));
+  launch_check();
+}
+
 void boxed_gemma_norm(StableIValue* stack, uint64_t, uint64_t) {
   auto x = to<Tensor>(stack[0]), weight = to<Tensor>(stack[1]);
   auto residual = to<std::optional<Tensor>>(stack[2]);
@@ -344,7 +380,7 @@ void boxed_cutlass_mm_impl(StableIValue* stack, bool fused) {
   torch::stable::accelerator::DeviceGuard guard(device);
   if (fused) {
     const int64_t schedule = to<int64_t>(stack[5]);
-    STD_TORCH_CHECK(schedule >= 0 && schedule <= 5, "Invalid fused GEMM schedule");
+    STD_TORCH_CHECK(schedule >= 0 && schedule <= 6, "Invalid fused GEMM schedule");
     fused_channel_mm(static_cast<int8_t*>(a.data_ptr()), static_cast<int8_t*>(w.data_ptr()),
         static_cast<float*>(sa.data_ptr()), sw.data_ptr(), out.data_ptr(), m, n, k, schedule, stream_for(device));
   } else {
@@ -503,6 +539,8 @@ void boxed_paged_attention(StableIValue* stack, uint64_t, uint64_t) {
 }  // namespace
 
 STABLE_TORCH_LIBRARY(consumer_int8, m) {
+  m.def("silu_mul(Tensor input, Tensor(a!) out) -> ()");
+  m.def("silu_mul_quantize(Tensor input, Tensor(a!) codes, Tensor(b!) scales) -> ()");
   m.def("gdn_conv(Tensor x, Tensor a, Tensor b, Tensor log_a, Tensor dt_bias, Tensor(a!) q, Tensor(b!) k, Tensor(c!) v, Tensor(d!) g, Tensor(e!) beta, Tensor weight, Tensor(f!) state, Tensor offsets, Tensor slots, Tensor initial, int max_query) -> ()");
   m.def("gemma_norm(Tensor x, Tensor weight, Tensor? residual, Tensor(a!) out, Tensor(b!)? residual_out, float epsilon) -> ()");
   m.def("gdn_post_conv(Tensor x, Tensor a, Tensor b, Tensor log_a, Tensor dt_bias, Tensor(a!) q, Tensor(b!) k, Tensor(c!) v, Tensor(d!) g, Tensor(e!) beta) -> ()");
@@ -520,6 +558,8 @@ STABLE_TORCH_LIBRARY(consumer_int8, m) {
   m.def("gdn_prefill(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor initial, Tensor(a!) final, Tensor(b!) out, Tensor(c!) cumulative, Tensor(d!) w, Tensor(e!) u, Tensor(f!) v_new, Tensor(g!) h_chunk, int num_sms) -> ()");
 }
 STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
+  m.impl("silu_mul", &boxed_silu_mul);
+  m.impl("silu_mul_quantize", &boxed_silu_quant);
   m.impl("gdn_conv", &boxed_gdn_conv);
   m.impl("gemma_norm", &boxed_gemma_norm);
   m.impl("gdn_post_conv", &boxed_post_conv);

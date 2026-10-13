@@ -62,15 +62,15 @@ def main():
     parser.add_argument(
         "--linear-shape", dest="linear_shapes", type=int, nargs=2, action="append"
     )
-    parser.add_argument("--fused-schedule", type=int, choices=range(6), default=0)
+    parser.add_argument("--fused-schedule", type=int, choices=range(7), default=0)
     parser.add_argument("--fused-only", action="store_true")
     parser.add_argument("--fused-paired", action="store_true")
     parser.add_argument(
         "--fused-schedules",
         type=int,
         nargs="+",
-        choices=range(6),
-        default=list(range(6)),
+        choices=range(7),
+        default=list(range(7)),
     )
     args = parser.parse_args()
     torch.manual_seed(20261011)
