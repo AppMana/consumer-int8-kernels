@@ -4,18 +4,6 @@ An independent AOT CUDA package for Qwen3.8-27B on SM86 GPUs, with torch stable
 ABI bindings targeting torch 2.10 and Python 3.10 or newer. It does not import
 vLLM. The serving engine owns allocation, cache scheduling and backend selection.
 
-The checkpoint encoder, CUDA kernels and vLLM adapter are implemented. The
-[two-A5000 evaluation](docs/a5000-2026-10-12.md) covers text and vision quality,
-TP=2 and PP=2, MTP off/on, and all 36 long-context retrieval/throughput cells.
-That original configuration uses AllSpark projections with native GDN decode
-and INT8 cache insertion. The [Nsight investigation](docs/prefill-2026-10-12.md)
-fixed the W8A8 dispatch bug behind the vision regression and qualified a faster
-MTP-off configuration across all 18 TP=2/PP=2 retrieval cells. It uses fused
-integer prefill GEMMs and native INT8-cache conversion plus FlashAttention 2.
-Hardware release gates remain pending, so the checkpoint is an
-unreleased candidate. Its immutable encoder report retains
-`encoded_unvalidated`; the separate validation report records completed gates.
-
 ## Build and test
 
 With a CUDA-enabled torch environment and CUDA toolkit installed:
@@ -81,9 +69,8 @@ of 64, with `(key_heads,value_heads)` equal to `(8,24)` or `(16,48)`. Initial
 and final states have shape `[value_heads,128,128]`, ordered value then key.
 The caller provides all intermediate buffers and the device's actual SM count.
 It wraps the pinned NInfer preparation, state propagation and output kernels;
-it does not yet support variable-length batches or unaligned tails. CUDA-graph
-correctness against FLA has passed for 64, 256 and 1024 tokens on an RTX A5000.
-Serving dispatch and model-level quality validation remain pending.
+it does not support variable-length batches or unaligned tails. The vLLM
+adapter retains FLA for serving prefill.
 
 `kv_cache_update` writes logical `[blocks,kv_heads,block_size,520]` cache rows
 containing `[K256, K_scale4, V256, V_scale4]` bytes. Slot zero is valid; negative
@@ -98,10 +85,8 @@ valid pages and disjoint output rows; each query length must be at most the
 provided `max_query`, with a KV length at least as large. Strided BF16 queries
 and HND/NHD caches are supported. Its 64-query, 64-key tiles use 94,464 bytes
 of shared memory on SM86. K scales apply after QK, and V scales apply before
-PV, preserving the serving kernel's scale placement. With corrected W8A8
-prefill and native GDN/cache, this candidate passes text NLL (+0.0079994)
-and vision (85/100 at C=1 and C=4, no new BF16 failures). The qualified
-serving configuration uses this implementation as its scratch-limit fallback.
+PV, preserving the serving kernel's scale placement. The vLLM FA2 adapter
+uses this implementation as its scratch-limit fallback.
 
 `unpack_kv_cache` produces `[sequences,capacity,kv_heads,256]` BF16 K/V buffers
 for existing attention implementations. It honors HND/NHD cache strides and
@@ -113,30 +98,17 @@ before rounding to BF16, which differs numerically from scaling QK/PV.
 The vLLM `attention_backend=consumer_fa2` adapter combines this converter
 with the installed FlashAttention 2. It limits transient K/V scratch to
 512 MiB per layer/rank and uses the direct packed CUDA kernel above that
-bound. Decode and unsupported attention modes retain Triton. In the isolated
-32k TP=2/C=4 shape, conversion plus FA2 takes 6.66 ms versus 43.00 ms for
-the original Triton kernel; the conversion is included and takes 0.72 ms.
-`benchmarks/microbench_attention.py` reproduces these kernel comparisons.
-The FA2 configuration passes NLL (+0.0070924) and scores 85/100 vision cases
-at C=1 and C=4 with no new BF16 failures. The final fused-GEMM/4096-token
-configuration passes NLL (+0.0125091 TP=2, +0.0052642 PP=2), the same vision
-checks, and all 18 serving timing cells with no new retrieval errors. Full
-phase rates and memory conditions are in the [report](docs/prefill-2026-10-12.md).
+bound. Decode and unsupported attention modes retain Triton.
+`benchmarks/microbench_attention.py` compares these attention implementations.
 
 `fused_channel_mm` retains row-first FP32 scaling and BF16 channel scales.
 It matches the separate INT32 GEMM plus rescale bit for bit, including CUDA
-graph replay and partial tiles. Across ten actual TP=2/PP=2 projection shapes
-on one A5000, it is 1.17x faster at M=1024 and 1.21x faster at M=4096
-(geometric means, excluding activation quantization and weight restoration).
-All twenty shape/row combinations match the previous outputs exactly. The
-largest PP=2 MLP projection at M=4096 avoids a 544-MiB INT32 output buffer.
+graph replay and partial tiles. It avoids the separate INT32 output buffer.
 The automatic schedule uses a 128x256x64 tile with eight warps and four
 pipeline stages at M>=2048; smaller inputs retain the original schedules.
-Against the fused 128x128x64 five-stage tile, this improves ten-shape
-geometric means by 1.05x/1.08x/1.15x at M=2048/3328/4096, with all outputs
-bitwise unchanged. `microbench.py --fused-schedule 5` selects the original
+`microbench.py --fused-schedule 5` selects the 128x128x64 five-stage
 schedule for comparison; 0 selects automatic dispatch. Values 1–4 expose
-the measured tuning candidates.
+alternative schedules.
 
 GDN decode is floating-point arithmetic. INT8 cache storage does not imply
 integer attention arithmetic. The three matmul operators actually use integer
@@ -147,40 +119,17 @@ it uses CUDA or integer arithmetic; numerical and performance gates apply.
 FLA and AllSpark implementations. Performance measurements require exclusive
 GPUs; records taken alongside another GPU workload must be discarded.
 
-On one idle RTX A5000, the 2026-10-11 sweep of twelve Qwen projection shapes
-found CUTLASS W8A8 1.68x faster than AllSpark at 1024 rows (geometric mean).
-Restoring AllSpark's packed weights on every call reduces that gain to 1.41x,
-with all twelve shapes still faster. At 256 rows, restoration erases the gain.
-This supports a candidate dispatch that retains AllSpark for small batches
-and restores one transient layer for 1024-row prefill, without a persistent
-second weight copy. These are CUDA-graph kernel timings, not serving rates.
-
-The first complete 65,504-token quality run measured BF16 mean NLL 1.951675.
-AllSpark INT8 increased NLL by 0.005659 and scored 85/100 vision fixtures at
-both C=1 and C=4, with no newly incorrect cases against BF16's 82/100.
-AllSpark plus native GDN/cache also passed these checks. Initial W8A8 prefill
-configurations passed NLL but regressed an OCR case at C=4. Nsight subsequently
-showed that guard-free AOT graph reuse had frozen the Python prefill branch:
-W8A8 ran at 1–729 rows despite the intended 1,024-row minimum. vLLM commit
-`7b5d852899` moves dispatch inside a runtime custom operator. The corrected
-all-projection prefill policy passes NLL (+0.0075165) and all per-case vision
-comparisons, scoring 85/100 at both C=1 and C=4. A second captured C=4 replay
-also passes, with zero unintended W8A8 launches. These results supersede the
-earlier attribution of this OCR failure to prefill activation quantization.
-The optimized MTP-off TP=2/PP=2 throughput matrix is complete, with zero
-new retrieval errors. Other hardware and optimized MTP-on remain unqualified.
-The configuration used for the original 36-cell serving matrix
-uses AllSpark projections with native GDN decode and native cache insertion;
-its NLL increase was 0.004887, with 85/100 vision cases at both concurrencies
-and no new failures against BF16.
+The vLLM `consumer_int8_prefill` projection backend uses W8A8 for at least
+1024 rows and AllSpark for smaller requests. Dispatch occurs inside a runtime
+custom operator so reused AOT graphs select the implementation from the actual
+row count. Each W8A8 call restores one transient layer from AllSpark's packed
+weights without retaining a second persistent weight copy.
 
 `benchmarks/microbench_cache.py` compares the native paged INT8 cache writer
 against vLLM's Triton writer using Qwen's strided projection output, two/four
-KV heads, HND/NHD layouts, and padded slots. All 24 A5000 cases match the
-entire cache byte-for-byte, including FP32 scales. Small-batch writes are
-1.05–1.08x faster; 256-row and 1024-row writes are about 2.0x and 3.2x faster.
-The native writer uses the same PTX division rounding as Triton. These
-measurements cover cache insertion only, not attention or model throughput.
+KV heads, HND/NHD layouts, and padded slots. It checks the entire cache
+byte-for-byte, including FP32 scales. The native writer uses the same PTX
+division rounding as Triton. The benchmark covers cache insertion only.
 
 `benchmarks/needle_matrix.py` targets one explicitly configured TP/PP/MTP
 server per invocation. It runs C=1/2/4 and 8k/16k/32k prompts with a 1k-token
