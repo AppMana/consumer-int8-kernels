@@ -97,6 +97,32 @@ class GpuMonitor(threading.Thread):
                             self.problems.append(
                                 dict(monotonic_s=time.monotonic(), process=line)
                             )
+                    activity = subprocess.check_output(
+                        ["nvidia-smi", "pmon", "-c", "1", "-s", "u"],
+                        text=True,
+                        timeout=10,
+                    )
+                    record["process_activity"] = activity
+                    for line in activity.splitlines():
+                        fields = line.split()
+                        if not fields or fields[0].startswith("#") or len(fields) < 6:
+                            continue
+                        if not fields[1].isdigit():
+                            continue
+                        # Desktop renderers can consume SM/bandwidth while absent
+                        # from query-compute-apps. Ignore idle resident contexts.
+                        load = [int(v) for v in fields[3:5] if v.isdigit()]
+                        if not load or max(load) <= 5:
+                            continue
+                        pid = int(fields[1])
+                        try:
+                            owned = os.getpgid(pid) == self.server_pid
+                        except ProcessLookupError:
+                            continue
+                        if not owned:
+                            self.problems.append(
+                                dict(monotonic_s=time.monotonic(), process=line)
+                            )
                     record["devices"] = subprocess.check_output(
                         [
                             "nvidia-smi",
