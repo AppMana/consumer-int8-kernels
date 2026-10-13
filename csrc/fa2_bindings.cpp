@@ -66,7 +66,7 @@ void boxed_fa2_prefill(StableIValue *stack, uint64_t, uint64_t) {
                       offsets.size(0) == k.size(0) + 1 && lse.dim() == 2 &&
                       lse.size(0) == q.size(1) && lse.size(1) == q.size(0) &&
                       max_query > 0 && max_query <= q.size(0) &&
-                      schedule >= 0 && schedule <= 8 &&
+                      schedule >= 0 && schedule <= 10 &&
                       q.size(0) <= std::numeric_limits<int>::max() - 127 &&
                       k.size(1) <= std::numeric_limits<int>::max() - 127,
                   "Invalid sequence metadata, LSE output or FA2 schedule");

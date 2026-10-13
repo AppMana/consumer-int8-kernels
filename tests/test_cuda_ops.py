@@ -557,7 +557,7 @@ def test_unpack_kv_cache_preserves_scales_pages_and_graph_updates(heads, layout)
 
 
 @pytest.mark.parametrize("heads", [2, 4])
-@pytest.mark.parametrize("schedule", range(9))
+@pytest.mark.parametrize("schedule", range(11))
 def test_fa2_prefill_preserves_ragged_causality_and_graph_metadata(heads, schedule):
     """Tile changes must preserve bottom-right masks, striding and device lengths."""
     torch.manual_seed(1971)
@@ -594,6 +594,24 @@ def test_fa2_prefill_preserves_ragged_causality_and_graph_metadata(heads, schedu
         out.fill_(float("nan"))
         lse.fill_(float("nan"))
         graph.replay()
+        if schedule in (9, 10):
+            # Scheduling alone must not alter the attention arithmetic.
+            reference = torch.empty_like(out)
+            reference_lse = torch.empty_like(lse)
+            ops.fa2_prefill(
+                q,
+                k,
+                v,
+                offsets,
+                lengths,
+                reference,
+                reference_lse,
+                136,
+                1 / 16,
+                1 if schedule == 9 else 8,
+            )
+            torch.testing.assert_close(out, reference, atol=0, rtol=0)
+            torch.testing.assert_close(lse, reference_lse, atol=0, rtol=0)
         start = 0
         for i, (count, length) in enumerate(zip(counts, lens, strict=True)):
             if not count:

@@ -251,7 +251,7 @@ def main():
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4])
     parser.add_argument("--query-tokens", type=int, nargs="+", default=[1024])
     parser.add_argument(
-        "--native-schedules", type=int, choices=range(9), nargs="*", default=[]
+        "--native-schedules", type=int, choices=range(11), nargs="*", default=[]
     )
     parser.add_argument("--triton-sweep", action="store_true")
     parser.add_argument("--skip-packed", action="store_true")

@@ -6,27 +6,46 @@
 #include <stdexcept>
 
 namespace consumer_fa2 {
-template <typename Traits>
+template <typename Traits, bool Ordered = false>
 __global__ __launch_bounds__(Traits::kNThreads) void fa2_prefill_kernel(
     const flash::Flash_fwd_params params) {
-  flash::compute_attn<Traits, false, true, false, false, false, true, false,
-                      false>(params);
+  if constexpr (Ordered) {
+    // Group heads at the same position and start with the later causal tiles.
+    const int heads = params.b * params.h;
+    const int block_m =
+        (params.seqlen_q + Traits::kBlockM - 1) / Traits::kBlockM - 1 -
+        blockIdx.x / heads;
+    const int bh = blockIdx.x % heads;
+    flash::compute_attn_1rowblock<Traits, false, true, false, false, false,
+                                  true, false, false>(params, bh / params.h,
+                                                      bh % params.h, block_m);
+  } else {
+    flash::compute_attn<Traits, false, true, false, false, false, true, false,
+                        false>(params);
+  }
 }
 
-template <int M, int N, int Warps, bool Qregs = false, bool Share = false>
+template <int M, int N, int Warps, bool Qregs = false, bool Share = false,
+          bool Ordered = false>
 void launch(flash::Flash_fwd_params &p, cudaStream_t stream) {
   using Traits = Flash_fwd_kernel_traits<256, M, N, Warps, Qregs, Share,
                                          cutlass::bfloat16_t>;
   static_assert(Traits::kSmemSize <= 101376, "SM86 shared-memory limit");
-  auto kernel = fa2_prefill_kernel<Traits>;
+  auto kernel = fa2_prefill_kernel<Traits, Ordered>;
   if constexpr (Traits::kSmemSize >= 49152) {
     const auto status = cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemSize);
     if (status != cudaSuccess)
       throw std::runtime_error(cudaGetErrorString(status));
   }
-  kernel<<<dim3((p.seqlen_q + M - 1) / M, p.b, p.h), Traits::kNThreads,
-           Traits::kSmemSize, stream>>>(p);
+  dim3 grid((p.seqlen_q + M - 1) / M, p.b, p.h);
+  if constexpr (Ordered) {
+    const int64_t blocks = int64_t(grid.x) * p.b * p.h;
+    if (blocks > 2147483647)
+      throw std::invalid_argument("Ordered FA2 grid exceeds CUDA's x limit");
+    grid = dim3(blocks);
+  }
+  kernel<<<grid, Traits::kNThreads, Traits::kSmemSize, stream>>>(p);
 }
 } // namespace consumer_fa2
 
@@ -84,6 +103,8 @@ void fa2_prefill(const void *q, const void *k, const void *v,
                        int64_t(capacity) >= 4 * int64_t(max_query)
                    ? 8
                    : 1;
+    if (sms == 64 && max_query >= 1024)
+      schedule = schedule == 8 ? 10 : 9;
   }
   switch (schedule) {
   case 1:
@@ -109,6 +130,12 @@ void fa2_prefill(const void *q, const void *k, const void *v,
     break;
   case 8:
     consumer_fa2::launch<128, 32, 8, true, true>(p, stream);
+    break;
+  case 9:
+    consumer_fa2::launch<64, 64, 4, false, false, true>(p, stream);
+    break;
+  case 10:
+    consumer_fa2::launch<128, 32, 8, true, true, true>(p, stream);
     break;
   default:
     throw std::invalid_argument("Unknown FA2 schedule");
