@@ -395,3 +395,67 @@ def test_unpack_kv_cache_preserves_scales_pages_and_graph_updates(heads, layout)
             assert (key[seq, length:] == -100.0).all()
             assert (value[seq, length:] == -100.0).all()
         table.copy_(table.flip(1))
+
+
+@pytest.mark.parametrize("heads", [2, 4])
+@pytest.mark.parametrize("schedule", range(9))
+def test_fa2_prefill_preserves_ragged_causality_and_graph_metadata(heads, schedule):
+    """Tile changes must preserve bottom-right masks, striding and device lengths."""
+    torch.manual_seed(1971)
+    query_lens, seq_lens = [7, 65, 129], [19, 133, 257]
+    tokens, capacity = sum(query_lens), 576
+    q = torch.randn(tokens, heads * 12, 256, device="cuda", dtype=torch.bfloat16)[
+        :, : heads * 6
+    ]
+    k = torch.randn(3, capacity, heads, 256, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    out = torch.empty(tokens, heads * 12, 256, device="cuda", dtype=torch.bfloat16)[
+        :, : heads * 6
+    ]
+    lse = torch.empty(heads * 6, tokens, device="cuda", dtype=torch.float32)
+    offsets = torch.tensor([0, 7, 72, tokens], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
+
+    def call():
+        ops.fa2_prefill(q, k, v, offsets, lengths, out, lse, 136, 1 / 16, schedule)
+
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for counts, lens in [(query_lens, seq_lens), ([0, 65, 136], [0, 147, 281])]:
+        offsets.copy_(
+            torch.tensor(
+                [0, counts[0], sum(counts[:2]), tokens],
+                device="cuda",
+                dtype=torch.int32,
+            )
+        )
+        lengths.copy_(torch.tensor(lens, device="cuda", dtype=torch.int32))
+        out.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        graph.replay()
+        start = 0
+        for i, (count, length) in enumerate(zip(counts, lens, strict=True)):
+            if not count:
+                continue
+            queries = q[start : start + count].float().transpose(0, 1)
+            keys = k[i, :length].float().repeat_interleave(6, dim=1).transpose(0, 1)
+            values = v[i, :length].float().repeat_interleave(6, dim=1).transpose(0, 1)
+            scores = queries @ keys.transpose(-1, -2) / 16
+            causal = (
+                torch.arange(length, device="cuda")[None, :]
+                <= (length - count + torch.arange(count, device="cuda"))[:, None]
+            )
+            scores.masked_fill_(~causal, -float("inf"))
+            expected = (scores.softmax(-1) @ values).transpose(0, 1).bfloat16()
+            torch.testing.assert_close(
+                out[start : start + count], expected, atol=0.004, rtol=0.008
+            )
+            torch.testing.assert_close(
+                lse[:, start : start + count],
+                scores.logsumexp(-1),
+                atol=2e-5,
+                rtol=2e-5,
+            )
+            start += count

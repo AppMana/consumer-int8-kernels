@@ -4,3 +4,6 @@
 [submodule "third_party/ninfer"]
 	path = third_party/ninfer
 	url = https://github.com/Don-Chad/ninfer-3090.git
+[submodule "third_party/flash_attention"]
+	path = third_party/flash_attention
+	url = https://github.com/vllm-project/flash-attention.git

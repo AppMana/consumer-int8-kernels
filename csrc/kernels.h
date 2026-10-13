@@ -3,6 +3,12 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+void fa2_prefill(const void* q, const void* k, const void* v,
+    const int32_t* offsets, const int32_t* lengths, void* out, float* lse,
+    int tokens, int heads, int kv_heads, int sequences, int capacity, int max_query,
+    int64_t qt, int64_t qh, int64_t ot, int64_t oh, float scale, int schedule,
+    cudaStream_t stream);
+
 void fused_channel_mm(const int8_t* a, const int8_t* w, const float* sa,
     const void* sw, void* out, int m, int n, int k, int schedule, cudaStream_t stream);
 

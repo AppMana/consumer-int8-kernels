@@ -12,9 +12,37 @@ defines = [
     "-DPy_LIMITED_API=0x030A0000",
     "-DTORCH_TARGET_VERSION=0x020A000000000000",
 ]
+
+
+def extension(name, sources, *, fast_math=False):
+    nvcc_flags = [
+        "-O3",
+        "-std=c++17",
+        "-lineinfo",
+        "--expt-relaxed-constexpr",
+        *defines,
+    ]
+    if fast_math:
+        nvcc_flags.append("--use_fast_math")
+    return CUDAExtension(
+        name,
+        sources,
+        include_dirs=[
+            str(Path("third_party/cutlass/include").resolve()),
+            str(Path("third_party/ninfer/src").resolve()),
+            str(Path("third_party/flash_attention/csrc/flash_attn/src").resolve()),
+        ],
+        py_limited_api=True,
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17", *defines],
+            "nvcc": nvcc_flags,
+        },
+    )
+
+
 setup(
     ext_modules=[
-        CUDAExtension(
+        extension(
             "consumer_int8._C",
             [
                 "csrc/bindings.cpp",
@@ -27,22 +55,12 @@ setup(
                 "csrc/kv_unpack.cu",
                 "csrc/fused_mm.cu",
             ],
-            include_dirs=[
-                str(Path("third_party/cutlass/include").resolve()),
-                str(Path("third_party/ninfer/src").resolve()),
-            ],
-            py_limited_api=True,
-            extra_compile_args={
-                "cxx": ["-O3", "-std=c++17", *defines],
-                "nvcc": [
-                    "-O3",
-                    "-std=c++17",
-                    "-lineinfo",
-                    "--expt-relaxed-constexpr",
-                    *defines,
-                ],
-            },
-        )
+        ),
+        extension(
+            "consumer_int8._fa2",
+            ["csrc/fa2_bindings.cpp", "csrc/fa2_prefill.cu"],
+            fast_math=True,
+        ),
     ],
     cmdclass={"build_ext": BuildExtension},
     options={"bdist_wheel": {"py_limited_api": "cp310"}},

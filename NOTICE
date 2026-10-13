@@ -26,3 +26,10 @@ bfa7e5b7afe40ebe48288801a2baf5c1135cd881 (Apache-2.0).
 https://github.com/vllm-project/vllm
 The adapter uses ordinary tiled scheduling, BF16 channel scales, and
 row-first scaling without an INT32 output workspace.
+
+The BF16 attention adapter in csrc/fa2_prefill.cu instantiates FlashAttention-2
+forward kernels from vllm-project/flash-attention at
+9cd61de38763d712bb6ce56e2a02cc2bf718c89f (BSD-3-Clause).
+https://github.com/vllm-project/flash-attention
+The pinned source and license remain in third_party/flash_attention. The
+adapter specializes D256/GQA6 prefill over caller-owned contiguous KV scratch.

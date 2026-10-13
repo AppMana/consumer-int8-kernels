@@ -9,7 +9,7 @@ log decay and beta is the FP32 sigmoid gate, both computed by the caller.
 
 import torch
 
-from . import _C  # noqa: F401
+from . import _C, _fa2  # noqa: F401
 
 quantize_rows = torch.ops.consumer_int8.quantize_rows
 channel_mm = torch.ops.consumer_int8.channel_mm
@@ -18,6 +18,7 @@ unpack_allspark = torch.ops.consumer_int8.unpack_allspark
 gdn_decode = torch.ops.consumer_int8.gdn_decode
 cutlass_channel_mm = torch.ops.consumer_int8.cutlass_channel_mm
 kv_cache_update = torch.ops.consumer_int8.kv_cache_update
+fa2_prefill = torch.ops.consumer_int8.fa2_prefill
 paged_attention = torch.ops.consumer_int8.paged_attention
 unpack_kv_cache = torch.ops.consumer_int8.unpack_kv_cache
 fused_channel_mm = torch.ops.consumer_int8.fused_channel_mm
@@ -30,6 +31,13 @@ def _fused_channel_mm_fake(a, w, a_scale, w_scale, out, schedule=0):
 
 @torch.library.register_fake("consumer_int8::unpack_kv_cache")
 def _unpack_kv_cache_fake(cache, table, lengths, key, value):
+    return None
+
+
+@torch.library.register_fake("consumer_int8::fa2_prefill")
+def _fa2_prefill_fake(
+    query, key, value, offsets, lengths, out, lse, max_query, scale, schedule=0
+):
     return None
 
 
