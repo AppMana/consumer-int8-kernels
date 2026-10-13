@@ -7,6 +7,157 @@ import torch
 from consumer_int8 import ops
 
 
+@pytest.mark.parametrize("hq,hv", [(8, 24), (16, 48)])
+@pytest.mark.parametrize("layout", ["DS", "SD"])
+@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("long_sequence", [65, 4097])
+def test_fused_conv_preserves_ragged_history_and_padded_slots(
+    hq, hv, layout, bias_dtype, long_sequence
+):
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
+    from vllm.third_party.flash_linear_attention.ops import fused_post_conv_prep
+
+    torch.manual_seed(631)
+    lengths = [1, 2, 17, long_sequence, 0]
+    tokens, width = sum(lengths), (2 * hq + hv) * 128
+    x = torch.randn(tokens, width + 128, device="cuda", dtype=torch.bfloat16)[:, :width]
+    weight = torch.randn(width, 4, device="cuda", dtype=x.dtype) * 0.2
+    state = torch.randn(7, width, 3, device="cuda", dtype=x.dtype)
+    if layout == "SD":
+        state = state.transpose(1, 2).contiguous().transpose(1, 2)
+    original = state.clone()
+    expected_state = state.clone()
+    offsets = torch.tensor(
+        [0, 1, 3, 20, tokens, tokens], device="cuda", dtype=torch.int32
+    )
+    slot_storage = torch.tensor(
+        [4, 0, 2, 0, 1, 0, 3, 0, 0, 0], device="cuda", dtype=torch.int32
+    )
+    slots = slot_storage[::2]
+    initial = torch.tensor([True, True, False, True, False], device="cuda")
+    gates = torch.randn(tokens, hv * 2, device="cuda", dtype=x.dtype)
+    a, b = gates[:, hv:], gates[:, :hv]
+    log_a = torch.randn(hv, device="cuda")
+    dt = torch.randn(hv, device="cuda", dtype=bias_dtype)
+    q, k = (
+        torch.empty(tokens, hq, 128, device="cuda", dtype=x.dtype) for _ in range(2)
+    )
+    v = torch.empty(tokens, hv, 128, device="cuda", dtype=x.dtype)
+    g, beta = (torch.empty(tokens, hv, device="cuda") for _ in range(2))
+
+    def run():
+        ops.gdn_conv(
+            x,
+            a,
+            b,
+            log_a,
+            dt,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            weight,
+            state,
+            offsets,
+            slots,
+            initial,
+            max(lengths),
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    state.copy_(original)
+    for step in range(3):
+        if step == 2:
+            initial.fill_(True)
+            x.normal_()
+            # Same graph must consume changed device metadata.
+            offsets[3] = 19
+        graph.replay()
+        conv = causal_conv1d_fn(
+            x.T, weight, None, expected_state, offsets, slots, initial
+        ).T
+        expected = fused_post_conv_prep(conv, a, b, log_a, dt, hq, 128, 128)
+        for actual, target in zip((q, k, v, g, beta), expected, strict=True):
+            torch.testing.assert_close(actual, target, atol=0.004, rtol=0.008)
+        torch.testing.assert_close(state, expected_state, atol=0, rtol=0)
+        for slot in (0, 5, 6):
+            torch.testing.assert_close(state[slot], original[slot], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("tokens,hq,hv", [(0, 8, 24), (17, 8, 24), (1024, 16, 48)])
+@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
+def test_post_conv_preserves_strided_inputs_and_graph_replay(
+    tokens, hq, hv, bias_dtype
+):
+    from vllm.third_party.flash_linear_attention.ops import fused_post_conv_prep
+
+    torch.manual_seed(717)
+    width = (2 * hq + hv) * 128
+    x = torch.randn(tokens, width + 128, device="cuda", dtype=torch.bfloat16)[:, :width]
+    gates = torch.randn(tokens, hv * 2, device="cuda", dtype=torch.bfloat16)
+    a, b = gates[:, hv:], gates[:, :hv]
+    log_a = torch.randn(hv, device="cuda")
+    dt = torch.linspace(-30, 30, hv, device="cuda", dtype=bias_dtype)
+    q = torch.empty(tokens, hq, 128, device="cuda", dtype=torch.bfloat16)
+    k, v = (
+        torch.empty_like(q),
+        torch.empty(tokens, hv, 128, device="cuda", dtype=q.dtype),
+    )
+    g = torch.empty(tokens, hv, device="cuda")
+    beta = torch.empty_like(g)
+
+    def run():
+        ops.gdn_post_conv(x, a, b, log_a, dt, q, k, v, g, beta)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for scale in (0, 0.7, 3):
+        x.normal_().mul_(scale)
+        gates.normal_().mul_(scale)
+        graph.replay()
+        expected = fused_post_conv_prep(x, a, b, log_a, dt, hq, 128, 128)
+        for actual, target in zip((q, k, v, g, beta), expected, strict=True):
+            if actual.dtype == torch.bfloat16:
+                torch.testing.assert_close(actual, target, atol=0.002, rtol=0.008)
+            else:
+                torch.testing.assert_close(actual, target, atol=2e-5, rtol=2e-6)
+        torch.testing.assert_close(v, expected[2], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("tokens", [0, 1, 17, 4096])
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_gemma_norm_preserves_unrounded_sum_and_bf16_residual(tokens, with_residual):
+    torch.manual_seed(927)
+    x = torch.randn(tokens, 5120, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(x) if with_residual else None
+    weight = torch.randn(5120, device="cuda", dtype=x.dtype)
+    out = torch.empty_like(x)
+    residual_out = torch.empty_like(x) if with_residual else None
+
+    def run():
+        ops.gemma_norm(x, weight, residual, out, residual_out, 1e-6)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for scale in (0, 1, 100):
+        x.normal_().mul_(scale)
+        graph.replay()
+        summed = x.float() + residual.float() if with_residual else x.float()
+        normalized = summed * torch.rsqrt(summed.square().mean(-1, keepdim=True) + 1e-6)
+        expected = (normalized * (weight.float() + 1)).bfloat16()
+        torch.testing.assert_close(out, expected, atol=0.001, rtol=0.008)
+        if with_residual:
+            torch.testing.assert_close(residual_out, summed.bfloat16(), atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("batch,hq,hv", [(1, 16, 48), (2, 8, 24), (4, 16, 48)])
 @pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
@@ -202,16 +353,23 @@ def test_channel_mm_matches_integer_product_with_output_tails(m, n, k):
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
-def test_quantize_rows_preserves_zero_rows_and_round_to_even():
-    x = torch.tensor(
-        [[0, -127, 63.5, 127], [0, 0, 0, 0]], device="cuda", dtype=torch.bfloat16
-    )
+@pytest.mark.parametrize("width", [4, 3072, 5120, 6144, 8704, 17408])
+@pytest.mark.parametrize("rows,misaligned", [(2, False), (1024, False), (1024, True)])
+def test_quantize_rows_preserves_zero_rows_and_round_to_even(width, rows, misaligned):
+    torch.manual_seed(742)
+    storage = torch.randn(rows * width + 1, device="cuda", dtype=torch.bfloat16)
+    x = storage[int(misaligned) : rows * width + int(misaligned)].view(rows, width)
+    x.mul_(100).clamp_(-127, 127)
+    x[:, 0] = -127
+    x[0, :4] = torch.tensor([0, -127, 63.5, 127], device="cuda")
+    x[1].zero_()
     q = torch.empty_like(x, dtype=torch.int8)
-    scales = torch.empty(2, device="cuda")
+    scales = torch.empty(rows, device="cuda")
     ops.quantize_rows(x, q, scales)
-    assert q.cpu().tolist() == [[0, -127, 64, 127], [0, 0, 0, 0]]
-    assert scales[0].item() == 1
-    assert torch.isfinite(scales).all() and (scales > 0).all()
+    expected_scale = torch.ones_like(scales)
+    expected_scale[1] = 1e-20
+    torch.testing.assert_close(scales, expected_scale, rtol=0, atol=0)
+    torch.testing.assert_close(q, x.float().round().to(torch.int8), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("batch,hq,hv", [(1, 16, 48), (2, 8, 24), (4, 16, 48)])
@@ -277,18 +435,19 @@ def test_channel_mm_rejects_unaligned_k_before_launch():
 
 
 @pytest.mark.parametrize("m", [1, 17, 64, 256, 1024, 1041, 2048, 2057])
-@pytest.mark.parametrize("fused", [False, True])
-def test_cutlass_schedules_match_integer_products_and_capture(m, fused):
-    a = torch.randint(-127, 128, (m, 512), device="cuda", dtype=torch.int8)
-    w = torch.randint(-127, 128, (128, 512), device="cuda", dtype=torch.int8)
+@pytest.mark.parametrize("fused", [None, 0, 1, 2, 3, 4, 5])
+@pytest.mark.parametrize("n,k", [(128, 512), (132, 544)])
+def test_gemm_schedules_match_integer_products_and_capture(m, fused, n, k):
+    a = torch.randint(-127, 128, (m, k), device="cuda", dtype=torch.int8)
+    w = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
     sa = torch.rand(m, device="cuda") / 127
-    sw = (torch.rand(128, device="cuda") / 127).bfloat16()
-    workspace = torch.empty(m, 128, device="cuda", dtype=torch.int32)
-    out = torch.empty(m, 128, device="cuda", dtype=torch.bfloat16)
+    sw = (torch.rand(n, device="cuda") / 127).bfloat16()
+    workspace = torch.empty(m, n, device="cuda", dtype=torch.int32)
+    out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
 
     def run():
-        if fused:
-            ops.fused_channel_mm(a, w, sa, sw, out)
+        if fused is not None:
+            ops.fused_channel_mm(a, w, sa, sw, out, fused)
         else:
             ops.cutlass_channel_mm(a, w, sa, sw, workspace, out)
 
@@ -298,7 +457,7 @@ def test_cutlass_schedules_match_integer_products_and_capture(m, fused):
         run()
     graph.replay()
     integer = a.cpu().int() @ w.cpu().int().T
-    if not fused:
+    if fused is None:
         torch.testing.assert_close(workspace.cpu(), integer, atol=0, rtol=0)
     expected = (integer.float().cuda() * sa[:, None] * sw.float()[None, :]).bfloat16()
     torch.testing.assert_close(out, expected, atol=0, rtol=0)

@@ -34,6 +34,55 @@ __global__ void quantize_rows_kernel(const __nv_bfloat16* x, int8_t* q,
   }
 }
 
+// Keep each BF16 row in registers across the maximum reduction. Qwen's
+// fixed widths permit vector loads/stores without a second global read.
+struct alignas(16) Bf16Pack8 { __nv_bfloat16 values[8]; };
+struct alignas(8) Int8Pack8 { int8_t values[8]; };
+template <int K, int Threads = 256>
+__global__ void quantize_rows_vector_kernel(const __nv_bfloat16* x, int8_t* q,
+                                           float* scales) {
+  constexpr int Packs = (K + Threads * 8 - 1) / (Threads * 8);
+  __shared__ float maxima[Threads / 32];
+  const int64_t row = int64_t(blockIdx.x) * K;
+  float values[Packs][8], maximum = 0.f;
+#pragma unroll
+  for (int i = 0; i < Packs; ++i) {
+    const int col = (i * Threads + threadIdx.x) * 8;
+    Bf16Pack8 packed{};
+    if (col < K) packed = *reinterpret_cast<const Bf16Pack8*>(x + row + col);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      values[i][j] = __bfloat162float(packed.values[j]);
+      maximum = fmaxf(maximum, fabsf(values[i][j]));
+    }
+  }
+#pragma unroll
+  for (int mask = 16; mask; mask >>= 1)
+    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, mask));
+  if (!(threadIdx.x & 31)) maxima[threadIdx.x / 32] = maximum;
+  __syncthreads();
+  maximum = threadIdx.x < Threads / 32 ? maxima[threadIdx.x] : 0;
+#pragma unroll
+  for (int mask = 16; mask; mask >>= 1)
+    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, mask));
+  if (!threadIdx.x) maxima[0] = fmaxf(maximum / 127.f, 1e-20f);
+  __syncthreads();
+  const float scale = maxima[0];
+  if (!threadIdx.x) scales[blockIdx.x] = scale;
+#pragma unroll
+  for (int i = 0; i < Packs; ++i) {
+    const int col = (i * Threads + threadIdx.x) * 8;
+    if (col < K) {
+      Int8Pack8 result;
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        result.values[j] = static_cast<int8_t>(max(-127, min(127,
+            __float2int_rn(values[i][j] / scale))));
+      *reinterpret_cast<Int8Pack8*>(q + row + col) = result;
+    }
+  }
+}
+
 __global__ void channel_mm_kernel(const int8_t* a, const uint8_t* w,
                                   const float* sa, const __nv_bfloat16* sw,
                                   __nv_bfloat16* out, int m, int n, int k) {
@@ -178,6 +227,13 @@ __global__ void kv_cache_update_kernel(
 }  // namespace
 
 void quantize_rows(const void* x, int8_t* codes, float* scales, int m, int k, cudaStream_t stream) {
+  if (m >= 1024 && reinterpret_cast<uintptr_t>(x) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(codes) % 8 == 0) {
+#define QUANT(K) case K: quantize_rows_vector_kernel<K><<<m, 256, 0, stream>>>( \
+    static_cast<const __nv_bfloat16*>(x), codes, scales); return
+    switch (k) { QUANT(3072); QUANT(5120); QUANT(6144); QUANT(8704); QUANT(17408); }
+#undef QUANT
+  }
   quantize_rows_kernel<<<m, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(x), codes, scales, k);
 }
 void channel_mm(const int8_t* a, const uint8_t* w, const float* sa,

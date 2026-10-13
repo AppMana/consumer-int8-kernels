@@ -89,6 +89,11 @@ def main():
         "--gdn-backend", choices=["triton", "consumer_int8"], default="triton"
     )
     parser.add_argument(
+        "--gdn-preparation-backend",
+        choices=["triton", "consumer_int8"],
+        default="triton",
+    )
+    parser.add_argument(
         "--kv-writer", choices=["triton", "consumer_int8"], default="triton"
     )
     parser.add_argument("--vision-repo", type=Path)
@@ -140,6 +145,7 @@ def main():
         quantization.update(
             linear_backend=args.linear_backend,
             gdn_decode_backend=args.gdn_backend,
+            gdn_preparation_backend=args.gdn_preparation_backend,
             kv_cache_backend=args.kv_writer,
             attention_backend=args.attention_backend,
         )

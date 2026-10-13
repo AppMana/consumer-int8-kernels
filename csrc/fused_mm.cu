@@ -68,7 +68,19 @@ void fused_channel_mm(const int8_t* a, const int8_t* w, const float* sa,
                        int schedule, cudaStream_t stream) {
   // Eight warps with a wider N tile improve large prefills on SM86. Retain
   // the smaller tiles below 2048 rows; their extra CTAs reduce tail overhead.
-  if (schedule == 0 && m >= 2048) schedule = 4;
+  if (schedule == 0) {
+    if (m == 1024) {
+      if (k == 5120) {
+        if (n == 16384 || n == 34816) schedule = 3;
+        else if (n == 14336) schedule = 2;
+        else if (n == 8192 || n == 7168) schedule = 1;
+      } else if (n == 5120 && (k == 3072 || k == 6144 || k == 8704)) {
+        schedule = 1;
+      }
+    } else if (m >= 2048) {
+      schedule = 4;
+    }
+  }
   if (schedule == 1) return fused_run<128, 128, 64, 64, 64, 3>(a, w, sa, sw, out, m, n, k, stream);
   if (schedule == 2) return fused_run<128, 256, 64, 64, 64, 3>(a, w, sa, sw, out, m, n, k, stream);
   if (schedule == 3) return fused_run<256, 128, 64, 64, 64, 3>(a, w, sa, sw, out, m, n, k, stream);

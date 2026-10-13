@@ -59,7 +59,19 @@ def main():
     parser.add_argument("--kind", choices=["gdn", "linear", "all"], default="all")
     parser.add_argument("--prefill-only", action="store_true")
     parser.add_argument("--linear-rows", type=int, nargs="+")
+    parser.add_argument(
+        "--linear-shape", dest="linear_shapes", type=int, nargs=2, action="append"
+    )
     parser.add_argument("--fused-schedule", type=int, choices=range(6), default=0)
+    parser.add_argument("--fused-only", action="store_true")
+    parser.add_argument("--fused-paired", action="store_true")
+    parser.add_argument(
+        "--fused-schedules",
+        type=int,
+        nargs="+",
+        choices=range(6),
+        default=list(range(6)),
+    )
     args = parser.parse_args()
     torch.manual_seed(20261011)
     results = {
@@ -160,7 +172,7 @@ def main():
     if args.kind in ("linear", "all"):
         from vllm import _custom_ops as vops
 
-        for n, k in [
+        for n, k in args.linear_shapes or [
             (16384, 5120),  # GDN QKVZ, PP2
             (8192, 5120),  # GDN QKVZ, TP2
             (14336, 5120),  # Full-attention QKV including Q gate, PP2
@@ -189,6 +201,55 @@ def main():
                 sa = torch.empty(m, device="cuda")
                 out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
                 workspace = torch.empty(m, n, device="cuda", dtype=torch.int32)
+
+                if args.fused_only:
+                    ops.quantize_rows(x, a, sa)
+                    ops.fused_channel_mm(a, signed, sa, scale, out, 0)
+                    expected = out.clone()
+                    for schedule in args.fused_schedules:
+                        call = partial(
+                            ops.fused_channel_mm, a, signed, sa, scale, out, schedule
+                        )
+                        call()
+                        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                        timing = time_us(call, repeats=5, launches=10)
+                        pairs = []
+                        if args.fused_paired:
+                            baseline = partial(
+                                ops.fused_channel_mm, a, signed, sa, scale, out, 0
+                            )
+                            for _ in range(3):
+                                before = time_us(baseline, repeats=3, launches=20)[
+                                    "median_us"
+                                ]
+                                candidate = time_us(call, repeats=3, launches=20)[
+                                    "median_us"
+                                ]
+                                after = time_us(baseline, repeats=3, launches=20)[
+                                    "median_us"
+                                ]
+                                pairs.append(
+                                    dict(
+                                        before_us=before,
+                                        candidate_us=candidate,
+                                        after_us=after,
+                                        speedup=(before + after) / 2 / candidate,
+                                    )
+                                )
+                        record(
+                            dict(
+                                op="fused_channel_mm",
+                                m=m,
+                                n=n,
+                                k=k,
+                                schedule=schedule,
+                                paired=pairs,
+                                **timing,
+                                tflops=2 * m * n * k / (timing["median_us"] * 1e6),
+                            )
+                        )
+                    del expected
+                    continue
 
                 native = partial(
                     _quantized_mm,

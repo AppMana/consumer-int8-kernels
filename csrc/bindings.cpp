@@ -28,6 +28,129 @@ void launch_check() {
   const auto error = cudaGetLastError();
   STD_TORCH_CHECK(error == cudaSuccess, cudaGetErrorString(error));
 }
+void boxed_gemma_norm(StableIValue* stack, uint64_t, uint64_t) {
+  auto x = to<Tensor>(stack[0]), weight = to<Tensor>(stack[1]);
+  auto residual = to<std::optional<Tensor>>(stack[2]);
+  auto out = to<Tensor>(stack[3]);
+  auto residual_out = to<std::optional<Tensor>>(stack[4]);
+  const double epsilon = to<double>(stack[5]);
+  const int device = x.get_device_index();
+  for (const auto& t : {x, weight, out}) check(t, ScalarType::BFloat16, device);
+  STD_TORCH_CHECK(x.dim() == 2 && x.size(1) == 5120 &&
+      out.sizes() == x.sizes() && weight.dim() == 1 && weight.size(0) == 5120 &&
+      x.size(0) <= std::numeric_limits<int>::max() && epsilon > 0,
+      "Expected D5120 BF16 Gemma RMSNorm tensors and positive epsilon");
+  STD_TORCH_CHECK(residual.has_value() == residual_out.has_value(),
+      "Residual input and output must both be supplied");
+  if (residual) {
+    check(*residual, ScalarType::BFloat16, device);
+    check(*residual_out, ScalarType::BFloat16, device);
+    STD_TORCH_CHECK(residual->sizes() == x.sizes() &&
+        residual_out->sizes() == x.sizes(), "Residual shape mismatch");
+  }
+  for (const auto& t : {x, weight, out})
+    STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+        "Gemma RMSNorm requires 16-byte alignment");
+  if (residual)
+    STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(residual->data_ptr()) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(residual_out->data_ptr()) % 16 == 0,
+        "Gemma RMSNorm requires 16-byte alignment");
+  torch::stable::accelerator::DeviceGuard guard(device);
+  gemma_norm(x.data_ptr(), residual ? residual->data_ptr() : nullptr,
+      weight.data_ptr(), out.data_ptr(), residual_out ? residual_out->data_ptr() : nullptr,
+      x.size(0), epsilon, stream_for(device));
+  launch_check();
+}
+void check_post_conv(const Tensor& x, const Tensor& a, const Tensor& b,
+    const Tensor& log_a, const Tensor& dt, const Tensor& q, const Tensor& k,
+    const Tensor& v, const Tensor& g, const Tensor& beta) {
+  const int device = x.get_device_index();
+  for (const auto& t : {x, a, b}) {
+    STD_TORCH_CHECK(t.is_cuda() && t.get_device_index() == device &&
+        t.scalar_type() == ScalarType::BFloat16 && t.dim() == 2 &&
+        t.stride(1) == 1 && t.stride(0) >= t.size(1),
+        "Expected row-strided BF16 input matrices");
+  }
+  for (const auto& t : {q, k, v}) check(t, ScalarType::BFloat16, device);
+  for (const auto& t : {log_a, g, beta}) check(t, ScalarType::Float, device);
+  STD_TORCH_CHECK(dt.scalar_type() == ScalarType::Float ||
+      dt.scalar_type() == ScalarType::BFloat16, "Expected FP32 or BF16 dt_bias");
+  check(dt, dt.scalar_type(), device);
+  STD_TORCH_CHECK(q.dim() == 3 && k.sizes() == q.sizes() && v.dim() == 3 &&
+      q.size(2) == 128 && v.size(2) == 128 && q.size(1) > 0 && v.size(1) > 0 &&
+      v.size(1) % q.size(1) == 0, "Expected D128 Q/K/V outputs");
+  const int64_t tokens = x.size(0), hq = q.size(1), hv = v.size(1);
+  STD_TORCH_CHECK(x.numel() <= std::numeric_limits<int>::max() &&
+      x.size(1) == (2 * hq + hv) * 128 && q.size(0) == tokens && v.size(0) == tokens &&
+      a.size(0) == tokens && a.size(1) == hv && b.sizes() == a.sizes() &&
+      log_a.dim() == 1 && log_a.size(0) == hv && dt.sizes() == log_a.sizes() &&
+      g.sizes() == a.sizes() && beta.sizes() == a.sizes(), "Invalid post-conv geometry");
+  for (const auto& t : {x, q, k, v})
+    STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 8 == 0,
+        "Post-conv QKV requires 8-byte alignment");
+  STD_TORCH_CHECK(x.stride(0) % 4 == 0, "Post-conv input row stride must align to 8 bytes");
+}
+void boxed_post_conv(StableIValue* stack, uint64_t, uint64_t) {
+  auto x = to<Tensor>(stack[0]), a = to<Tensor>(stack[1]), b = to<Tensor>(stack[2]);
+  auto log_a = to<Tensor>(stack[3]), dt = to<Tensor>(stack[4]);
+  auto q = to<Tensor>(stack[5]), k = to<Tensor>(stack[6]), v = to<Tensor>(stack[7]);
+  auto g = to<Tensor>(stack[8]), beta = to<Tensor>(stack[9]);
+  const int device = x.get_device_index();
+  check_post_conv(x, a, b, log_a, dt, q, k, v, g, beta);
+  const int64_t tokens = x.size(0), hq = q.size(1), hv = v.size(1);
+  torch::stable::accelerator::DeviceGuard guard(device);
+  gdn_post_conv(x.data_ptr(), a.data_ptr(), b.data_ptr(),
+      static_cast<float*>(log_a.data_ptr()), dt.data_ptr(), q.data_ptr(), k.data_ptr(),
+      v.data_ptr(), static_cast<float*>(g.data_ptr()), static_cast<float*>(beta.data_ptr()),
+      tokens, hq, hv, x.stride(0), a.stride(0), b.stride(0),
+      dt.scalar_type() == ScalarType::Float, stream_for(device));
+  launch_check();
+}
+void boxed_gdn_conv(StableIValue* stack, uint64_t, uint64_t) {
+  auto x = to<Tensor>(stack[0]), a = to<Tensor>(stack[1]), b = to<Tensor>(stack[2]);
+  auto log_a = to<Tensor>(stack[3]), dt = to<Tensor>(stack[4]);
+  auto q = to<Tensor>(stack[5]), k = to<Tensor>(stack[6]), v = to<Tensor>(stack[7]);
+  auto g = to<Tensor>(stack[8]), beta = to<Tensor>(stack[9]);
+  auto weight = to<Tensor>(stack[10]), state = to<Tensor>(stack[11]);
+  auto offsets = to<Tensor>(stack[12]), slots = to<Tensor>(stack[13]);
+  auto initial = to<Tensor>(stack[14]);
+  const int64_t max_query = to<int64_t>(stack[15]);
+  check_post_conv(x, a, b, log_a, dt, q, k, v, g, beta);
+  const int device = x.get_device_index();
+  check(weight, ScalarType::BFloat16, device);
+  check(offsets, ScalarType::Int, device);
+  check(initial, ScalarType::Bool, device);
+  STD_TORCH_CHECK(weight.dim() == 2 && weight.size(0) == x.size(1) &&
+      weight.size(1) == 4 && reinterpret_cast<uintptr_t>(weight.data_ptr()) % 8 == 0,
+      "Fused GDN convolution requires width 4 and aligned weights without bias");
+  STD_TORCH_CHECK(state.is_cuda() && state.get_device_index() == device &&
+      state.scalar_type() == ScalarType::BFloat16 && state.dim() == 3 &&
+      state.size(0) > 0 && state.size(0) <= std::numeric_limits<int>::max() &&
+      state.size(1) == x.size(1) && state.size(2) == 3 &&
+      ((state.stride(1) >= 3 && state.stride(2) == 1) ||
+       (state.stride(1) == 1 && state.stride(2) >= x.size(1))) &&
+      state.stride(0) >= (state.size(1) - 1) * state.stride(1) + 2 * state.stride(2) + 1,
+      "Expected nonoverlapping BF16 convolution state [slots, channels, 3]");
+  STD_TORCH_CHECK(offsets.dim() == 1 && offsets.size(0) > 0 && offsets.size(0) <= 65536 &&
+      initial.dim() == 1 && initial.size(0) == offsets.size(0) - 1 &&
+      slots.is_cuda() && slots.get_device_index() == device && slots.scalar_type() == ScalarType::Int &&
+      (slots.dim() == 1 || (slots.dim() == 2 && slots.size(1) == 1)) &&
+      slots.size(0) == initial.size(0) && slots.stride(0) >= 1 &&
+      max_query >= 0 && max_query <= x.size(0) && q.size(1) + v.size(1) <= 65535,
+      "Invalid convolution sequence metadata");
+  STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && x.stride(0) % 8 == 0,
+      "cp.async input requires 16-byte aligned rows");
+  torch::stable::accelerator::DeviceGuard guard(device);
+  gdn_conv(x.data_ptr(), weight.data_ptr(), state.data_ptr(),
+      static_cast<int32_t*>(offsets.data_ptr()), static_cast<int32_t*>(slots.data_ptr()),
+      static_cast<bool*>(initial.data_ptr()), a.data_ptr(), b.data_ptr(),
+      static_cast<float*>(log_a.data_ptr()), dt.data_ptr(), q.data_ptr(), k.data_ptr(), v.data_ptr(),
+      static_cast<float*>(g.data_ptr()), static_cast<float*>(beta.data_ptr()), initial.size(0),
+      max_query, q.size(1), v.size(1), state.size(0), x.stride(0), a.stride(0), b.stride(0),
+      state.stride(0), state.stride(1), state.stride(2), slots.stride(0),
+      dt.scalar_type() == ScalarType::Float, stream_for(device));
+  launch_check();
+}
 void boxed_quant(StableIValue* stack, uint64_t, uint64_t) {
   auto x = to<Tensor>(stack[0]);
   auto codes = to<Tensor>(stack[1]);
@@ -380,6 +503,9 @@ void boxed_paged_attention(StableIValue* stack, uint64_t, uint64_t) {
 }  // namespace
 
 STABLE_TORCH_LIBRARY(consumer_int8, m) {
+  m.def("gdn_conv(Tensor x, Tensor a, Tensor b, Tensor log_a, Tensor dt_bias, Tensor(a!) q, Tensor(b!) k, Tensor(c!) v, Tensor(d!) g, Tensor(e!) beta, Tensor weight, Tensor(f!) state, Tensor offsets, Tensor slots, Tensor initial, int max_query) -> ()");
+  m.def("gemma_norm(Tensor x, Tensor weight, Tensor? residual, Tensor(a!) out, Tensor(b!)? residual_out, float epsilon) -> ()");
+  m.def("gdn_post_conv(Tensor x, Tensor a, Tensor b, Tensor log_a, Tensor dt_bias, Tensor(a!) q, Tensor(b!) k, Tensor(c!) v, Tensor(d!) g, Tensor(e!) beta) -> ()");
   m.def("fused_channel_mm(Tensor a, Tensor w, Tensor a_scale, Tensor w_scale, Tensor(a!) out, int schedule=0) -> ()");
   m.def("unpack_kv_cache(Tensor cache, Tensor table, Tensor lengths, Tensor(a!) key, Tensor(b!) value) -> ()");
   m.def("paged_attention(Tensor query, Tensor cache, Tensor table, Tensor offsets, Tensor lengths, Tensor(a!) out, int max_query, float scale) -> ()");
@@ -394,6 +520,9 @@ STABLE_TORCH_LIBRARY(consumer_int8, m) {
   m.def("gdn_prefill(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor initial, Tensor(a!) final, Tensor(b!) out, Tensor(c!) cumulative, Tensor(d!) w, Tensor(e!) u, Tensor(f!) v_new, Tensor(g!) h_chunk, int num_sms) -> ()");
 }
 STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
+  m.impl("gdn_conv", &boxed_gdn_conv);
+  m.impl("gemma_norm", &boxed_gemma_norm);
+  m.impl("gdn_post_conv", &boxed_post_conv);
   m.impl("fused_channel_mm", &boxed_fused_mm);
   m.impl("unpack_kv_cache", &boxed_unpack_kv_cache);
   m.impl("paged_attention", &boxed_paged_attention);

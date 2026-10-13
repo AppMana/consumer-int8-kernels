@@ -3,6 +3,21 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+void gdn_conv(const void* x, const void* weight, void* state,
+    const int32_t* offsets, const int32_t* slots, const bool* initial,
+    const void* a, const void* b, const float* log_a, const void* dt,
+    void* q, void* k, void* v, float* g, float* beta,
+    int sequences, int max_query, int hq, int hv, int num_slots,
+    int64_t xs, int64_t as, int64_t bs, int64_t ss, int64_t sd, int64_t st,
+    int64_t slot_stride, bool float_bias, cudaStream_t stream);
+
+void gemma_norm(const void* x, const void* residual, const void* weight,
+    void* out, void* residual_out, int rows, float epsilon, cudaStream_t stream);
+void gdn_post_conv(const void* x, const void* a, const void* b,
+    const float* log_a, const void* dt, void* q, void* k, void* v,
+    float* g, float* beta, int tokens, int hq, int hv,
+    int64_t xs, int64_t as, int64_t bs, bool float_bias, cudaStream_t stream);
+
 void fa2_prefill(const void* q, const void* k, const void* v,
     const int32_t* offsets, const int32_t* lengths, void* out, float* lse,
     int tokens, int heads, int kv_heads, int sequences, int capacity, int max_query,

@@ -135,6 +135,9 @@ def main():
         ],
     )
     parser.add_argument("--gdn-backend", choices=["triton", "consumer_int8"])
+    parser.add_argument(
+        "--gdn-preparation-backend", choices=["triton", "consumer_int8"]
+    )
     parser.add_argument("--kv-writer", choices=["triton", "consumer_int8"])
     parser.add_argument(
         "--attention-backend", choices=["triton", "consumer_int8", "consumer_fa2"]
@@ -167,6 +170,7 @@ def main():
     for key, value in (
         ("linear_backend", args.linear_backend),
         ("gdn_decode_backend", args.gdn_backend),
+        ("gdn_preparation_backend", args.gdn_preparation_backend),
         ("kv_cache_backend", args.kv_writer),
         ("attention_backend", args.attention_backend),
     ):

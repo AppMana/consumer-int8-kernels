@@ -47,6 +47,8 @@ setup(
             [
                 "csrc/bindings.cpp",
                 "csrc/kernels.cu",
+                "csrc/qwen_aux.cu",
+                "csrc/gdn_conv.cu",
                 "csrc/cutlass_mm.cu",
                 "csrc/gdn_prefill.cu",
                 "csrc/gemv.cu",

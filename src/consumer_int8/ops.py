@@ -22,6 +22,18 @@ fa2_prefill = torch.ops.consumer_int8.fa2_prefill
 paged_attention = torch.ops.consumer_int8.paged_attention
 unpack_kv_cache = torch.ops.consumer_int8.unpack_kv_cache
 fused_channel_mm = torch.ops.consumer_int8.fused_channel_mm
+gemma_norm = torch.ops.consumer_int8.gemma_norm
+gdn_post_conv = torch.ops.consumer_int8.gdn_post_conv
+
+
+@torch.library.register_fake("consumer_int8::gemma_norm")
+def _gemma_norm_fake(x, weight, residual, out, residual_out, epsilon):
+    return None
+
+
+@torch.library.register_fake("consumer_int8::gdn_post_conv")
+def _gdn_post_conv_fake(x, a, b, log_a, dt_bias, q, k, v, g, beta):
+    return None
 
 
 @torch.library.register_fake("consumer_int8::fused_channel_mm")
@@ -108,3 +120,94 @@ def _gdn_prefill_fake(
     num_sms,
 ):
     return None
+
+
+gdn_conv = torch.ops.consumer_int8.gdn_conv
+
+
+@torch.library.register_fake("consumer_int8::gdn_conv")
+def _gdn_conv_fake(
+    x,
+    a,
+    b,
+    log_a,
+    dt_bias,
+    q,
+    k,
+    v,
+    g,
+    beta,
+    weight,
+    state,
+    offsets,
+    slots,
+    initial,
+    max_query,
+):
+    return None
+
+
+def _gdn_buffers(x, num_k_heads, num_v_heads):
+    tokens = x.shape[0]
+    q = torch.empty(tokens, num_k_heads, 128, dtype=x.dtype, device=x.device)
+    k = torch.empty_like(q)
+    v = torch.empty(tokens, num_v_heads, 128, dtype=x.dtype, device=x.device)
+    g = torch.empty(tokens, num_v_heads, dtype=torch.float32, device=x.device)
+    return q, k, v, g, torch.empty_like(g)
+
+
+def gdn_post_conv_prep(
+    conv_output,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    num_k_heads,
+    head_k_dim,
+    head_v_dim,
+    apply_l2norm=True,
+    output_g_exp=False,
+):
+    """D128 BF16 preparation with the same buffers as FLA's prefill API."""
+    if head_k_dim != 128 or head_v_dim != 128 or not apply_l2norm or output_g_exp:
+        raise ValueError("CUDA preparation requires normalized D128 Q/K and log decay")
+    buffers = _gdn_buffers(conv_output, num_k_heads, A_log.shape[0])
+    gdn_post_conv(conv_output, a, b, A_log, dt_bias, *buffers)
+    return buffers
+
+
+def gdn_conv_prep(
+    x,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    weight,
+    state,
+    offsets,
+    slots,
+    initial,
+    num_k_heads,
+    max_query,
+):
+    """Fuse width-4 SiLU convolution and D128 preparation without prefix caching.
+
+    Active state slots must be unique. Offsets partition all input tokens;
+    max_query bounds the largest partition. Slot zero is reserved for padding.
+    """
+    buffers = _gdn_buffers(x, num_k_heads, A_log.shape[0])
+    gdn_conv(
+        x,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        *buffers,
+        weight,
+        state,
+        offsets,
+        slots,
+        initial,
+        max_query,
+    )
+    return buffers
