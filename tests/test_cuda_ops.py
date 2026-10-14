@@ -215,15 +215,18 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 @pytest.mark.parametrize(
-    "query_lens,seq_lens,heads",
+    "query_lens,seq_lens,heads,decode",
     [
-        ([33], [97], 2),
-        ([1, 17, 49, 4], [65, 255, 511, 99], 4),
+        ([33], [97], 2, False),
+        ([1, 17, 49, 4], [65, 255, 511, 99], 4, False),
+        ([1], [8193], 2, True),
+        ([1, 2], [1, 3], 2, True),
+        ([1, 3, 8, 0], [257, 2049, 8001, 0], 4, True),
     ],
 )
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 def test_paged_attention_handles_gqa_tails_and_graph_metadata(
-    query_lens, seq_lens, heads, layout
+    query_lens, seq_lens, heads, decode, layout
 ):
     """D256 INT8 attention must preserve causal masking and changing page tables."""
     from vllm.v1.attention.ops.triton_unified_attention import unified_attention
@@ -262,10 +265,25 @@ def test_paged_attention_handles_gqa_tails_and_graph_metadata(
     out, expected = torch.empty_like(query), torch.empty_like(query)
     views = cache.transpose(1, 2)
 
+    scratch = torch.empty((tokens, heads * 6, 32, 258), device="cuda")
+
     def native():
-        ops.paged_attention(
-            query, cache, table, offsets, lengths, out, max(query_lens), 1 / 16
-        )
+        if decode:
+            ops.paged_decode(
+                query,
+                cache,
+                table,
+                offsets,
+                lengths,
+                out,
+                max(query_lens),
+                1 / 16,
+                scratch,
+            )
+        else:
+            ops.paged_attention(
+                query, cache, table, offsets, lengths, out, max(query_lens), 1 / 16
+            )
 
     native()
     graph = torch.cuda.CUDAGraph()

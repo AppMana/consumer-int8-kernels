@@ -21,6 +21,7 @@ gdn_decode = torch.ops.consumer_int8.gdn_decode
 cutlass_channel_mm = torch.ops.consumer_int8.cutlass_channel_mm
 kv_cache_update = torch.ops.consumer_int8.kv_cache_update
 fa2_prefill = torch.ops.consumer_int8.fa2_prefill
+paged_decode = torch.ops.consumer_int8.paged_decode
 paged_attention = torch.ops.consumer_int8.paged_attention
 unpack_kv_cache = torch.ops.consumer_int8.unpack_kv_cache
 fused_channel_mm = torch.ops.consumer_int8.fused_channel_mm
@@ -222,4 +223,11 @@ def _silu_mul_fake(input, out):
 
 @torch.library.register_fake("consumer_int8::silu_mul_quantize")
 def _silu_mul_quantize_fake(input, codes, scales):
+    return None
+
+
+@torch.library.register_fake("consumer_int8::paged_decode")
+def _paged_decode_fake(
+    query, cache, table, offsets, lengths, out, max_query, scale, scratch
+):
     return None

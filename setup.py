@@ -55,6 +55,7 @@ setup(
                 "csrc/gemv.cu",
                 "csrc/allspark_layout.cu",
                 "csrc/paged_attention.cu",
+                "csrc/paged_decode.cu",
                 "csrc/kv_unpack.cu",
                 "csrc/fused_mm.cu",
             ],

@@ -497,6 +497,7 @@ void boxed_unpack_kv_cache(StableIValue* stack, uint64_t, uint64_t) {
       stream_for(device));
   launch_check();
 }
+template <bool Decode>
 void boxed_paged_attention(StableIValue* stack, uint64_t, uint64_t) {
   auto q = to<Tensor>(stack[0]), cache = to<Tensor>(stack[1]);
   auto table = to<Tensor>(stack[2]), offsets = to<Tensor>(stack[3]);
@@ -528,12 +529,28 @@ void boxed_paged_attention(StableIValue* stack, uint64_t, uint64_t) {
       table.size(0) == lengths.size(0) && table.size(1) > 0 &&
       offsets.size(0) == lengths.size(0) + 1, "Invalid page/sequence metadata");
   torch::stable::accelerator::DeviceGuard guard(device);
+  if constexpr (Decode) {
+    auto scratch = to<Tensor>(stack[8]);
+    check(scratch, ScalarType::Float, device);
+    STD_TORCH_CHECK(scratch.dim() == 4 && scratch.size(0) == q.size(0) &&
+        scratch.size(1) == q.size(1) && scratch.size(2) > 0 && scratch.size(2) <= 128 &&
+        scratch.size(3) == 258 && max_query <= 8 &&
+        cache.stride(0) % 8 == 0 && cache.stride(1) % 8 == 0 && cache.stride(2) % 8 == 0 &&
+        reinterpret_cast<uintptr_t>(cache.data_ptr()) % 8 == 0, "Invalid short-query attention scratch");
+    paged_decode(q.data_ptr(), static_cast<int8_t*>(cache.data_ptr()),
+        static_cast<int32_t*>(table.data_ptr()), static_cast<int32_t*>(offsets.data_ptr()),
+        static_cast<int32_t*>(lengths.data_ptr()), out.data_ptr(), static_cast<float*>(scratch.data_ptr()),
+        q.size(0), q.size(1), cache.size(1), scratch.size(2), cache.size(2), table.stride(0),
+        lengths.size(0), max_query, q.stride(0), q.stride(1), cache.stride(0), cache.stride(1),
+        cache.stride(2), out.stride(0), out.stride(1), scale, stream_for(device));
+  } else {
   paged_attention(q.data_ptr(), static_cast<int8_t*>(cache.data_ptr()),
       static_cast<int32_t*>(table.data_ptr()), static_cast<int32_t*>(offsets.data_ptr()),
       static_cast<int32_t*>(lengths.data_ptr()), out.data_ptr(),
       q.size(1), cache.size(1), cache.size(2), table.stride(0), lengths.size(0), max_query,
       q.stride(0), q.stride(1), cache.stride(0), cache.stride(1), cache.stride(2),
       out.stride(0), out.stride(1), scale, stream_for(device));
+  }
   launch_check();
 }
 }  // namespace
@@ -546,6 +563,7 @@ STABLE_TORCH_LIBRARY(consumer_int8, m) {
   m.def("gdn_post_conv(Tensor x, Tensor a, Tensor b, Tensor log_a, Tensor dt_bias, Tensor(a!) q, Tensor(b!) k, Tensor(c!) v, Tensor(d!) g, Tensor(e!) beta) -> ()");
   m.def("fused_channel_mm(Tensor a, Tensor w, Tensor a_scale, Tensor w_scale, Tensor(a!) out, int schedule=0) -> ()");
   m.def("unpack_kv_cache(Tensor cache, Tensor table, Tensor lengths, Tensor(a!) key, Tensor(b!) value) -> ()");
+  m.def("paged_decode(Tensor query, Tensor cache, Tensor table, Tensor offsets, Tensor lengths, Tensor(a!) out, int max_query, float scale, Tensor(b!) scratch) -> ()");
   m.def("paged_attention(Tensor query, Tensor cache, Tensor table, Tensor offsets, Tensor lengths, Tensor(a!) out, int max_query, float scale) -> ()");
   m.def("quantize_rows(Tensor input, Tensor(a!) codes, Tensor(b!) scales) -> ()");
   m.def("channel_mm(Tensor a, Tensor w, Tensor a_scale, Tensor w_scale, Tensor(a!) out) -> ()");
@@ -565,7 +583,8 @@ STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
   m.impl("gdn_post_conv", &boxed_post_conv);
   m.impl("fused_channel_mm", &boxed_fused_mm);
   m.impl("unpack_kv_cache", &boxed_unpack_kv_cache);
-  m.impl("paged_attention", &boxed_paged_attention);
+  m.impl("paged_attention", &boxed_paged_attention<false>);
+  m.impl("paged_decode", &boxed_paged_attention<true>);
   m.impl("quantize_rows", &boxed_quant);
   m.impl("channel_mm", &boxed_mm);
   m.impl("channel_gemv", &boxed_gemv);

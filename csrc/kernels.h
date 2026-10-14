@@ -71,3 +71,10 @@ void gdn_packed_decode(const void* qkv, const void* a, const void* b,
     void* out, int batch, int hq, int hv, int num_slots, int64_t qkv_stride,
     int64_t a_stride, int64_t b_stride, int64_t state_stride, int64_t slot_stride,
     bool dt_float, bool slots_int64, cudaStream_t stream);
+
+void paged_decode(const void* query, const int8_t* cache, const int32_t* table,
+    const int32_t* offsets, const int32_t* lengths, void* out, float* scratch,
+    int tokens, int heads, int kv_heads, int parts, int block_size,
+    int table_stride, int sequences, int max_query, int64_t qt, int64_t qh,
+    int64_t cb, int64_t ch, int64_t ct, int64_t ot, int64_t oh, float scale,
+    cudaStream_t stream);

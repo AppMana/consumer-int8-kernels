@@ -75,7 +75,8 @@ class GpuMonitor(threading.Thread):
     def run(self):
         with self.output.open("w") as stream:
             while not self.done.is_set():
-                record = dict(monotonic_s=time.monotonic())
+                record = dict(monotonic_s=time.monotonic(), cpu_loadavg=os.getloadavg())
+                record["cpu_pressure"] = Path("/proc/pressure/cpu").read_text()
                 try:
                     processes = subprocess.check_output(
                         [
@@ -128,7 +129,7 @@ class GpuMonitor(threading.Thread):
                     record["devices"] = subprocess.check_output(
                         [
                             "nvidia-smi",
-                            "--query-gpu=index,uuid,memory.used,utilization.gpu,clocks.sm,power.draw,temperature.gpu",
+                            "--query-gpu=index,uuid,memory.used,utilization.gpu,clocks.sm,power.draw,temperature.gpu,fan.speed,clocks_event_reasons.sw_power_cap,clocks_event_reasons.sw_thermal_slowdown,clocks_event_reasons.hw_thermal_slowdown,clocks_event_reasons.hw_power_brake_slowdown",
                             "--format=csv,noheader",
                         ],
                         text=True,
