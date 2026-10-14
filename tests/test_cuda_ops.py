@@ -11,8 +11,9 @@ from consumer_int8 import ops
 @pytest.mark.parametrize("layout", ["DS", "SD"])
 @pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("long_sequence", [65, 4097])
+@pytest.mark.parametrize("state_width", [3, 6, 10])
 def test_fused_conv_preserves_ragged_history_and_padded_slots(
-    hq, hv, layout, bias_dtype, long_sequence
+    hq, hv, layout, bias_dtype, long_sequence, state_width
 ):
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
     from vllm.third_party.flash_linear_attention.ops import fused_post_conv_prep
@@ -22,7 +23,7 @@ def test_fused_conv_preserves_ragged_history_and_padded_slots(
     tokens, width = sum(lengths), (2 * hq + hv) * 128
     x = torch.randn(tokens, width + 128, device="cuda", dtype=torch.bfloat16)[:, :width]
     weight = torch.randn(width, 4, device="cuda", dtype=x.dtype) * 0.2
-    state = torch.randn(7, width, 3, device="cuda", dtype=x.dtype)
+    state = torch.randn(7, width, state_width, device="cuda", dtype=x.dtype)
     if layout == "SD":
         state = state.transpose(1, 2).contiguous().transpose(1, 2)
     original = state.clone()
@@ -84,6 +85,7 @@ def test_fused_conv_preserves_ragged_history_and_padded_slots(
         for actual, target in zip((q, k, v, g, beta), expected, strict=True):
             torch.testing.assert_close(actual, target, atol=0.004, rtol=0.008)
         torch.testing.assert_close(state, expected_state, atol=0, rtol=0)
+        torch.testing.assert_close(state[:, :, 3:], original[:, :, 3:], atol=0, rtol=0)
         for slot in (0, 5, 6):
             torch.testing.assert_close(state[slot], original[slot], atol=0, rtol=0)
 

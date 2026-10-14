@@ -197,6 +197,7 @@ def gdn_conv_prep(
 
     Active state slots must be unique. Offsets partition all input tokens;
     max_query bounds the largest partition. Slot zero is reserved for padding.
+    Only the first three history positions are used; speculative tails are preserved.
     """
     buffers = _gdn_buffers(x, num_k_heads, A_log.shape[0])
     gdn_conv(

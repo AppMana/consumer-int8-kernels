@@ -162,11 +162,12 @@ void boxed_gdn_conv(StableIValue* stack, uint64_t, uint64_t) {
   STD_TORCH_CHECK(state.is_cuda() && state.get_device_index() == device &&
       state.scalar_type() == ScalarType::BFloat16 && state.dim() == 3 &&
       state.size(0) > 0 && state.size(0) <= std::numeric_limits<int>::max() &&
-      state.size(1) == x.size(1) && state.size(2) == 3 &&
-      ((state.stride(1) >= 3 && state.stride(2) == 1) ||
+      state.size(1) == x.size(1) && state.size(2) >= 3 &&
+      ((state.stride(1) >= state.size(2) && state.stride(2) == 1) ||
        (state.stride(1) == 1 && state.stride(2) >= x.size(1))) &&
-      state.stride(0) >= (state.size(1) - 1) * state.stride(1) + 2 * state.stride(2) + 1,
-      "Expected nonoverlapping BF16 convolution state [slots, channels, 3]");
+      state.stride(0) >= (state.size(1) - 1) * state.stride(1) +
+          (state.size(2) - 1) * state.stride(2) + 1,
+      "Expected nonoverlapping BF16 convolution state [slots, channels, >=3]");
   STD_TORCH_CHECK(offsets.dim() == 1 && offsets.size(0) > 0 && offsets.size(0) <= 65536 &&
       initial.dim() == 1 && initial.size(0) == offsets.size(0) - 1 &&
       slots.is_cuda() && slots.get_device_index() == device && slots.scalar_type() == ScalarType::Int &&
