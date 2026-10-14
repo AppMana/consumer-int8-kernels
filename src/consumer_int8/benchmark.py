@@ -16,7 +16,8 @@ def audit_gpu_timing(
     Older compute-only recordings cannot establish that desktop renderers were
     idle. Missing samples likewise mean unknown activity, not an idle GPU.
     The sampler is periodic, so include one maximum sampling interval around
-    each request when checking reported interference.
+    each request when checking reported interference. Sampler failures use
+    their entire recorded span; an unknown span invalidates all windows.
     """
     if not intervals or not samples:
         return [{"error": "Missing request intervals or GPU telemetry"}]
@@ -28,7 +29,27 @@ def audit_gpu_timing(
     ):
         return [{"error": "Invalid GPU sample timestamp"}]
     samples = sorted(samples, key=lambda sample: sample["monotonic_s"])
+
+    def error_overlaps_request(problem):
+        start = problem.get("monotonic_s")
+        end = problem.get("sample_end_monotonic_s")
+        if (
+            not isinstance(start, (int, float))
+            or not isinstance(end, (int, float))
+            or not math.isfinite(start)
+            or not math.isfinite(end)
+            or end < start
+        ):
+            return True
+        return any(
+            start <= request_end + max_sample_gap_s
+            and end >= request_start - max_sample_gap_s
+            for request_start, request_end in intervals
+        )
+
     problems = []
+    if any("error" in sample and error_overlaps_request(sample) for sample in samples):
+        problems.append({"error": "GPU sampler failed during a request"})
     for start, end in intervals:
         selected = [
             sample
@@ -58,16 +79,18 @@ def audit_gpu_timing(
         ):
             problems.append({"error": "GPU telemetry gap overlaps a request"})
             break
-        if any("error" in sample for sample in selected):
-            problems.append({"error": "GPU sampler failed during a request"})
-            break
     problems.extend(
         problem
         for problem in reported_problems
-        if "error" in problem
-        or any(
-            start - max_sample_gap_s <= problem["monotonic_s"] <= end + max_sample_gap_s
-            for start, end in intervals
+        if (
+            error_overlaps_request(problem)
+            if "error" in problem
+            else any(
+                start - max_sample_gap_s
+                <= problem["monotonic_s"]
+                <= end + max_sample_gap_s
+                for start, end in intervals
+            )
         )
     )
     return problems

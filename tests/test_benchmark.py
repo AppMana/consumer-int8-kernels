@@ -41,6 +41,34 @@ def test_gpu_audit_requires_samples_even_for_short_requests():
     assert audit_gpu_timing([gpu_sample(1)], [(10, 11)], [])
 
 
+@pytest.mark.parametrize("start,end", [(1, 4), (26, 40)])
+def test_sampler_timeout_outside_request_margin_does_not_poison_clean_windows(
+    start, end
+):
+    samples = [gpu_sample(t) for t in range(9, 24, 2)]
+    timeout = dict(
+        monotonic_s=start, sample_end_monotonic_s=end, error="pmon timed out"
+    )
+    assert audit_gpu_timing([timeout, *samples], [(10, 20)], [timeout]) == []
+
+
+def test_sampler_timeout_starting_earlier_but_spanning_request_is_rejected():
+    samples = [gpu_sample(t) for t in range(14, 24, 2)]
+    timeout = dict(monotonic_s=1, sample_end_monotonic_s=13, error="pmon timed out")
+    assert timeout in audit_gpu_timing([timeout, *samples], [(10, 20)], [timeout])
+    # The telemetry itself must suffice even when the separate problem list is lost.
+    assert audit_gpu_timing([timeout, *samples], [(10, 20)], []) == [
+        {"error": "GPU sampler failed during a request"}
+    ]
+
+
+@pytest.mark.parametrize("end", [None, float("nan"), 0])
+def test_sampler_error_without_reliable_end_time_still_fails_closed(end):
+    samples = [gpu_sample(t) for t in range(9, 24, 2)]
+    timeout = dict(monotonic_s=1, sample_end_monotonic_s=end, error="pmon timed out")
+    assert timeout in audit_gpu_timing(samples, [(10, 20)], [timeout])
+
+
 def request(start, first, last, prompt=8000, output=1000):
     return {
         "engine_phase_timing": {
