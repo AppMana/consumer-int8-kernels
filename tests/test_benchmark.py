@@ -1,7 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
 import pytest
 
-from consumer_int8.benchmark import interval_union_seconds, phase_throughput
+from consumer_int8.benchmark import (
+    audit_gpu_timing,
+    interval_union_seconds,
+    phase_throughput,
+)
+
+
+def gpu_sample(time):
+    return dict(monotonic_s=time, compute_processes="", process_activity="", devices="")
+
+
+def test_compute_only_recording_cannot_establish_idle_graphics():
+    samples = [gpu_sample(t) for t in range(9, 24, 2)]
+    for sample in samples:
+        del sample["process_activity"]
+    assert audit_gpu_timing(samples, [(10, 20)], []) == [
+        {"error": "Incomplete compute/graphics GPU telemetry"}
+    ]
+
+
+def test_gpu_audit_rejects_missing_activity_during_request():
+    samples = [gpu_sample(9), gpu_sample(11), gpu_sample(21)]
+    assert audit_gpu_timing(samples, [(10, 20)], []) == [
+        {"error": "GPU telemetry gap overlaps a request"}
+    ]
+
+
+def test_gpu_audit_uses_request_windows_and_keeps_interference_margin():
+    samples = [gpu_sample(t) for t in range(9, 24, 2)]
+    startup = dict(monotonic_s=2, process="desktop renderer")
+    nearby = dict(monotonic_s=8, process="foreign CUDA process")
+    assert audit_gpu_timing(samples, [(10, 20)], [startup]) == []
+    assert audit_gpu_timing(samples, [(10, 20)], [startup, nearby]) == [nearby]
+
+
+def test_gpu_audit_requires_samples_even_for_short_requests():
+    assert audit_gpu_timing([], [(10, 11)], [])
+    assert audit_gpu_timing([gpu_sample(1)], [(10, 11)], [])
 
 
 def request(start, first, last, prompt=8000, output=1000):

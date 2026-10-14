@@ -5,6 +5,74 @@ import math
 import statistics
 
 
+def audit_gpu_timing(
+    samples: list[dict],
+    intervals: list[tuple[float, float]],
+    reported_problems: list[dict],
+    max_sample_gap_s: float = 5.0,
+) -> list[dict]:
+    """Require compute and graphics telemetry across measured request windows.
+
+    Older compute-only recordings cannot establish that desktop renderers were
+    idle. Missing samples likewise mean unknown activity, not an idle GPU.
+    The sampler is periodic, so include one maximum sampling interval around
+    each request when checking reported interference.
+    """
+    if not intervals or not samples:
+        return [{"error": "Missing request intervals or GPU telemetry"}]
+    interval_union_seconds(intervals)
+    if not math.isfinite(max_sample_gap_s) or max_sample_gap_s <= 0:
+        raise ValueError("A positive maximum sampling gap is required")
+    if any(
+        not math.isfinite(sample.get("monotonic_s", float("nan"))) for sample in samples
+    ):
+        return [{"error": "Invalid GPU sample timestamp"}]
+    samples = sorted(samples, key=lambda sample: sample["monotonic_s"])
+    problems = []
+    for start, end in intervals:
+        selected = [
+            sample
+            for sample in samples
+            if start - max_sample_gap_s
+            <= sample["monotonic_s"]
+            <= end + max_sample_gap_s
+        ]
+        if not selected or any(
+            key not in sample
+            for sample in selected
+            for key in ("compute_processes", "process_activity", "devices")
+        ):
+            problems.append({"error": "Incomplete compute/graphics GPU telemetry"})
+            break
+        times = (
+            [start]
+            + [
+                sample["monotonic_s"]
+                for sample in selected
+                if start < sample["monotonic_s"] < end
+            ]
+            + [end]
+        )
+        if any(
+            b - a > max_sample_gap_s for a, b in zip(times, times[1:], strict=False)
+        ):
+            problems.append({"error": "GPU telemetry gap overlaps a request"})
+            break
+        if any("error" in sample for sample in selected):
+            problems.append({"error": "GPU sampler failed during a request"})
+            break
+    problems.extend(
+        problem
+        for problem in reported_problems
+        if "error" in problem
+        or any(
+            start - max_sample_gap_s <= problem["monotonic_s"] <= end + max_sample_gap_s
+            for start, end in intervals
+        )
+    )
+    return problems
+
+
 def interval_union_seconds(intervals: list[tuple[float, float]]) -> float:
     if not intervals:
         return 0.0

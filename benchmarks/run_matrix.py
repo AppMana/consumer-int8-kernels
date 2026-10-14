@@ -15,6 +15,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from consumer_int8.benchmark import audit_gpu_timing
+
 VISION_LIMITS = {"image": {"count": 1, "width": 1024, "height": 768}, "video": 0}
 
 
@@ -135,6 +137,7 @@ class GpuMonitor(threading.Thread):
                 except Exception as exc:
                     record["error"] = repr(exc)
                     self.problems.append(record)
+                record["sample_end_monotonic_s"] = time.monotonic()
                 stream.write(json.dumps(record) + "\n")
                 stream.flush()
                 self.done.wait(1)
@@ -339,6 +342,7 @@ def main():
                         "VLLM_GDN_DECODE_KERNEL",
                     )
                 },
+                gpu_monitor_schema=2,
             )
             manifest["environment"].update(
                 {key: value for key, value in env.items() if key.startswith("NCCL_")}
@@ -409,16 +413,34 @@ def main():
                 finally:
                     monitor.done.set()
                     monitor.join(timeout=25)
+                    stop_server(process)
+                    manifest["server_returncode"] = process.returncode
                     manifest["gpu_monitor_problems"] = monitor.problems
+                    records = [
+                        json.loads(path.read_text())
+                        for path in (out / "needle").glob("tp*.json")
+                    ]
+                    intervals = [
+                        (timing["scheduled_s"], timing["last_token_s"])
+                        for record in records
+                        if not record["warmup"]
+                        for result in record["results"]
+                        if (timing := result.get("engine_phase_timing"))
+                    ]
+                    samples = [
+                        json.loads(line)
+                        for line in (out / "gpu-load.jsonl").read_text().splitlines()
+                    ]
+                    manifest["gpu_timing_problems"] = audit_gpu_timing(
+                        samples, intervals, monitor.problems
+                    )
                     manifest["valid_for_performance_selection"] = (
-                        not monitor.problems
+                        not manifest["gpu_timing_problems"]
                         and manifest.get("benchmark_returncode") == 0
                         and "error" not in manifest
                     )
-                    if monitor.problems and name not in failures:
+                    if manifest["gpu_timing_problems"] and name not in failures:
                         failures.append(name)
-                    stop_server(process)
-                    manifest["server_returncode"] = process.returncode
                     write_json(out / "server-manifest.json", manifest)
             report = out / "needle/report.md"
             if report.exists() and manifest["valid_for_performance_selection"]:
