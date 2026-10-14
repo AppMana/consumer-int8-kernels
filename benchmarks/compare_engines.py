@@ -174,7 +174,9 @@ async def measure(args, monitor, out):
                         assert len(ids) == length
                         prompts.append((ids, needle))
                     for attempt in range(1, 31):
-                        quiet = (15, 45, 90, 180)[min(attempt - 1, 3)]
+                        # Leave the audit's five-second guard after foreign work.
+                        # Long backoffs can miss every gap between periodic tests.
+                        quiet = 6
                         while any(
                             p.get("sample_end_monotonic_s", p.get("monotonic_s", 0))
                             > time.monotonic() - quiet
