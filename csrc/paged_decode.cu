@@ -63,12 +63,13 @@ stage(Shared<Rows> &s, const int8_t *cache, const int32_t *table, int seq,
 // Six query heads share one packed KV tile. Split contexts independently of
 // query count so C=1 decode can occupy every SM. No host metadata reads.
 template <int Rows>
-__global__ void split_kernel(const bf16 *q, const int8_t *cache,
-                             const int32_t *table, const int32_t *offsets,
-                             const int32_t *lengths, float *scratch, int heads,
-                             int kv_heads, int parts, int block_size,
-                             int table_stride, int64_t qt, int64_t qh,
-                             int64_t cb, int64_t ch, int64_t ct, float scale) {
+__global__ __launch_bounds__(Rows * 8, 2)
+void split_kernel(const bf16 *q, const int8_t *cache,
+                  const int32_t *table, const int32_t *offsets,
+                  const int32_t *lengths, float *scratch, int heads,
+                  int kv_heads, int parts, int block_size,
+                  int table_stride, int64_t qt, int64_t qh,
+                  int64_t cb, int64_t ch, int64_t ct, float scale) {
   const int seq = blockIdx.z, kh = blockIdx.y / parts,
             part = blockIdx.y % parts;
   const int start = offsets[seq], count = offsets[seq + 1] - start;
