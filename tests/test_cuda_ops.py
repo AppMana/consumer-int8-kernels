@@ -216,6 +216,37 @@ def test_packed_gdn_matches_serving_kernel_with_strided_inputs(
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+def _packed_attention_reference(query, cache, table, query_lens, seq_lens):
+    """FP64 causal attention on the represented INT8 cache, without Triton."""
+    heads = cache.shape[1]
+    expected = torch.empty(query.shape, device=query.device, dtype=torch.float64)
+    start = 0
+    for seq, (count, length) in enumerate(zip(query_lens, seq_lens, strict=True)):
+        if not count:
+            continue
+        packed = (
+            cache[table[seq].long()].transpose(1, 2).reshape(-1, heads, 520)[:length]
+        )
+        key = packed[..., :256].double() * packed[..., 256:260].contiguous().view(
+            torch.float32
+        )
+        value = packed[..., 260:516].double() * packed[..., 516:520].contiguous().view(
+            torch.float32
+        )
+        causal = torch.arange(length, device=query.device)[None] <= (
+            length - count + torch.arange(count, device=query.device)[:, None]
+        )
+        for head in range(heads):
+            q = query[start : start + count, head * 6 : (head + 1) * 6].double()
+            score = torch.einsum("qhd,nd->qhn", q, key[:, head]) / 16
+            score.masked_fill_(~causal[:, None], -torch.inf)
+            expected[start : start + count, head * 6 : (head + 1) * 6] = torch.einsum(
+                "qhn,nd->qhd", score.softmax(-1), value[:, head]
+            )
+        start += count
+    return expected
+
+
 @pytest.mark.parametrize(
     "query_lens,seq_lens,heads,decode",
     [
@@ -294,30 +325,71 @@ def test_paged_attention_handles_gqa_tails_and_graph_metadata(
     for _ in range(2):
         out.fill_(float("nan"))
         graph.replay()
-        unified_attention(
-            q=query,
-            k=views[..., :256],
-            v=views[..., 260:516],
-            out=expected,
-            cu_seqlens_q=offsets,
-            max_seqlen_q=max(query_lens),
-            seqused_k=lengths,
-            max_seqlen_k=max(seq_lens),
-            softmax_scale=1 / 16,
-            causal=True,
-            window_size=(-1, -1),
-            block_table=table,
-            softcap=0,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
-            kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
-            k_scale_cache=views[..., 256:260].view(torch.float32).squeeze(-1),
-            v_scale_cache=views[..., 516:520].view(torch.float32).squeeze(-1),
-        )
+        if decode:
+            expected.copy_(
+                _packed_attention_reference(query, cache, table, query_lens, seq_lens)
+            )
+        else:
+            unified_attention(
+                q=query,
+                k=views[..., :256],
+                v=views[..., 260:516],
+                out=expected,
+                cu_seqlens_q=offsets,
+                max_seqlen_q=max(query_lens),
+                seqused_k=lengths,
+                max_seqlen_k=max(seq_lens),
+                softmax_scale=1 / 16,
+                causal=True,
+                window_size=(-1, -1),
+                block_table=table,
+                softcap=0,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
+                kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
+                k_scale_cache=views[..., 256:260].view(torch.float32).squeeze(-1),
+                v_scale_cache=views[..., 516:520].view(torch.float32).squeeze(-1),
+            )
         torch.testing.assert_close(out, expected, atol=0.002, rtol=0.008)
         table.copy_(table.flip(1))
         query.mul_(0.75)
+
+
+@pytest.mark.parametrize("queries", [1, 8])
+@pytest.mark.parametrize("parts", [4, 32])
+def test_paged_decode_retains_scaled_probability_precision(queries, parts):
+    """Split attention should approach final BF16 rounding of FP64 attention.
+
+    Compare with the same quantized cache, independently of Triton. Rounding
+    scaled probabilities to a single BF16 before PV loses accuracy even when
+    output differences pass the serving backend's usual tolerance.
+    """
+    torch.manual_seed(731)
+    length, heads, block_size = 1021, 2, 32
+    pages = (length + block_size - 1) // block_size
+    cache = torch.empty(
+        (pages, heads, block_size, 520), device="cuda", dtype=torch.int8
+    )
+    key = torch.randn(
+        pages * block_size, heads, 256, device="cuda", dtype=torch.bfloat16
+    )
+    value = torch.randn_like(key)
+    ops.kv_cache_update(key, value, cache, torch.arange(key.shape[0], device="cuda"))
+    table = torch.randperm(pages, device="cuda", dtype=torch.int32)[None]
+    offsets = torch.tensor([0, queries], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([length], device="cuda", dtype=torch.int32)
+    q = torch.randn(queries, heads * 12, 256, device="cuda", dtype=torch.bfloat16)[
+        :, : heads * 6
+    ]
+    out = torch.empty_like(q)
+    scratch = torch.empty((queries, heads * 6, parts, 258), device="cuda")
+    ops.paged_decode(q, cache, table, offsets, lengths, out, queries, 1 / 16, scratch)
+
+    expected = _packed_attention_reference(q, cache, table, [queries], [length])
+    rounding_error = (expected.bfloat16().double() - expected).square().mean()
+    actual_error = (out.double() - expected).square().mean()
+    assert actual_error <= 1.01 * rounding_error
 
 
 @pytest.mark.parametrize("n,k", [(16, 16), (48, 80), (128, 512), (5120, 3072)])

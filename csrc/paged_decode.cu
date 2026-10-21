@@ -12,7 +12,7 @@ template <int Rows> struct Shared {
     uint32_t packed[32][132];
   };
   bf16 v[32][264];
-  bf16 p[Rows][40];
+  bf16 p[Rows][40], p_residual[Rows][40];
   float score[Rows][32], ks[32], vs[32];
   float maximum[Rows], sum[Rows], alpha[Rows];
 };
@@ -169,7 +169,13 @@ __global__ void split_kernel(const bf16 *q, const int8_t *cache,
       const float p =
           isfinite(maximum) ? expf(s.score[row][col] - maximum) : 0.f;
       sum += p;
-      s.p[row][col] = __float2bfloat16(p * s.vs[col]);
+      // A single BF16 rounding of P * V_scale introduces split-dependent
+      // error before PV. Preserve its residual in a second tensor-core dot.
+      const float scaled_p = p * s.vs[col];
+      const bf16 hi = __float2bfloat16(scaled_p);
+      s.p[row][col] = hi;
+      s.p_residual[row][col] =
+          __float2bfloat16(scaled_p - __bfloat162float(hi));
     }
 #pragma unroll
     for (int mask = 4; mask; mask >>= 1)
@@ -191,6 +197,11 @@ __global__ void split_kernel(const bf16 *q, const int8_t *cache,
                          pair(&s.p[row_base + group + 8][d + tid * 2]),
                          pair(&s.p[row_base + group][d + tid * 2 + 8]),
                          pair(&s.p[row_base + group + 8][d + tid * 2 + 8])};
+        uint32_t residual[4] = {
+            pair(&s.p_residual[row_base + group][d + tid * 2]),
+            pair(&s.p_residual[row_base + group + 8][d + tid * 2]),
+            pair(&s.p_residual[row_base + group][d + tid * 2 + 8]),
+            pair(&s.p_residual[row_base + group + 8][d + tid * 2 + 8])};
         const int col = (warp % 4) * 64 + tile * 8 + group;
         uint32_t b[2];
 #pragma unroll
@@ -199,6 +210,7 @@ __global__ void split_kernel(const bf16 *q, const int8_t *cache,
           b[j] = uint32_t(__bfloat16_as_ushort(s.v[r][col])) |
                  (uint32_t(__bfloat16_as_ushort(s.v[r + 1][col])) << 16);
         }
+        mma(accum[tile], residual, b);
         mma(accum[tile], p, b);
       }
     }
