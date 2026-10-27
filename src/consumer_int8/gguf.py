@@ -384,6 +384,7 @@ def _iq_s_fake(
     bits,
     tile_rows=16,
     weighted=False,
+    tile_columns=64,
 ):
     return None
 

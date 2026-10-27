@@ -264,7 +264,15 @@ def main(args):
     plan_graphs = {}
     errors = {}
     outputs = []
-    for tile in (16, 32):
+    configs = [(16, args.iq2s_columns), (32, 64)]
+    if args.compare_iq2s_wide:
+        if args.iq2s_columns != 64 or "IQ2_S" not in (first_format, second_format):
+            raise ValueError(
+                "Wide comparison requires default columns and IQ2_S weights"
+            )
+        configs.append((16, 128))
+    for tile, columns in configs:
+        key = tile if columns == 64 else f"{tile}x{columns}"
         tasks = torch.tensor(
             [
                 (e, e * capacity + r)
@@ -280,9 +288,9 @@ def main(args):
             tasks = torch.empty(
                 (required + tile - 1) // tile, 2, device="cuda", dtype=torch.int32
             )
-        task_buffers[tile] = tasks  # Graph input storage must outlive every replay.
+        task_buffers[key] = tasks  # Graph input storage must outlive every replay.
 
-        def run(tile=tile, tasks=tasks):
+        def run(tile=tile, tasks=tasks, columns=columns):
             if args.device_plan:
                 ops.gguf_plan_routes(
                     top_ids,
@@ -313,6 +321,11 @@ def main(args):
                     int(first_format[2]),
                     tile,
                     False,
+                    **(
+                        {"tile_columns": 128}
+                        if first_format == "IQ2_S" and tile == 16 and columns == 128
+                        else {}
+                    ),
                 )
             ops.gguf_swiglu(projected, hidden, 10.0)
             if second_format == "MXFP4":
@@ -335,6 +348,11 @@ def main(args):
                     int(second_format[2]),
                     tile,
                     True,
+                    **(
+                        {"tile_columns": 128}
+                        if second_format == "IQ2_S" and tile == 16 and columns == 128
+                        else {}
+                    ),
                 )
             ops.gguf_route_reduce(contributions, inverse, output)
 
@@ -342,12 +360,12 @@ def main(args):
             run()
         relative = ((output.float() - expected).norm() / expected.norm()).item()
         assert torch.isfinite(output).all() and relative < 0.005
-        errors[tile] = relative
+        errors[key] = relative
         outputs.append(output.clone())
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run()
-        graphs[tile] = graph
+        graphs[key] = graph
         if args.device_plan:
             plan_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(plan_graph):
@@ -362,8 +380,8 @@ def main(args):
                     tasks,
                     tile,
                 )
-            plan_graphs[tile] = plan_graph
-    assert torch.equal(*outputs)
+            plan_graphs[key] = plan_graph
+    assert all(torch.equal(outputs[0], value) for value in outputs[1:])
     for tile, graph in graphs.items():
         output.fill_(float("nan"))
         graph.replay()
@@ -454,6 +472,8 @@ def main(args):
         experts=args.experts,
         global_experts=global_experts,
         tokens=count,
+        iq2s_columns=args.iq2s_columns,
+        compare_iq2s_wide=args.compare_iq2s_wide,
         topk=topk,
         rows_per_expert=counts,
         relative_l2=errors,
@@ -490,6 +510,8 @@ if __name__ == "__main__":
     parser.add_argument("--experts", type=int, default=192)
     parser.add_argument("--global-experts", type=int)
     parser.add_argument("--tokens", type=int, default=512)
+    parser.add_argument("--compare-iq2s-wide", action="store_true")
+    parser.add_argument("--iq2s-columns", type=int, choices=[64, 128], default=64)
     parser.add_argument("--device-plan", action="store_true")
     parser.add_argument("--compare-b12x", action="store_true")
     parser.add_argument("--routing", choices=["random", "balanced"], default="random")

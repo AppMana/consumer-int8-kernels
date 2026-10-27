@@ -413,13 +413,13 @@ def test_device_route_plan_graph(api, count, experts, tile):
 
 @pytest.mark.parametrize("bits", [2, 3])
 @pytest.mark.parametrize("tile", [16, 32])
-@pytest.mark.parametrize("k", [768, 2304, 5120])
+@pytest.mark.parametrize("n,k", [(37, 768), (37, 2304), (37, 5120), (137, 768)])
 @pytest.mark.parametrize("weighted", [False, True])
 @pytest.mark.parametrize("family", ["XXS", "S"])
-def test_xxs_routed_oracle_graph(api, bits, tile, k, weighted, family):
+def test_xxs_routed_oracle_graph(api, bits, tile, n, k, weighted, family):
     gguf = pytest.importorskip("gguf")
     rng = np.random.default_rng(948)
-    experts, n, capacity = 3, 37, 64
+    experts, capacity = 3, 64
     block_bytes = (
         (66 if bits == 2 else 98) if family == "XXS" else (82 if bits == 2 else 110)
     )
@@ -450,9 +450,43 @@ def test_xxs_routed_oracle_graph(api, bits, tile, k, weighted, family):
     )
     weights = torch.rand(experts * capacity, device="cuda") * 0.9 + 0.05
     out = torch.empty(experts * capacity, n, device="cuda", dtype=torch.bfloat16)
+    if family == "S" and bits == 2 and tile == 16 and n == 137:
+        for rejected_bits, rejected_tile, rejected_columns in [
+            (2, 16, 96),
+            (3, 16, 128),
+            (2, 32, 128),
+        ]:
+            with pytest.raises(RuntimeError, match="Tile columns"):
+                op(
+                    x,
+                    *packed,
+                    tokens,
+                    tasks,
+                    weights,
+                    out,
+                    rejected_bits,
+                    rejected_tile,
+                    weighted,
+                    rejected_columns,
+                )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        op(x, *packed, tokens, tasks, weights, out, bits, tile, weighted)
+        op(
+            x,
+            *packed,
+            tokens,
+            tasks,
+            weights,
+            out,
+            bits,
+            tile,
+            weighted,
+            **(
+                {"tile_columns": 128 if bits == 2 and tile == 16 and n == 137 else 64}
+                if family == "S"
+                else {}
+            ),
+        )
     for trial in range(3):
         x.mul_(0.75)
         weights.mul_(0.8)

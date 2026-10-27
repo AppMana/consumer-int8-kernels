@@ -31,7 +31,7 @@ void gguf_route_reduce(const void*,const int32_t*,void*,int64_t,int,int,int,cuda
 void gguf_plan_routes(const int32_t*,const float*,const int32_t*,int32_t*,int32_t*,float*,
     int32_t*,int32_t*,int,int,int,int,int,int,int,cudaStream_t);
 void gguf_iq_xxs_routed_mm(const void*,const uint8_t*,const void*,const uint8_t*,const int32_t*,
-    const int32_t*,const float*,void*,int,int,int,int,int,int,int,int,bool,cudaStream_t);
+    const int32_t*,const float*,void*,int,int,int,int,int,int,int,int,bool,int,cudaStream_t);
 namespace {
 void boxed_q6_packed_expand(StableIValue* stack, uint64_t, uint64_t) {
   auto values=to<Tensor>(stack[0]), metadata=to<Tensor>(stack[1]), out=to<Tensor>(stack[2]);
@@ -258,6 +258,10 @@ void boxed_iq_xxs_routed(StableIValue* stack, uint64_t, uint64_t) {
   int64_t tile_rows=to<int64_t>(stack[9]);
   int64_t bits=to<int64_t>(stack[8]);
   bool weighted=to<bool>(stack[10]);
+  int64_t columns=64;
+  if constexpr (Small) columns=to<int64_t>(stack[11]);
+  STD_TORCH_CHECK(columns==64 || (Small && bits==2 && tile_rows==16 && columns==128),
+      "Tile columns128 require IQ2_S and16 routed rows; otherwise use64");
   STD_TORCH_CHECK(bits==2 || bits==3, "XXS bits must be2 or3");
   STD_TORCH_CHECK(tile_rows==16 || tile_rows==32, "Routed IQ_XXS tile must be 16 or 32");
   auto x=to<Tensor>(stack[0]), q=to<Tensor>(stack[1]), d=to<Tensor>(stack[2]);
@@ -282,7 +286,7 @@ void boxed_iq_xxs_routed(StableIValue* stack, uint64_t, uint64_t) {
       out.size(0)==tokens.size(0) && out.size(1)==q.size(1), "Invalid routed IQ_XXS shapes");
   STD_TORCH_CHECK(tasks.size(0)<=65535 && x.size(0)<=2147483647 &&
       tokens.size(0)<=2147483632 && x.size(1)<=2147483392 && q.size(0)<=2147483647 &&
-      q.size(1)<=2147483584, "Routed IQ_XXS launch too large");
+      q.size(1)<=2147483647-(columns-1), "Routed IQ_XXS launch too large");
   STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr())%16==0 &&
       reinterpret_cast<uintptr_t>(q.data_ptr())%16==0 &&
       reinterpret_cast<uintptr_t>(d.data_ptr())%4==0 &&
@@ -297,7 +301,7 @@ void boxed_iq_xxs_routed(StableIValue* stack, uint64_t, uint64_t) {
   gguf_iq_xxs_routed_mm(x.data_ptr(),static_cast<const uint8_t*>(q.data_ptr()),d.data_ptr(),
       static_cast<const uint8_t*>(s.data_ptr()),static_cast<const int32_t*>(tokens.data_ptr()),
       static_cast<const int32_t*>(tasks.data_ptr()),static_cast<const float*>(weights.data_ptr()),out.data_ptr(),tokens.size(0),q.size(1),
-      x.size(1),q.size(0),tasks.size(0),x.size(0),bits+(Small ? 2 : 0),tile_rows,weighted,reinterpret_cast<cudaStream_t>(stream));
+      x.size(1),q.size(0),tasks.size(0),x.size(0),bits+(Small ? 2 : 0),tile_rows,weighted,columns,reinterpret_cast<cudaStream_t>(stream));
   auto error=cudaGetLastError();
   STD_TORCH_CHECK(error==cudaSuccess,cudaGetErrorString(error));
 }
@@ -479,7 +483,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(consumer_int8, m) {
   m.def("gguf_q6_packed_expand(Tensor values, Tensor metadata, Tensor(a!) out) -> ()");
   m.def("gguf_q6_expand(Tensor raw, Tensor(a!) out) -> ()");
   m.def("gguf_q6_mm(Tensor x, Tensor raw, Tensor(a!) out, int tile_rows=64) -> ()");
-  m.def("gguf_iq_s_routed_mm(Tensor x, Tensor codes, Tensor bases, Tensor metadata, Tensor tokens, Tensor tasks, Tensor weights, Tensor(a!) out, int bits, int tile_rows=16, bool weighted=False) -> ()");
+  m.def("gguf_iq_s_routed_mm(Tensor x, Tensor codes, Tensor bases, Tensor metadata, Tensor tokens, Tensor tasks, Tensor weights, Tensor(a!) out, int bits, int tile_rows=16, bool weighted=False, int tile_columns=64) -> ()");
   m.def("gguf_iq_xxs_routed_mm(Tensor x, Tensor codes, Tensor bases, Tensor metadata, Tensor tokens, Tensor tasks, Tensor weights, Tensor(a!) out, int bits, int tile_rows=16, bool weighted=False) -> ()");
   m.def("gguf_plan_routes(Tensor ids, Tensor top_weights, Tensor expert_map, Tensor(a!) info, Tensor(b!) tokens, Tensor(c!) weights, Tensor(d!) inverse, Tensor(e!) tasks, int tile_rows=16) -> ()");
   m.def("gguf_mxfp4_routed_weighted_mm(Tensor x, Tensor codes, Tensor scales, Tensor tokens, Tensor tasks, Tensor weights, Tensor(a!) out, int tile_rows=16) -> ()");
