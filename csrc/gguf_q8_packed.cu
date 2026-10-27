@@ -3,11 +3,12 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <mma.h>
 #include <cstdint>
 namespace {
-using namespace nvcuda;
-constexpr int BM=32, BN=64, BK=64, LD=72;
+constexpr int BM=32, BN=64, BK=64, LD=64;
+__device__ __forceinline__ int swizzle(int row, int col) {
+  return row*LD + (col ^ ((row & 7)*8));
+}
 __device__ __forceinline__ void copy16(void* dst, const void* src, bool valid) {
   auto address = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::
@@ -22,14 +23,14 @@ struct Storage {
   __nv_bfloat16 a[2][BM*LD];
   int8_t q[2][BN*BK];
   __half scales[2][BN*2];
-  union { __nv_bfloat16 b[BN*LD]; float c[BM*BN]; } tile;
+  __nv_bfloat16 b[BN*LD];
 };
 __device__ __forceinline__ void load(Storage& s, int stage, int start,
     const __nv_bfloat16* x, const int8_t* q, const __half* scales,
     int m, int n, int k, int64_t xs, int64_t xg) {
   int t=threadIdx.x, row=blockIdx.y*BM+t/8, col=(t%8)*8;
   auto xp = row < m ? x+int64_t(row)*xs+int64_t(blockIdx.z)*xg+start+col : x;
-  copy16(s.a[stage]+(t/8)*LD+col, xp, row<m);
+  copy16(s.a[stage]+swizzle(t/8,col), xp, row<m);
   row=blockIdx.x*BN+t/4; col=(t%4)*16;
   auto qp = row<n ? q+(int64_t(blockIdx.z)*n+row)*k+start+col : q;
   copy16(s.q[stage]+(t/4)*BK+col, qp, row<n);
@@ -45,8 +46,8 @@ __global__ void packed_q8(const __nv_bfloat16* x, const int8_t* q,
     int64_t xs, int64_t xg) {
   __shared__ __align__(32) Storage s;
   int t=threadIdx.x, warp=t/32;
-  wmma::fragment<wmma::accumulator,16,16,16,float> acc;
-  wmma::fill_fragment(acc,0.f);
+  float acc[2][4] = {};
+  const int lane=t%32;
   load(s,0,0,x,q,scales,m,n,k,xs,xg);
   asm volatile("cp.async.wait_group 0;");
   __syncthreads();
@@ -58,28 +59,53 @@ __global__ void packed_q8(const __nv_bfloat16* x, const int8_t* q,
       float scale=__half2float(s.scales[stage][row*2+col/32]);
       auto value=__floats2bfloat162_rn(float(int8_t(pair&255))*scale,
                                      float(int8_t(pair>>8))*scale);
-      *reinterpret_cast<__nv_bfloat162*>(s.tile.b+row*LD+col)=value;
+      *reinterpret_cast<__nv_bfloat162*>(s.b+swizzle(row,col))=value;
     }
     __syncthreads();
     #pragma unroll
     for (int kk=0; kk<BK; kk+=16) {
-      wmma::fragment<wmma::matrix_a,16,16,16,__nv_bfloat16,wmma::row_major> a;
-      wmma::fragment<wmma::matrix_b,16,16,16,__nv_bfloat16,wmma::col_major> b;
-      wmma::load_matrix_sync(a,s.a[stage]+(warp/4)*16*LD+kk,LD);
-      wmma::load_matrix_sync(b,s.tile.b+(warp%4)*16*LD+kk,LD);
-      wmma::mma_sync(acc,a,b,acc);
+      uint32_t a[4];
+      uint32_t ap=static_cast<uint32_t>(__cvta_generic_to_shared(
+          s.a[stage]+swizzle((warp/4)*16+lane%16,kk+(lane/16)*8)));
+      asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+          : "=r"(a[0]),"=r"(a[1]),"=r"(a[2]),"=r"(a[3]) : "r"(ap));
+      #pragma unroll
+      for (int nn=0;nn<2;++nn) {
+        uint32_t b[2];
+        uint32_t bp=static_cast<uint32_t>(__cvta_generic_to_shared(
+            s.b+swizzle((warp%4)*16+nn*8+lane%8,kk+((lane/8)%2)*8)));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+            : "=r"(b[0]),"=r"(b[1]) : "r"(bp));
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+f"(acc[nn][0]),"+f"(acc[nn][1]),"+f"(acc[nn][2]),"+f"(acc[nn][3])
+            : "r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b[0]),"r"(b[1]));
+      }
     }
     __syncthreads();
     asm volatile("cp.async.wait_group 0;");
     __syncthreads();
   }
-  wmma::store_matrix_sync(s.tile.c+(warp/4)*16*BN+(warp%4)*16,acc,BN,wmma::mem_row_major);
-  __syncthreads();
-  for (int i=t;i<BM*BN;i+=256) {
-    int row=blockIdx.y*BM+i/BN,col=blockIdx.x*BN+i%BN;
-    if (row<m && col<n)
-      y[(int64_t(row)*groups+blockIdx.z)*n+col]=__float2bfloat16_rn(s.tile.c[i]);
+  #pragma unroll
+  for (int nn=0;nn<2;++nn) {
+    #pragma unroll
+    for (int r=0;r<2;++r) {
+      int row=blockIdx.y*BM+(warp/4)*16+lane/4+r*8;
+      int col=blockIdx.x*BN+(warp%4)*16+nn*8+(lane%4)*2;
+      if (row<m && col<n) {
+        int64_t dst=(int64_t(row)*groups+blockIdx.z)*n+col;
+        if (col+1<n && (dst%2)==0)
+          *reinterpret_cast<__nv_bfloat162*>(y+dst)=
+              __floats2bfloat162_rn(acc[nn][r*2],acc[nn][r*2+1]);
+        else {
+          y[dst]=__float2bfloat16_rn(acc[nn][r*2]);
+          if (col+1<n) y[dst+1]=__float2bfloat16_rn(acc[nn][r*2+1]);
+        }
+      }
+    }
   }
+
 }
 }
 void gguf_q8_packed_mm(const void* x,const int8_t* q,const void* scales,void* y,
