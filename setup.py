@@ -43,6 +43,10 @@ def extension(name, sources, *, fast_math=False):
 setup(
     ext_modules=[
         extension(
+            "consumer_int8._gguf",
+            ["csrc/gguf_bindings.cpp", "csrc/gguf_q8.cu"],
+        ),
+        extension(
             "consumer_int8._C",
             [
                 "csrc/bindings.cpp",
