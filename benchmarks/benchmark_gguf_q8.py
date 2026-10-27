@@ -16,11 +16,79 @@ import numpy as np
 import torch
 
 
+def prepare_b12x(raw, x, out, recipe):
+    from b12x.gemm import blockscaled
+    from b12x.preparation import PreparationSession, PreparedCall, require_prepared
+
+    calls, outputs = [], []
+    with PreparationSession(
+        device=x.device, autotune=False, compile_workers=1
+    ) as session:
+        for group in range(x.shape[1]):
+            weight = blockscaled.pack_weight(raw[group], recipe=recipe.lower())
+            gathered = torch.empty_like(
+                x[:, group], memory_format=torch.contiguous_format
+            )
+            output = (
+                torch.empty_like(out[:, group], memory_format=torch.contiguous_format)
+                if x.shape[1] > 1
+                else out[:, 0]
+            )
+            gathered.copy_(x[:, group])
+            plan = blockscaled.plan(
+                blockscaled.query_from_call(gathered, weight, out=output)
+            )
+
+            def factory(
+                state, weight=weight, gathered=gathered, output=output, group=group
+            ):
+                def run():
+                    if x.shape[1] > 1:
+                        gathered.copy_(x[:, group])
+                    state.run(
+                        gathered if x.shape[1] > 1 else x[:, 0],
+                        weight.values,
+                        weight.metadata,
+                        None,
+                        out=output,
+                    )
+
+                return PreparedCall(
+                    run=run, output=output, owners=(weight, state, gathered)
+                )
+
+            session.prepare(
+                (plan.request(name="paired GGUF dense", prepare_call=factory),)
+            )
+            calls.append(factory(require_prepared(plan, "gemm.blockscaled_precision")))
+            outputs.append(output)
+        session.freeze()
+
+    def run():
+        for call in calls:
+            call.run()
+        if x.shape[1] > 1:
+            torch.stack(outputs, dim=1, out=out)
+
+    return PreparedCall(run=run, output=out, owners=tuple(calls))
+
+
 def main(args):
     torch.cuda.set_device(args.device)
     torch.manual_seed(137)
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.ops.load_library(str(args.library.resolve()))
+    b12x_source_hash = None
+    if args.compare_b12x:
+        import b12x
+
+        source_root = Path(b12x.__file__).parent
+        b12x_source_hash = hashlib.sha256(
+            b"".join(
+                str(path.relative_to(source_root)).encode() + path.read_bytes()
+                for path in sorted(source_root.rglob("*.py"))
+            )
+        ).hexdigest()
     manifest = json.loads(args.manifest.read_text())
     flush = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
     with args.output.open("x") as report:
@@ -32,14 +100,29 @@ def main(args):
             path = args.manifest.parent / Path(item["path"]).name
             data = path.read_bytes()
             assert hashlib.sha256(data).hexdigest() == item["sha256"]
-            k, n = item["dims"][:2]
+            k, source_n = item["dims"][:2]
+            selected_n = args.row_count or source_n - args.row_start
+            if (
+                args.row_start < 0
+                or selected_n <= 0
+                or args.row_start + selected_n > source_n
+                or selected_n % args.groups
+            ):
+                raise ValueError("Invalid source row partition")
+            n = selected_n // args.groups
+            if args.quant != "Q8_0" and args.groups != 1:
+                raise ValueError("Grouped benchmark currently requires Q8")
             nibbles = None
             if args.quant == "IQ2_XS":
                 import gguf
 
                 assert item.get("experts", 1) == 1
                 raw_np = (
-                    np.frombuffer(data, dtype=np.uint8).copy().reshape(n, k // 256, 74)
+                    np.frombuffer(data, dtype=np.uint8)
+                    .copy()
+                    .reshape(source_n, k // 256, 74)[
+                        args.row_start : args.row_start + selected_n
+                    ]
                 )
                 raw = torch.from_numpy(raw_np).unsqueeze(0).cuda()
                 codes = raw[..., 2:66].contiguous().view(torch.int16).flatten(2)
@@ -50,25 +133,44 @@ def main(args):
                 decoded = gguf.dequantize(
                     raw_np.reshape(-1, 74), gguf.GGMLQuantizationType.IQ2_XS
                 )
-                dense = torch.from_numpy(decoded.reshape(n, k)).cuda().bfloat16()
+                dense = torch.from_numpy(decoded.reshape(1, n, k)).cuda().bfloat16()
             else:
                 raw_np = (
-                    np.frombuffer(data, dtype=np.uint8).copy().reshape(n, k // 32, 34)
+                    np.frombuffer(data, dtype=np.uint8)
+                    .copy()
+                    .reshape(source_n, k // 32, 34)[
+                        args.row_start : args.row_start + selected_n
+                    ]
+                    .reshape(args.groups, n, k // 32, 34)
                 )
                 scales = (
                     np.ascontiguousarray(raw_np[..., :2]).view("<f2").astype(np.float32)
                 )
                 values = raw_np[..., 2:].view(np.int8).astype(np.float32)
-                raw = torch.from_numpy(raw_np).unsqueeze(0).cuda()
-                codes = raw[..., 2:].contiguous().view(torch.int8).reshape(1, n, k)
+                raw = torch.from_numpy(raw_np).cuda()
+                codes = (
+                    raw[..., 2:]
+                    .contiguous()
+                    .view(torch.int8)
+                    .reshape(args.groups, n, k)
+                )
                 scales_gpu = raw[..., :2].contiguous().view(torch.float16).squeeze(-1)
                 dense = (
-                    torch.from_numpy((scales * values).reshape(n, k)).cuda().bfloat16()
+                    torch.from_numpy((scales * values).reshape(args.groups, n, k))
+                    .cuda()
+                    .bfloat16()
                 )
-            expanded = torch.empty(1, n, k, device="cuda", dtype=torch.bfloat16)
+            expanded = torch.empty(
+                args.groups, n, k, device="cuda", dtype=torch.bfloat16
+            )
             for m in args.rows:
-                x = torch.randn(m, 1, k, device="cuda", dtype=torch.bfloat16) * 0.1
-                out = torch.empty(m, 1, n, device="cuda", dtype=torch.bfloat16)
+                x = (
+                    torch.randn(m, args.groups, k, device="cuda", dtype=torch.bfloat16)
+                    * 0.1
+                )
+                out = torch.empty(
+                    m, args.groups, n, device="cuda", dtype=torch.bfloat16
+                )
                 base = torch.empty_like(out)
 
                 def native(x=x, raw=raw, out=out):
@@ -87,7 +189,11 @@ def main(args):
                         )
 
                 def cublas(x=x, dense=dense, base=base):
-                    torch.mm(x[:, 0], dense.T, out=base[:, 0])
+                    torch.bmm(
+                        x.transpose(0, 1),
+                        dense.transpose(1, 2),
+                        out=base.transpose(0, 1),
+                    )
 
                 def expand_cublas(
                     x=x,
@@ -97,7 +203,11 @@ def main(args):
                     base=base,
                 ):
                     torch.ops.consumer_int8.gguf_q8_expand(codes, scales_gpu, expanded)
-                    torch.mm(x[:, 0], expanded[0].T, out=base[:, 0])
+                    torch.bmm(
+                        x.transpose(0, 1),
+                        expanded.transpose(1, 2),
+                        out=base.transpose(0, 1),
+                    )
 
                 if args.quant == "Q8_0":
                     native()
@@ -105,10 +215,11 @@ def main(args):
                 packed()
                 if args.quant == "Q8_0":
                     assert torch.equal(out, raw_result)
-                reference = (x[:, 0].float() @ dense.float().T).bfloat16()
+                reference = torch.einsum(
+                    "mgk,gnk->mgn", x.float(), dense.float()
+                ).bfloat16()
                 relative = (
-                    (out[:, 0].float() - reference.float()).norm()
-                    / reference.float().norm()
+                    (out.float() - reference.float()).norm() / reference.float().norm()
                 ).item()
                 assert (
                     relative < 0.001
@@ -125,15 +236,34 @@ def main(args):
                 candidates = [("packed_async", packed), ("resident_cublas", cublas)]
                 if args.quant == "Q8_0":
                     expand_cublas()
-                    assert torch.equal(expanded[0], dense)
+                    assert torch.equal(expanded, dense)
                     cublas_result = base.clone()
                     cublas()
                     assert torch.equal(base, cublas_result)
                     candidates.insert(0, ("native", native))
                     candidates.append(("expand_cublas", expand_cublas))
+                b12x_call = None
+                if args.compare_b12x:
+                    b12x_out = torch.empty_like(out)
+                    b12x_call = prepare_b12x(raw, x, b12x_out, args.quant)
+                    candidates.append(("b12x", b12x_call.run))
+                candidate_outputs = {
+                    "native": out,
+                    "packed_async": out,
+                    "resident_cublas": base,
+                    "expand_cublas": base,
+                }
+                if b12x_call is not None:
+                    candidate_outputs["b12x"] = b12x_call.output
+                errors = {}
                 for name, fn in candidates:
                     for _ in range(3):
                         fn()
+                    result = candidate_outputs[name].float()
+                    errors[name] = (
+                        (result - reference.float()).norm() / reference.float().norm()
+                    ).item()
+                    assert torch.isfinite(result).all() and errors[name] < 0.005
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
                         fn()
@@ -151,7 +281,21 @@ def main(args):
                         end.record()
                         end.synchronize()
                         measurements[name].append(start.elapsed_time(end))
+                for name, graph in graphs.items():
+                    candidate_outputs[name].fill_(float("nan"))
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    result = candidate_outputs[name].float()
+                    assert torch.isfinite(result).all()
+                    assert (
+                        result - reference.float()
+                    ).norm() / reference.float().norm() < 0.005
                 record = dict(
+                    benchmark_sha256=hashlib.sha256(
+                        Path(__file__).read_bytes()
+                    ).hexdigest(),
+                    candidate_relative_l2=errors,
+                    b12x_source_sha256=b12x_source_hash,
                     workspace_bytes=expanded.numel() * expanded.element_size(),
                     quant=args.quant,
                     checkpoint=manifest["repo"],
@@ -163,6 +307,8 @@ def main(args):
                     ).hexdigest(),
                     device=str(torch.cuda.get_device_properties(args.device)),
                     torch=torch.__version__,
+                    groups=args.groups,
+                    row_start=args.row_start,
                     m=m,
                     n=n,
                     k=k,
@@ -196,6 +342,10 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--quant", choices=["Q8_0", "IQ2_XS"], default="Q8_0")
     parser.add_argument("--device", type=int, default=1)
+    parser.add_argument("--groups", type=int, default=1)
+    parser.add_argument("--row-start", type=int, default=0)
+    parser.add_argument("--row-count", type=int)
+    parser.add_argument("--compare-b12x", action="store_true")
     parser.add_argument("--tensor", help="Profile or benchmark one manifest tensor")
     parser.add_argument(
         "--profile-only",
