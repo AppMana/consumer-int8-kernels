@@ -14,6 +14,8 @@ void gguf_q8_mm(const void*, const uint8_t*, void*, int, int, int, int,
                 int64_t, int64_t, cudaStream_t);
 void gguf_q8_packed_mm(const void*, const int8_t*, const void*, void*, int, int, int, int,
                        int64_t, int64_t, cudaStream_t);
+void gguf_iq2_xs_mm(const void*, const int8_t*, const void*, const uint8_t*, void*,
+    int, int, int, int, int64_t, int64_t, cudaStream_t);
 namespace {
 void boxed_q8(StableIValue* stack, uint64_t, uint64_t) {
   auto x = to<Tensor>(stack[0]), w = to<Tensor>(stack[1]), y = to<Tensor>(stack[2]);
@@ -82,12 +84,54 @@ void boxed_q8_packed(StableIValue* stack, uint64_t, uint64_t) {
   STD_TORCH_CHECK(error==cudaSuccess,cudaGetErrorString(error));
 }
 
+void boxed_iq2_xs(StableIValue* stack, uint64_t, uint64_t) {
+  auto x=to<Tensor>(stack[0]), q=to<Tensor>(stack[1]), d=to<Tensor>(stack[2]);
+  auto s=to<Tensor>(stack[3]), out=to<Tensor>(stack[4]);
+  STD_TORCH_CHECK(x.is_cuda() && q.is_cuda() && d.is_cuda() && s.is_cuda() && out.is_cuda() &&
+      x.get_device_index()==q.get_device_index() && x.get_device_index()==d.get_device_index() &&
+      x.get_device_index()==s.get_device_index() && x.get_device_index()==out.get_device_index(),
+      "IQ2_XS tensors must share a CUDA device");
+  STD_TORCH_CHECK(x.scalar_type()==ScalarType::BFloat16 && q.scalar_type()==ScalarType::Short &&
+      d.scalar_type()==ScalarType::Half && s.scalar_type()==ScalarType::Byte &&
+      out.scalar_type()==ScalarType::BFloat16, "Invalid IQ2_XS dtype");
+  STD_TORCH_CHECK(x.dim()==3 && q.dim()==3 && d.dim()==3 && s.dim()==3 && out.dim()==3,
+      "Expected x[M,G,K], codes[G,N,K/8], bases[G,N,even_ceil(K/256)], scales[G,N,K/32]");
+  STD_TORCH_CHECK(x.size(2)>0 && x.size(2)%256==0 && x.stride(2)==1 &&
+      x.stride(0)>0 && x.stride(1)>0 && q.is_contiguous() && d.is_contiguous() &&
+      s.is_contiguous() && out.is_contiguous() && q.size(0)==x.size(1) &&
+      q.size(2)==x.size(2)/8 && d.size(0)==q.size(0) && d.size(1)==q.size(1) &&
+      d.size(2)==((x.size(2)/256+1)&~int64_t(1)) && s.size(0)==q.size(0) &&
+      s.size(1)==q.size(1) && s.size(2)==x.size(2)/32 && out.size(0)==x.size(0) &&
+      out.size(1)==x.size(1) && out.size(2)==q.size(1), "Invalid IQ2_XS shape or strides");
+  STD_TORCH_CHECK(x.size(0)<=65535*32 && x.size(1)<=65535 && x.size(2)<=2147483392 &&
+      q.size(1)<=2147483584, "IQ2_XS grid too large");
+  STD_TORCH_CHECK(x.stride(0)%8==0 && x.stride(1)%8==0 &&
+      reinterpret_cast<uintptr_t>(x.data_ptr())%16==0 &&
+      reinterpret_cast<uintptr_t>(q.data_ptr())%16==0 &&
+      reinterpret_cast<uintptr_t>(d.data_ptr())%4==0 &&
+      reinterpret_cast<uintptr_t>(s.data_ptr())%4==0, "IQ2_XS copy alignment violation");
+  if (!out.numel()) return;
+  STD_TORCH_CHECK(out.data_ptr()!=x.data_ptr() && out.data_ptr()!=q.data_ptr() &&
+      out.data_ptr()!=d.data_ptr() && out.data_ptr()!=s.data_ptr(), "IQ2_XS output must not alias inputs");
+  int device=x.get_device_index();
+  torch::stable::accelerator::DeviceGuard guard(device);
+  void* stream=nullptr;
+  TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device,&stream));
+  gguf_iq2_xs_mm(x.data_ptr(),static_cast<const int8_t*>(q.data_ptr()),d.data_ptr(),
+      static_cast<const uint8_t*>(s.data_ptr()),out.data_ptr(),x.size(0),q.size(1),x.size(2),
+      x.size(1),x.stride(0),x.stride(1),reinterpret_cast<cudaStream_t>(stream));
+  auto error=cudaGetLastError();
+  STD_TORCH_CHECK(error==cudaSuccess,cudaGetErrorString(error));
+}
+
 }
 STABLE_TORCH_LIBRARY_FRAGMENT(consumer_int8, m) {
+  m.def("gguf_iq2_xs_mm(Tensor x, Tensor codes, Tensor bases, Tensor scales, Tensor(a!) out) -> ()");
   m.def("gguf_q8_packed_mm(Tensor x, Tensor codes, Tensor scales, Tensor(a!) out) -> ()");
   m.def("gguf_q8_mm(Tensor x, Tensor weight, Tensor(a!) out) -> ()");
 }
 STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
+  m.impl("gguf_iq2_xs_mm", &boxed_iq2_xs);
   m.impl("gguf_q8_packed_mm", &boxed_q8_packed);
   m.impl("gguf_q8_mm", &boxed_q8);
 }

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Race native Q8 against resident dequantized cuBLAS (a memory-costly ceiling).
+"""Race native Q8/IQ2_XS against resident dequantized cuBLAS (a memory-costly ceiling).
 
 Loads an explicitly built library; does not compile during import or measurement.
 The raw sample manifest binds checkpoint identity and bytes. JSONL output belongs
@@ -25,21 +25,46 @@ def main(args):
     flush = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
     with args.output.open("x") as report:
         for item in manifest["samples"]:
+            if args.quant == "IQ2_XS" and item.get("type") != "IQ2_XS":
+                continue
             if args.tensor and item["name"] != args.tensor:
                 continue
             path = args.manifest.parent / Path(item["path"]).name
             data = path.read_bytes()
             assert hashlib.sha256(data).hexdigest() == item["sha256"]
-            k, n = item["dims"]
-            raw_np = np.frombuffer(data, dtype=np.uint8).copy().reshape(n, k // 32, 34)
-            scales = (
-                np.ascontiguousarray(raw_np[..., :2]).view("<f2").astype(np.float32)
-            )
-            values = raw_np[..., 2:].view(np.int8).astype(np.float32)
-            raw = torch.from_numpy(raw_np).unsqueeze(0).cuda()
-            codes = raw[..., 2:].contiguous().view(torch.int8).reshape(1, n, k)
-            scales_gpu = raw[..., :2].contiguous().view(torch.float16).squeeze(-1)
-            dense = torch.from_numpy((scales * values).reshape(n, k)).cuda().bfloat16()
+            k, n = item["dims"][:2]
+            nibbles = None
+            if args.quant == "IQ2_XS":
+                import gguf
+
+                assert item.get("experts", 1) == 1
+                raw_np = (
+                    np.frombuffer(data, dtype=np.uint8).copy().reshape(n, k // 256, 74)
+                )
+                raw = torch.from_numpy(raw_np).unsqueeze(0).cuda()
+                codes = raw[..., 2:66].contiguous().view(torch.int16).flatten(2)
+                scales_gpu = raw[..., :2].contiguous().view(torch.float16).squeeze(-1)
+                if scales_gpu.shape[-1] % 2:
+                    scales_gpu = torch.nn.functional.pad(scales_gpu, (0, 1))
+                nibbles = raw[..., 66:].contiguous().flatten(2)
+                decoded = gguf.dequantize(
+                    raw_np.reshape(-1, 74), gguf.GGMLQuantizationType.IQ2_XS
+                )
+                dense = torch.from_numpy(decoded.reshape(n, k)).cuda().bfloat16()
+            else:
+                raw_np = (
+                    np.frombuffer(data, dtype=np.uint8).copy().reshape(n, k // 32, 34)
+                )
+                scales = (
+                    np.ascontiguousarray(raw_np[..., :2]).view("<f2").astype(np.float32)
+                )
+                values = raw_np[..., 2:].view(np.int8).astype(np.float32)
+                raw = torch.from_numpy(raw_np).unsqueeze(0).cuda()
+                codes = raw[..., 2:].contiguous().view(torch.int8).reshape(1, n, k)
+                scales_gpu = raw[..., :2].contiguous().view(torch.float16).squeeze(-1)
+                dense = (
+                    torch.from_numpy((scales * values).reshape(n, k)).cuda().bfloat16()
+                )
             for m in args.rows:
                 x = torch.randn(m, 1, k, device="cuda", dtype=torch.bfloat16) * 0.1
                 out = torch.empty(m, 1, n, device="cuda", dtype=torch.bfloat16)
@@ -48,16 +73,27 @@ def main(args):
                 def native(x=x, raw=raw, out=out):
                     torch.ops.consumer_int8.gguf_q8_mm(x, raw, out)
 
-                def packed(x=x, codes=codes, scales_gpu=scales_gpu, out=out):
-                    torch.ops.consumer_int8.gguf_q8_packed_mm(x, codes, scales_gpu, out)
+                def packed(
+                    x=x, codes=codes, scales_gpu=scales_gpu, out=out, nibbles=nibbles
+                ):
+                    if args.quant == "IQ2_XS":
+                        torch.ops.consumer_int8.gguf_iq2_xs_mm(
+                            x, codes, scales_gpu, nibbles, out
+                        )
+                    else:
+                        torch.ops.consumer_int8.gguf_q8_packed_mm(
+                            x, codes, scales_gpu, out
+                        )
 
                 def cublas(x=x, dense=dense, base=base):
                     torch.mm(x[:, 0], dense.T, out=base[:, 0])
 
-                native()
-                raw_result = out.clone()
+                if args.quant == "Q8_0":
+                    native()
+                    raw_result = out.clone()
                 packed()
-                assert torch.equal(out, raw_result)
+                if args.quant == "Q8_0":
+                    assert torch.equal(out, raw_result)
                 reference = (x[:, 0].float() @ dense.float().T).bfloat16()
                 relative = (
                     (out[:, 0].float() - reference.float()).norm()
@@ -75,11 +111,10 @@ def main(args):
                     report.flush()
                     continue
                 graphs = {}
-                for name, fn in [
-                    ("native", native),
-                    ("packed_async", packed),
-                    ("resident_cublas", cublas),
-                ]:
+                candidates = [("packed_async", packed), ("resident_cublas", cublas)]
+                if args.quant == "Q8_0":
+                    candidates.insert(0, ("native", native))
+                for name, fn in candidates:
                     for _ in range(3):
                         fn()
                     graph = torch.cuda.CUDAGraph()
@@ -100,6 +135,7 @@ def main(args):
                         end.synchronize()
                         measurements[name].append(start.elapsed_time(end))
                 record = dict(
+                    quant=args.quant,
                     checkpoint=manifest["repo"],
                     revision=manifest["revision"],
                     tensor=item["name"],
@@ -140,6 +176,7 @@ if __name__ == "__main__":
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--quant", choices=["Q8_0", "IQ2_XS"], default="Q8_0")
     parser.add_argument("--device", type=int, default=1)
     parser.add_argument("--tensor", help="Profile or benchmark one manifest tensor")
     parser.add_argument(

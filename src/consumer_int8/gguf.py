@@ -52,3 +52,33 @@ def pack_q8(raw):
         raise ValueError("Q8 scale bases must be finite")
     codes = raw[..., 2:].contiguous().view(torch.int8)
     return codes.reshape(*raw.shape[:2], raw.shape[2] * 32), scales
+
+
+iq2_xs_mm = torch.ops.consumer_int8.gguf_iq2_xs_mm
+
+
+@torch.library.register_fake("consumer_int8::gguf_iq2_xs_mm")
+def _iq2_xs_fake(x, codes, bases, scales, out):
+    return None
+
+
+def pack_iq2_xs(raw):
+    """Losslessly separate IQ2_XS [G,N,K/256,74] before graph capture.
+
+    Bases are padded to an even count for aligned copies; codeword and nibble
+    storage retain their original size. No expanded floating weights are kept.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("IQ2_XS packing must precede graph capture")
+    if not raw.is_cuda or raw.dtype != torch.uint8 or raw.ndim != 4:
+        raise ValueError("Expected CUDA uint8 raw IQ2_XS blocks [G,N,K/256,74]")
+    if raw.shape[-1] != 74 or min(raw.shape) <= 0:
+        raise ValueError("Invalid IQ2_XS block shape")
+    bases = raw[..., :2].contiguous().view(torch.float16).squeeze(-1)
+    if not torch.isfinite(bases).all().item():
+        raise ValueError("IQ2_XS scale bases must be finite")
+    if bases.shape[-1] % 2:
+        bases = torch.nn.functional.pad(bases, (0, 1))
+    codes = raw[..., 2:66].contiguous().view(torch.int16).flatten(2)
+    scales = raw[..., 66:].contiguous().flatten(2)
+    return codes, bases, scales
