@@ -62,7 +62,12 @@ __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
     const __half* scales, const uint8_t* iq_scales, __nv_bfloat16* y, int m, int n, int k, int groups,
     int64_t xs, int64_t xg) {
   __shared__ __align__(32) Storage<IQ> s;
+  __shared__ uint64_t codebook[IQ ? 512 : 1];
   int t=threadIdx.x, warp=t/32;
+  if constexpr (IQ) {
+    codebook[t]=iq2xs_grid[t];
+    codebook[t+256]=iq2xs_grid[t+256];
+  }
   float acc[2][4] = {};
   const int lane=t%32;
   load(s,0,0,x,q,scales,iq_scales,m,n,k,xs,xg);
@@ -77,7 +82,7 @@ __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
         uint16_t code=*reinterpret_cast<const uint16_t*>(s.q[stage]+row*(BK/4)+(col/8)*2);
         uint32_t signs=code>>9;
         signs|=(__popc(signs)&1)<<7;
-        uint64_t grid=iq2xs_grid[code&511];
+        uint64_t grid=codebook[code&511];
         uint32_t pair=uint32_t(grid>>((col%8)*8));
         uint8_t sb=s.iq_scales[stage][row*4+((start/64)%2)*2+col/32];
         int scale4=(sb>>(((col%32)/16)*4))&15;
