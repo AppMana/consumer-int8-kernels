@@ -18,7 +18,20 @@ import torch
 
 
 def prepare_b12x(
-    gate, up, down, first, second, x, ids, weights, mapping, experts, expert_ids=None
+    gate,
+    up,
+    down,
+    first,
+    second,
+    x,
+    ids,
+    weights,
+    mapping,
+    experts,
+    expert_ids=None,
+    *,
+    max_tokens=None,
+    prepared=None,
 ):
     from b12x.moe import fused_moe as moe
     from b12x.preparation import PreparationSession, PreparedCall, require_prepared
@@ -55,21 +68,28 @@ def prepare_b12x(
             "IQ3_S": moe.IQ3SWeights,
         }[first]
     )
-    prepared = moe.prepare_weights(
-        plan=plan,
-        weights=(
-            moe.GGUFExpertWeights(gate, up, down, expert_ids, x.device)
-            if expert_ids is not None
-            else weight_type(
-                torch.cat((gate, up), 0).unsqueeze(0).repeat(experts, 1, 1, 1),
-                down.unsqueeze(0).repeat(experts, 1, 1, 1),
-            )
-        ),
+    capacity = x.shape[0] if max_tokens is None else max_tokens
+    if capacity < x.shape[0]:
+        raise ValueError("Prepared capacity must cover live tokens")
+    prepared = (
+        prepared
+        if prepared is not None
+        else moe.prepare_weights(
+            plan=plan,
+            weights=(
+                moe.GGUFExpertWeights(gate, up, down, expert_ids, x.device)
+                if expert_ids is not None
+                else weight_type(
+                    torch.cat((gate, up), 0).unsqueeze(0).repeat(experts, 1, 1, 1),
+                    down.unsqueeze(0).repeat(experts, 1, 1, 1),
+                )
+            ),
+        )
     )
     declaration = moe.plan_execution(
         experts=prepared,
         capacity=moe.ExecutionCapacity(
-            max_tokens=x.shape[0],
+            max_tokens=capacity,
             top_k=ids.shape[1],
             route_num_experts=mapping.numel(),
         ),

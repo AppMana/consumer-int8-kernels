@@ -196,6 +196,24 @@ def main(args):
                 )
                 calls["b12x"] = (b12x.run, b12x.output)
                 owners.append(b12x)
+                for capacity in args.b12x_capacities:
+                    if capacity == count:
+                        continue
+                    extra = prepare_b12x(
+                        *sources,
+                        gate.quant_type,
+                        down.quant_type,
+                        x,
+                        ids,
+                        weights,
+                        native.expert_map,
+                        args.experts,
+                        expert_ids=owned,
+                        max_tokens=capacity,
+                        prepared=b12x.owners[0],
+                    )
+                    calls[f"b12x-capacity{capacity}"] = (extra.run, extra.output)
+                    owners.append(extra)
                 for pattern in args.patterns:
                     host_ids = make_routes(count, first, pattern)
                     ids.copy_(torch.from_numpy(host_ids))
@@ -262,6 +280,7 @@ def main(args):
                         identity,
                         layer=layer,
                         tokens=count,
+                        b12x_capacities=[count, *args.b12x_capacities],
                         pattern=pattern,
                         formats=[gate.quant_type, down.quant_type],
                         local_active_experts=int(np.count_nonzero(route_counts)),
@@ -314,6 +333,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--tokens", type=int, nargs="+", default=[512])
     parser.add_argument(
+        "--b12x-capacities",
+        type=int,
+        nargs="*",
+        default=[],
+        help="Race additional prepared capacities on the same live rows and weights",
+    )
+    parser.add_argument(
         "--patterns",
         choices=["balanced", "legacy-balanced", "random"],
         nargs="+",
@@ -326,4 +352,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if not 1 <= args.experts <= 192 or min(*args.tokens, args.trials) < 1:
         parser.error("Invalid expert count, token count or trials")
+    if any(capacity < max(args.tokens) for capacity in args.b12x_capacities):
+        parser.error("Every additional capacity must cover all live token counts")
     main(args)
