@@ -5,6 +5,7 @@ import os
 
 import pytest
 import torch
+from test_gguf_iq2_xs import api as api
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -78,3 +79,53 @@ def test_q8_expand_oracle_graph(k):
         assert torch.cuda.memory_allocated() == allocated
         ref = codes.view(3, 37, k // 32, 32).float() * scales.float()[..., None]
         assert torch.equal(out, ref.reshape_as(out).bfloat16())
+
+
+@pytest.mark.parametrize("k", [256, 768, 1280])
+@pytest.mark.parametrize(
+    "m,tile_rows,group_major", [(1, 32, False), (37, 64, True), (129, 64, False)]
+)
+def test_q6_raw_oracle_and_graph(api, k, m, tile_rows, group_major):
+    """Catch Q6 split-nibble/sign/scale ordering and scratch reuse errors."""
+    import gguf
+    import numpy as np
+
+    rng = np.random.default_rng(k + m)
+    groups, n = 2, 37
+    raw_np = rng.integers(0, 256, (groups, n, k // 256, 210), dtype=np.uint8)
+    bases = (rng.standard_normal((groups, n, k // 256, 1)) * 0.01).astype("<f2")
+    raw_np[..., 208:] = bases.view(np.uint8)
+    raw = torch.from_numpy(raw_np).cuda()
+    decoded = gguf.dequantize(raw_np.reshape(-1, 210), gguf.GGMLQuantizationType.Q6_K)
+    dense = torch.from_numpy(decoded.reshape(groups, n, k)).cuda().bfloat16()
+    expanded = torch.empty_like(dense)
+    x = torch.randn(
+        (groups, m, k) if group_major else (m, groups, k),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    if group_major:
+        x = x.transpose(0, 1)
+    out = torch.empty(m, groups, n, dtype=torch.bfloat16, device="cuda")
+    expanded_out = torch.empty_like(out)
+    api.q6_expand_mm(x, raw, expanded, expanded_out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        api.q6_expand_mm(x, raw, expanded, expanded_out)
+        torch.ops.consumer_int8.gguf_q6_mm(x, raw, out, tile_rows)
+    for _ in range(3):
+        x.mul_(0.75)
+        expanded.fill_(float("nan"))
+        out.fill_(float("nan"))
+        expanded_out.fill_(float("nan"))
+        allocated = torch.cuda.memory_allocated()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated
+        assert torch.equal(expanded, dense)
+        ref = torch.bmm(x.transpose(0, 1).float(), dense.float().transpose(1, 2))
+        ref = ref.transpose(0, 1).bfloat16().float()
+        assert torch.isfinite(out).all()
+        assert (out.float() - ref).norm() / ref.norm() < 0.001
+        assert torch.isfinite(expanded_out).all()
+        assert (expanded_out.float() - ref).norm() / ref.norm() < 0.001

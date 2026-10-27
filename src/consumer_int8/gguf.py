@@ -21,6 +21,38 @@ from . import _gguf  # noqa: F401
 
 q8_mm = torch.ops.consumer_int8.gguf_q8_mm
 
+q6_mm = torch.ops.consumer_int8.gguf_q6_mm
+q6_expand = torch.ops.consumer_int8.gguf_q6_expand
+
+
+@torch.library.register_fake("consumer_int8::gguf_q6_mm")
+def _q6_fake(x, raw, out, tile_rows=64):
+    return None
+
+
+@torch.library.register_fake("consumer_int8::gguf_q6_expand")
+def _q6_expand_fake(raw, out):
+    return None
+
+
+def q6_expand_mm(x, raw, weight_workspace, out):
+    """Expand raw Q6_K [G,N,K/256,210] into shared scratch, then BF16 GEMM.
+
+    Keeps original signed scales and codes, without activation quantization.
+    The caller owns scratch [G,N,K] and serializes concurrent users. This is
+    an experimental shape-dependent candidate, not a default serving policy.
+    """
+    if x.ndim != 3 or raw.ndim != 4 or out.ndim != 3:
+        raise ValueError("Expected x[M,G,K], raw[G,N,K/256,210], out[M,G,N]")
+    if x.shape[1:] != (raw.shape[0], raw.shape[2] * 256):
+        raise ValueError("Q6 activation shape does not match weights")
+    if out.shape != (x.shape[0], raw.shape[0], raw.shape[1]):
+        raise ValueError("Q6 output shape does not match activations/weights")
+    q6_expand(raw, weight_workspace)
+    torch.bmm(
+        x.transpose(0, 1), weight_workspace.transpose(1, 2), out=out.transpose(0, 1)
+    )
+
 
 @torch.library.register_fake("consumer_int8::gguf_q8_mm")
 def _q8_fake(x, weight, out):

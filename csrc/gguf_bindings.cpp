@@ -10,6 +10,8 @@
 #include <limits>
 using torch::stable::Tensor;
 using torch::headeronly::ScalarType;
+void gguf_q6_expand(const uint8_t*,void*,int64_t,cudaStream_t);
+void gguf_q6_mm(const void*,const uint8_t*,void*,int,int,int,int,int64_t,int64_t,int,cudaStream_t);
 void gguf_q8_mm(const void*, const uint8_t*, void*, int, int, int, int,
                 int64_t, int64_t, cudaStream_t);
 void gguf_q8_packed_mm(const void*, const int8_t*, const void*, void*, int, int, int, int,
@@ -30,6 +32,49 @@ void gguf_plan_routes(const int32_t*,const float*,const int32_t*,int32_t*,int32_
 void gguf_iq_xxs_routed_mm(const void*,const uint8_t*,const void*,const uint8_t*,const int32_t*,
     const int32_t*,const float*,void*,int,int,int,int,int,int,int,int,bool,cudaStream_t);
 namespace {
+template<bool Expand>
+void boxed_q6(StableIValue* stack, uint64_t, uint64_t) {
+  auto raw=to<Tensor>(stack[Expand ? 0 : 1]), out=to<Tensor>(stack[Expand ? 1 : 2]);
+  STD_TORCH_CHECK(raw.is_cuda() && out.is_cuda() && raw.get_device_index()==out.get_device_index(),
+      "Q6 tensors must share a CUDA device");
+  STD_TORCH_CHECK(raw.scalar_type()==ScalarType::Byte && out.scalar_type()==ScalarType::BFloat16 &&
+      raw.dim()==4 && out.dim()==3 && raw.is_contiguous() && out.is_contiguous(),
+      "Q6 requires contiguous raw uint8 [G,N,K/256,210] and BF16 output");
+  STD_TORCH_CHECK(raw.size(2)>0 && raw.size(2)<=2147483392/256 && raw.size(3)==210 &&
+      raw.size(0)<=65535 && raw.size(1)<=2147483584,
+      "Invalid Q6 block shape or grid");
+  STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(raw.data_ptr())%2==0 &&
+      reinterpret_cast<uintptr_t>(out.data_ptr())%4==0, "Q6 alignment violation");
+  STD_TORCH_CHECK(!out.numel() || raw.data_ptr()!=out.data_ptr(), "Q6 output must not alias weights");
+  int device=raw.get_device_index();
+  torch::stable::accelerator::DeviceGuard guard(device);
+  void* stream=nullptr;
+  TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device,&stream));
+  if constexpr (Expand) {
+    STD_TORCH_CHECK(out.size(0)==raw.size(0) && out.size(1)==raw.size(1) &&
+        out.size(2)==raw.size(2)*256, "Q6 expansion output must be [G,N,K]");
+    gguf_q6_expand(static_cast<const uint8_t*>(raw.data_ptr()),out.data_ptr(),out.numel(),
+        reinterpret_cast<cudaStream_t>(stream));
+  } else {
+    auto x=to<Tensor>(stack[0]);
+    int64_t rows=to<int64_t>(stack[3]);
+    STD_TORCH_CHECK(rows==32 || rows==64,"Q6 tile rows must be32 or64");
+    STD_TORCH_CHECK(x.is_cuda() && x.get_device_index()==device &&
+        x.scalar_type()==ScalarType::BFloat16 && x.dim()==3,
+        "Q6 activations must be BF16 [M,G,K] on the weight device");
+    STD_TORCH_CHECK(x.size(0)<=65535*rows && x.size(1)==raw.size(0) &&
+        x.size(2)==raw.size(2)*256 && x.stride(2)==1 && x.stride(0)>0 && x.stride(1)>0 &&
+        x.stride(0)%2==0 && x.stride(1)%2==0 && reinterpret_cast<uintptr_t>(x.data_ptr())%4==0 &&
+        out.size(0)==x.size(0) && out.size(1)==x.size(1) && out.size(2)==raw.size(1),
+        "Invalid Q6 activation/output shape or strides");
+    STD_TORCH_CHECK(!out.numel() || x.data_ptr()!=out.data_ptr(),"Q6 output must not alias activations");
+    gguf_q6_mm(x.data_ptr(),static_cast<const uint8_t*>(raw.data_ptr()),out.data_ptr(),
+        x.size(0),raw.size(1),x.size(2),raw.size(0),x.stride(0),x.stride(1),rows,
+        reinterpret_cast<cudaStream_t>(stream));
+  }
+  auto error=cudaGetLastError();
+  STD_TORCH_CHECK(error==cudaSuccess,cudaGetErrorString(error));
+}
 void boxed_q8(StableIValue* stack, uint64_t, uint64_t) {
   auto x = to<Tensor>(stack[0]), w = to<Tensor>(stack[1]), y = to<Tensor>(stack[2]);
   STD_TORCH_CHECK(x.is_cuda() && w.is_cuda() && y.is_cuda() &&
@@ -404,6 +449,8 @@ void boxed_plan_routes(StableIValue* stack,uint64_t,uint64_t) {
 
 }
 STABLE_TORCH_LIBRARY_FRAGMENT(consumer_int8, m) {
+  m.def("gguf_q6_expand(Tensor raw, Tensor(a!) out) -> ()");
+  m.def("gguf_q6_mm(Tensor x, Tensor raw, Tensor(a!) out, int tile_rows=64) -> ()");
   m.def("gguf_iq_s_routed_mm(Tensor x, Tensor codes, Tensor bases, Tensor metadata, Tensor tokens, Tensor tasks, Tensor weights, Tensor(a!) out, int bits, int tile_rows=16, bool weighted=False) -> ()");
   m.def("gguf_iq_xxs_routed_mm(Tensor x, Tensor codes, Tensor bases, Tensor metadata, Tensor tokens, Tensor tasks, Tensor weights, Tensor(a!) out, int bits, int tile_rows=16, bool weighted=False) -> ()");
   m.def("gguf_plan_routes(Tensor ids, Tensor top_weights, Tensor expert_map, Tensor(a!) info, Tensor(b!) tokens, Tensor(c!) weights, Tensor(d!) inverse, Tensor(e!) tasks, int tile_rows=16) -> ()");
@@ -418,6 +465,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(consumer_int8, m) {
   m.def("gguf_q8_mm(Tensor x, Tensor weight, Tensor(a!) out) -> ()");
 }
 STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
+  m.impl("gguf_q6_expand", &boxed_q6<true>);
+  m.impl("gguf_q6_mm", &boxed_q6<false>);
   m.impl("gguf_iq_xxs_routed_mm", &boxed_iq_xxs_routed<false>);
   m.impl("gguf_iq_s_routed_mm", &boxed_iq_xxs_routed<true>);
   m.impl("gguf_plan_routes", &boxed_plan_routes);
