@@ -20,12 +20,15 @@ __device__ __forceinline__ void copy4(void* dst, const void* src, bool valid) {
   asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::
       "r"(address), "l"(src), "r"(valid ? 4 : 0));
 }
-template<bool IQ, int TM, bool MX=false, int XX=0> struct Storage {
+// Register-decoded16-row tiles need no shared BF16 weight allocation.
+// Empty-base optimization avoids even a placeholder's alignment overhead.
+template<int TM> struct WeightTile { __nv_bfloat16 b[BN*LD]; };
+template<> struct WeightTile<16> {};
+template<bool IQ, int TM, bool MX=false, int XX=0> struct Storage : WeightTile<TM> {
   __nv_bfloat16 a[2][TM*LD];
   int8_t q[2][BN*(IQ ? BK/4 : MX ? BK/2 : BK)];
   uint8_t iq_scales[2][BN*(XX==4 ? 12 : XX==5 ? 16 : XX ? 8 : 4)];
   __half scales[2][BN*2];
-  __nv_bfloat16 b[TM==16 ? 1 : BN*LD];
 };
 template<bool IQ, int TM, bool Routed, bool MX=false, int XX=0>
 __device__ __forceinline__ void load(Storage<IQ,TM,MX,XX>& s, int stage, int start,
