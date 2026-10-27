@@ -22,9 +22,11 @@ def main(args):
     torch.manual_seed(137)
     torch.backends.cuda.matmul.allow_tf32 = False
     lib = ctypes.CDLL(str(args.library.resolve()))
-    call = lib.iq2xxs_block_int8
-    call.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
-    call.restype = ctypes.c_int
+    entries = list(
+        dict.fromkeys(
+            [args.entry] + (["iq2xxs_block_int8"] if args.compare_scalar else [])
+        )
+    )
     manifest = json.loads(args.manifest.read_text())
     item = next(s for s in manifest["samples"] if s["name"] == args.tensor)
     assert item["type"] == "IQ2_XXS"
@@ -44,10 +46,15 @@ def main(args):
             a = torch.empty_like(x, dtype=torch.int8)
             sa = torch.empty(m, k // 32, device="cuda")
             graphs, outputs = {}, {}
-            for tile in (16, 32, 64):
+            for entry, tile in [(e, t) for e in entries for t in (16, 32, 64)]:
+                call = getattr(lib, entry)
+                call.argtypes = (
+                    [ctypes.c_void_p] * 5 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
+                )
+                call.restype = ctypes.c_int
                 out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
 
-                def run(tile=tile, out=out, x=x, a=a, sa=sa, m=m):
+                def run(tile=tile, out=out, x=x, a=a, sa=sa, m=m, call=call):
                     assert (
                         call(
                             *[t.data_ptr() for t in (x, a, sa, raw, out)],
@@ -65,7 +72,8 @@ def main(args):
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     run()
-                graphs[f"int8_{tile}"], outputs[f"int8_{tile}"] = graph, out
+                name = f"{entry.removeprefix('iq2xxs_block_')}_{tile}"
+                graphs[name], outputs[name] = graph, out
             if args.compare_b12x:
                 from benchmark_gguf_q8 import prepare_b12x
 
@@ -121,6 +129,7 @@ def main(args):
                     end.synchronize()
                     times[name].append(start.elapsed_time(end))
             record = dict(
+                entry=args.entry,
                 m=m,
                 n=n,
                 k=k,
@@ -146,11 +155,13 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--entry", default="iq2xxs_block_int8")
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--tensor", default="blk.2.ffn_gate_exps.weight")
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 17, 128, 512])
     parser.add_argument("--limit-n", type=int)
+    parser.add_argument("--compare-scalar", action="store_true")
     parser.add_argument("--compare-b12x", action="store_true")
     parser.add_argument("--device", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)

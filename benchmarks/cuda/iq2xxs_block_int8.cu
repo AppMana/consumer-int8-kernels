@@ -5,7 +5,12 @@
 #include "q8_block_int8.cu"
 #include "../../csrc/gguf_iq_tables.cuh"
 namespace {
-template<int BM, int BN=64>
+__device__ __forceinline__ uint32_t signed_bytes(uint32_t v, uint32_t signs) {
+  uint32_t mask = (signs & 1) * 0xffu | ((signs >> 1) & 1) * 0xff00u |
+                  ((signs >> 2) & 1) * 0xff0000u | ((signs >> 3) & 1) * 0xff000000u;
+  return __vsub4(v ^ mask, mask);
+}
+template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false>
 __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k) {
   constexpr int Rows = BM + BN, Threads = (BM / 16) * (BN / 32) * 32;
   __shared__ int8_t tile[Rows][144];
@@ -14,6 +19,11 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
   const int warp = threadIdx.x >> 5;
   const int rb = blockIdx.y * BM, cb = blockIdx.x * BN;
   const int wr = (warp / (BN / 32)) * 16, wc = (warp % (BN / 32)) * 32;
+  __shared__ uint64_t lut[SharedLUT ? 256 : 1];
+  if constexpr (SharedLUT) {
+    for (int i = threadIdx.x; i < 256; i += Threads) lut[i] = iq2xxs_grid[i];
+    __syncthreads();
+  }
   float sum[4][4] = {};
   for (int base = 0; base < k; base += 128) {
     for (int index = threadIdx.x; index < BM * 8; index += Threads) {
@@ -42,12 +52,17 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
         for (int j = 0; j < 4; ++j) {
           uint32_t signs = (metadata >> (j * 7)) & 127;
           signs |= (__popc(signs) & 1) << 7;
-          uint64_t grid = iq2xxs_grid[sub[j]];
+          uint64_t grid = SharedLUT ? lut[sub[j]] : iq2xxs_grid[sub[j]];
+          if constexpr (Packed) {
+            values[j] = uint64_t(signed_bytes(uint32_t(grid), signs)) |
+                        (uint64_t(signed_bytes(uint32_t(grid >> 32), signs >> 4)) << 32);
+          } else {
           #pragma unroll
           for (int t = 0; t < 8; ++t) {
             int v = int((grid >> (t * 8)) & 255);
             if (signs & (1 << t)) v = -v;
             values[j] |= uint64_t(uint8_t(v)) << (t * 8);
+          }
           }
         }
       }
@@ -110,6 +125,50 @@ extern "C" int iq2xxs_block_int8(const void* x, void* a, float* sa,
         static_cast<__nv_bfloat16*>(y), m, n, k);
   else
     iq2xxs_tiled<64><<<dim3((n + 63) / 64, (m + 63) / 64), 256, 0, stream>>>(
+        static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+        static_cast<__nv_bfloat16*>(y), m, n, k);
+  return cudaGetLastError();
+}
+
+extern "C" int iq2xxs_block_int8_packed(const void* x, void* a, float* sa,
+                                const void* raw, void* y, int m, int n, int k,
+                                int tile_m, cudaStream_t stream) {
+  if (m <= 0 || n <= 0 || k <= 0 || k % 256 || (tile_m != 16 && tile_m != 32 && tile_m != 64))
+    return cudaErrorInvalidValue;
+  quantize<<<(m * (k / 32) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, m * (k / 32));
+  if (tile_m == 16)
+    iq2xxs_tiled<16,32,true><<<dim3((n + 31) / 32, (m + 15) / 16), 32, 0, stream>>>(
+        static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+        static_cast<__nv_bfloat16*>(y), m, n, k);
+  else if (tile_m == 32)
+    iq2xxs_tiled<32,64,true><<<dim3((n + 63) / 64, (m + 31) / 32), 128, 0, stream>>>(
+        static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+        static_cast<__nv_bfloat16*>(y), m, n, k);
+  else
+    iq2xxs_tiled<64,64,true><<<dim3((n + 63) / 64, (m + 63) / 64), 256, 0, stream>>>(
+        static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+        static_cast<__nv_bfloat16*>(y), m, n, k);
+  return cudaGetLastError();
+}
+
+extern "C" int iq2xxs_block_int8_lut(const void* x, void* a, float* sa,
+                                const void* raw, void* y, int m, int n, int k,
+                                int tile_m, cudaStream_t stream) {
+  if (m <= 0 || n <= 0 || k <= 0 || k % 256 || (tile_m != 16 && tile_m != 32 && tile_m != 64))
+    return cudaErrorInvalidValue;
+  quantize<<<(m * (k / 32) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, m * (k / 32));
+  if (tile_m == 16)
+    iq2xxs_tiled<16,32,true,true><<<dim3((n + 31) / 32, (m + 15) / 16), 32, 0, stream>>>(
+        static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+        static_cast<__nv_bfloat16*>(y), m, n, k);
+  else if (tile_m == 32)
+    iq2xxs_tiled<32,64,true,true><<<dim3((n + 63) / 64, (m + 31) / 32), 128, 0, stream>>>(
+        static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+        static_cast<__nv_bfloat16*>(y), m, n, k);
+  else
+    iq2xxs_tiled<64,64,true,true><<<dim3((n + 63) / 64, (m + 63) / 64), 256, 0, stream>>>(
         static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
         static_cast<__nv_bfloat16*>(y), m, n, k);
   return cudaGetLastError();
