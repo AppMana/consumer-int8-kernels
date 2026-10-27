@@ -82,3 +82,16 @@ def pack_iq2_xs(raw):
     codes = raw[..., 2:66].contiguous().view(torch.int16).flatten(2)
     scales = raw[..., 66:].contiguous().flatten(2)
     return codes, bases, scales
+
+
+# tokens[R] maps expert-major route rows to x[T,K]; negative entries are padding.
+# tasks[L,2] holds (expert, route-row start), with 16 or 32 rows per task.
+# Tasks must write disjoint row ranges. Expert -1 disables unused graph slots.
+# Output rows not covered by an active task remain untouched. No top-k weights,
+# SiLU or scatter are applied: this is a projection in the routed domain.
+iq2_xs_routed_mm = torch.ops.consumer_int8.gguf_iq2_xs_routed_mm
+
+
+@torch.library.register_fake("consumer_int8::gguf_iq2_xs_routed_mm")
+def _iq2_xs_routed_fake(x, codes, bases, scales, tokens, tasks, out, tile_rows=16):
+    return None

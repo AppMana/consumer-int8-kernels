@@ -64,3 +64,63 @@ def test_iq2_xs_oracle_graph(api, m, k, group_major):
         ref = ref.transpose(0, 1).bfloat16().float()
         assert torch.isfinite(out).all()
         assert (out.float() - ref).norm() / ref.norm() < 0.001
+
+
+@pytest.mark.parametrize("k", [768, 5120])
+@pytest.mark.parametrize("tile_rows", [16, 32])
+def test_routed_tasks_change_during_graph(api, k, tile_rows):
+    gguf = pytest.importorskip("gguf")
+    rng = np.random.default_rng(971)
+    g, n = 3, 37
+    raw = rng.integers(0, 256, (g, n, k // 256, 74), dtype=np.uint8)
+    raw[..., :2] = (
+        rng.uniform(-0.01, 0.01, (g, n, k // 256, 1)).astype(np.float16).view(np.uint8)
+    )
+    dense = gguf.dequantize(raw.reshape(-1, 74), gguf.GGMLQuantizationType.IQ2_XS)
+    dense = torch.from_numpy(dense.reshape(g, n, k)).cuda().bfloat16()
+    codes, bases, scales = api.pack_iq2_xs(torch.from_numpy(raw).cuda())
+    x = torch.randn(29, k, device="cuda", dtype=torch.bfloat16)
+    tokens = torch.full((3 * tile_rows + 1,), -1, device="cuda", dtype=torch.int32)
+    tokens[:3] = torch.tensor([4, 4, 23], device="cuda", dtype=torch.int32)
+    tokens[tile_rows : tile_rows + 19] = torch.arange(
+        19, device="cuda", dtype=torch.int32
+    )
+    tasks = torch.tensor(
+        [[1, 0], [2, tile_rows], [2, 2 * tile_rows], [-1, 0]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    out = torch.empty(3 * tile_rows + 1, n, device="cuda", dtype=torch.bfloat16)
+
+    def run():
+        api.iq2_xs_routed_mm(x, codes, bases, scales, tokens, tasks, out, tile_rows)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for trial in range(3):
+        x.mul_(0.75)
+        tasks[0, 0] = trial
+        tokens[1] = 10 + trial
+        out.fill_(float("nan"))
+        allocated = torch.cuda.memory_allocated()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated
+        reference = torch.zeros(3 * tile_rows, n, device="cuda")
+        for expert, begin in tasks.cpu().tolist():
+            if expert < 0:
+                continue
+            ids = tokens[begin : begin + tile_rows].long()
+            valid = ids >= 0
+            values = x[ids.clamp_min(0)].float() @ dense[expert].float().T
+            reference[begin : begin + tile_rows] = torch.where(
+                valid[:, None], values, 0
+            )
+        reference = reference.bfloat16().float()
+        assert torch.isfinite(out[: 3 * tile_rows]).all()
+        assert (
+            out[: 3 * tile_rows].float() - reference
+        ).norm() / reference.norm() < 0.001
+        assert torch.isnan(out[3 * tile_rows]).all()  # Not covered by any active task.

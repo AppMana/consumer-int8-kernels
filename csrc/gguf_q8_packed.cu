@@ -20,52 +20,65 @@ __device__ __forceinline__ void copy4(void* dst, const void* src, bool valid) {
   asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::
       "r"(address), "l"(src), "r"(valid ? 4 : 0));
 }
-template<bool IQ> struct Storage {
-  __nv_bfloat16 a[2][BM*LD];
+template<bool IQ, int TM> struct Storage {
+  __nv_bfloat16 a[2][TM*LD];
   int8_t q[2][BN*(IQ ? BK/4 : BK)];
   uint8_t iq_scales[2][BN*4];
   __half scales[2][BN*2];
   __nv_bfloat16 b[BN*LD];
 };
-template<bool IQ>
-__device__ __forceinline__ void load(Storage<IQ>& s, int stage, int start,
+template<bool IQ, int TM, bool Routed>
+__device__ __forceinline__ void load(Storage<IQ,TM>& s, int stage, int start,
     const __nv_bfloat16* x, const int8_t* q, const __half* scales,
-    const uint8_t* iq_scales, int m, int n, int k, int64_t xs, int64_t xg) {
-  int t=threadIdx.x, row=blockIdx.y*BM+t/8, col=(t%8)*8;
-  auto xp = row < m ? x+int64_t(row)*xs+int64_t(blockIdx.z)*xg+start+col : x;
-  copy16(s.a[stage]+swizzle(t/8,col), xp, row<m);
+    const uint8_t* iq_scales, int m, int n, int k, int64_t xs, int64_t xg,
+    int group, int rowbase, const int32_t* tokens, int xrows) {
+  int t=threadIdx.x, row=rowbase+t/8, col=(t%8)*8;
+  bool valid=row<m;
+  int inputrow=row;
+  if constexpr (Routed) {
+    inputrow=valid ? tokens[row] : -1;
+    valid=valid && inputrow>=0 && inputrow<xrows;
+  }
+  auto xp = valid ? x+int64_t(inputrow)*xs+int64_t(Routed ? 0 : group)*xg+start+col : x;
+  copy16(s.a[stage]+swizzle(t/8,col), xp, valid);
   if constexpr (IQ) {
     if (t<BN) {
       row=blockIdx.x*BN+t;
-      auto qp=row<n ? q+(int64_t(blockIdx.z)*n+row)*(k/4)+start/4 : q;
+      auto qp=row<n ? q+(int64_t(group)*n+row)*(k/4)+start/4 : q;
       copy16(s.q[stage]+t*(BK/4),qp,row<n);
       const int dstride=((k/256)+1)&~1;
-      auto dp=row<n ? scales+(int64_t(blockIdx.z)*n+row)*dstride+((start/256)&~1) : scales;
+      auto dp=row<n ? scales+(int64_t(group)*n+row)*dstride+((start/256)&~1) : scales;
       copy4(s.scales[stage]+t*2,dp,row<n);
-      auto sp=row<n ? iq_scales+(int64_t(blockIdx.z)*n+row)*(k/32)+(start/128)*4 : iq_scales;
+      auto sp=row<n ? iq_scales+(int64_t(group)*n+row)*(k/32)+(start/128)*4 : iq_scales;
       copy4(s.iq_scales[stage]+t*4,sp,row<n);
     }
   } else {
     row=blockIdx.x*BN+t/4; col=(t%4)*16;
-    auto qp = row<n ? q+(int64_t(blockIdx.z)*n+row)*k+start+col : q;
+    auto qp = row<n ? q+(int64_t(group)*n+row)*k+start+col : q;
     copy16(s.q[stage]+(t/4)*BK+col, qp, row<n);
     if (t<BN) {
       row=blockIdx.x*BN+t;
-      auto sp = row<n ? scales+(int64_t(blockIdx.z)*n+row)*(k/32)+start/32 : scales;
+      auto sp = row<n ? scales+(int64_t(group)*n+row)*(k/32)+start/32 : scales;
       copy4(s.scales[stage]+t*2, sp, row<n);
     }
   }
   asm volatile("cp.async.commit_group;");
 }
-template<bool IQ>
+template<bool IQ, int TM=32, bool Routed=false>
 __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
     const __half* scales, const uint8_t* iq_scales, __nv_bfloat16* y, int m, int n, int k, int groups,
-    int64_t xs, int64_t xg) {
-  __shared__ __align__(32) Storage<IQ> s;
+    int64_t xs, int64_t xg, const int32_t* tokens=nullptr,
+    const int32_t* tasks=nullptr, int xrows=0, int experts=0) {
+  const int group=Routed ? tasks[blockIdx.y*2] : int(blockIdx.z);
+  const int rowbase=Routed ? tasks[blockIdx.y*2+1] : int(blockIdx.y)*TM;
+  if constexpr (Routed) {
+    if (group<0 || group>=experts || rowbase<0 || rowbase>=m) return;
+  }
+  __shared__ __align__(32) Storage<IQ,TM> s;
   __shared__ uint32_t codebook[IQ ? 2048 : 1];
   int t=threadIdx.x, warp=t/32;
   if constexpr (IQ) {
-    for (int i=t;i<2048;i+=256) {
+    for (int i=t;i<2048;i+=TM*8) {
       uint64_t grid=iq2xs_grid[i/4];
       uint32_t pair=uint32_t(grid>>((i%4)*16));
       codebook[i]=(__float_as_uint(float(pair&255))>>16) |
@@ -74,12 +87,12 @@ __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
   }
   float acc[2][4] = {};
   const int lane=t%32;
-  load(s,0,0,x,q,scales,iq_scales,m,n,k,xs,xg);
+  load<IQ,TM,Routed>(s,0,0,x,q,scales,iq_scales,m,n,k,xs,xg,group,rowbase,tokens,xrows);
   asm volatile("cp.async.wait_group 0;");
   __syncthreads();
   for (int start=0, stage=0; start<k; start+=BK, stage^=1) {
-    if (start+BK<k) load(s,stage^1,start+BK,x,q,scales,iq_scales,m,n,k,xs,xg);
-    for (int i=t; i<BN*BK/2; i+=256) {
+    if (start+BK<k) load<IQ,TM,Routed>(s,stage^1,start+BK,x,q,scales,iq_scales,m,n,k,xs,xg,group,rowbase,tokens,xrows);
+    for (int i=t; i<BN*BK/2; i+=TM*8) {
       int row=i/(BK/2), col=(i%(BK/2))*2;
       __nv_bfloat162 value;
       if constexpr (IQ) {
@@ -134,10 +147,10 @@ __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
   for (int nn=0;nn<2;++nn) {
     #pragma unroll
     for (int r=0;r<2;++r) {
-      int row=blockIdx.y*BM+(warp/4)*16+lane/4+r*8;
+      int row=rowbase+(warp/4)*16+lane/4+r*8;
       int col=blockIdx.x*BN+(warp%4)*16+nn*8+(lane%4)*2;
       if (row<m && col<n) {
-        int64_t dst=(int64_t(row)*groups+blockIdx.z)*n+col;
+        int64_t dst=(int64_t(row)*groups+(Routed ? 0 : group))*n+col;
         if (col+1<n && (dst%2)==0)
           *reinterpret_cast<__nv_bfloat162*>(y+dst)=
               __floats2bfloat162_rn(acc[nn][r*2],acc[nn][r*2+1]);
@@ -166,4 +179,22 @@ void gguf_iq2_xs_mm(const void* x,const int8_t* q,const void* bases,
   packed_mm<true><<<dim3((n+BN-1)/BN,(m+BM-1)/BM,groups),256,0,stream>>>(
       static_cast<const __nv_bfloat16*>(x),q,static_cast<const __half*>(bases),scales,
       static_cast<__nv_bfloat16*>(y),m,n,k,groups,xs,xg);
+}
+
+// Tasks hold (expert, padded row start), one tile of 16 or 32 rows per task.
+// -1 expert denotes an inactive graph-capacity slot. Tokens map route rows to
+// original activation rows; negative tokens are padding and produce zeros.
+void gguf_iq2_xs_routed_mm(const void* x,const int8_t* q,const void* bases,
+    const uint8_t* scales,const int32_t* tokens,const int32_t* tasks,void* y,
+    int rows,int n,int k,int experts,int taskcount,int xrows,int tile_rows,cudaStream_t stream) {
+  if (!rows || !n || !taskcount) return;
+  if (tile_rows==32) {
+    packed_mm<true,32,true><<<dim3((n+BN-1)/BN,taskcount),256,0,stream>>>(
+        static_cast<const __nv_bfloat16*>(x),q,static_cast<const __half*>(bases),scales,
+        static_cast<__nv_bfloat16*>(y),rows,n,k,1,k,0,tokens,tasks,xrows,experts);
+    return;
+  }
+  packed_mm<true,16,true><<<dim3((n+BN-1)/BN,taskcount),128,0,stream>>>(
+      static_cast<const __nv_bfloat16*>(x),q,static_cast<const __half*>(bases),scales,
+      static_cast<__nv_bfloat16*>(y),rows,n,k,1,k,0,tokens,tasks,xrows,experts);
 }
