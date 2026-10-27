@@ -155,3 +155,23 @@ def test_streamed_owner_and_reused_arena_graph(adapter, first, second):
             out,
             fresh,
         )
+
+
+def test_benchmark_balanced_routes_cover_the_entire_partition(monkeypatch):
+    """Historical strided routes touch only half the resident experts."""
+    import importlib
+
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / "benchmarks"))
+    benchmark = importlib.import_module("benchmark_gguf_partition")
+    for first in (0, 192):
+        routes = benchmark.make_routes(512, first, "balanced")
+        assert np.all(np.bincount(routes.ravel(), minlength=384) == 8)
+        for pattern, active in (
+            ("balanced", 192),
+            ("legacy-balanced", 96),
+            ("random", 192),
+        ):
+            routes = benchmark.make_routes(512, first, pattern)
+            assert all(len(set(row)) == 6 for row in routes)
+            local = routes[(routes >= first) & (routes < first + 192)]
+            assert len(np.unique(local)) == active

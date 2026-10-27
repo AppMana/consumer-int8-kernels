@@ -35,6 +35,22 @@ def hashed_source(source):
     return result
 
 
+def make_routes(count, first, pattern):
+    row = np.arange(count)[:, None]
+    slot = np.arange(6)[None, :]
+    if pattern == "balanced":
+        return ((row * 6 + slot + first) % 384).astype(np.int32)
+    if pattern == "legacy-balanced":
+        return ((row * 6 + slot * 64 + first) % 384).astype(np.int32)
+    if pattern != "random":
+        raise ValueError("Unknown routing pattern")
+    rng = np.random.default_rng(928)
+    ids = np.stack([rng.choice(384, 6, replace=False) for _ in range(count)])
+    if first not in ids[0]:
+        ids[0, 0] = first
+    return ids.astype(np.int32)
+
+
 def reference(sources, x, ids, weights, owned):
     result = torch.zeros_like(x, dtype=torch.float32)
     for expert in ids.unique().tolist():
@@ -181,18 +197,15 @@ def main(args):
                 calls["b12x"] = (b12x.run, b12x.output)
                 owners.append(b12x)
                 for pattern in args.patterns:
-                    if pattern == "balanced":
-                        row = torch.arange(count, device=device)[:, None]
-                        slot = torch.arange(6, device=device)[None, :]
-                        ids.copy_((row * 6 + slot * 64 + first) % 384)
-                    else:
-                        rng = np.random.default_rng(928)
-                        host_ids = np.stack(
-                            [rng.choice(384, 6, replace=False) for _ in range(count)]
-                        )
-                        if first not in host_ids[0]:
-                            host_ids[0, 0] = first
-                        ids.copy_(torch.from_numpy(host_ids))
+                    host_ids = make_routes(count, first, pattern)
+                    ids.copy_(torch.from_numpy(host_ids))
+                    local = (
+                        host_ids[
+                            (host_ids >= first) & (host_ids < first + args.experts)
+                        ]
+                        - first
+                    )
+                    route_counts = np.bincount(local, minlength=args.experts)
                     graphs = {}
                     with kernel_resolution_guard("paired GGUF partition benchmark"):
                         for label, (run, _out) in calls.items():
@@ -251,6 +264,10 @@ def main(args):
                         tokens=count,
                         pattern=pattern,
                         formats=[gate.quant_type, down.quant_type],
+                        local_active_experts=int(np.count_nonzero(route_counts)),
+                        local_routes=int(route_counts.sum()),
+                        routes_per_expert=route_counts.tolist(),
+                        routes_sha256=hashlib.sha256(memoryview(host_ids)).hexdigest(),
                         correctness=correctness,
                         milliseconds=timings,
                         medians_ms={
@@ -298,7 +315,7 @@ if __name__ == "__main__":
     parser.add_argument("--tokens", type=int, nargs="+", default=[512])
     parser.add_argument(
         "--patterns",
-        choices=["balanced", "random"],
+        choices=["balanced", "legacy-balanced", "random"],
         nargs="+",
         default=["balanced", "random"],
     )
