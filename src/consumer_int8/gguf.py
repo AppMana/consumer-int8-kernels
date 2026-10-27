@@ -23,6 +23,15 @@ q8_mm = torch.ops.consumer_int8.gguf_q8_mm
 
 q6_mm = torch.ops.consumer_int8.gguf_q6_mm
 q6_expand = torch.ops.consumer_int8.gguf_q6_expand
+# Consume b12x's existing lossless values[N,K/2] and metadata
+# [ceil(N/128),K/256,10496]; write caller-owned contiguous BF16 out[N,K].
+# No runtime dependency on b12x or persistent expanded-weight allocation.
+q6_packed_expand = torch.ops.consumer_int8.gguf_q6_packed_expand
+
+
+@torch.library.register_fake("consumer_int8::gguf_q6_packed_expand")
+def _q6_packed_expand_fake(values, metadata, out):
+    return None
 
 
 @torch.library.register_fake("consumer_int8::gguf_q6_mm")

@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 
-def prepare_b12x(raw, x, out, recipe):
+def prepare_b12x(raw, x, out, recipe, packed_weights=None):
     from b12x.gemm import blockscaled
     from b12x.preparation import PreparationSession, PreparedCall, require_prepared
 
@@ -25,7 +25,11 @@ def prepare_b12x(raw, x, out, recipe):
         device=x.device, autotune=False, compile_workers=1
     ) as session:
         for group in range(x.shape[1]):
-            weight = blockscaled.pack_weight(raw[group], recipe=recipe.lower())
+            weight = (
+                packed_weights[group]
+                if packed_weights is not None
+                else blockscaled.pack_weight(raw[group], recipe=recipe.lower())
+            )
             gathered = torch.empty_like(
                 x[:, group], memory_format=torch.contiguous_format
             )
@@ -74,6 +78,8 @@ def prepare_b12x(raw, x, out, recipe):
 
 
 def main(args):
+    if args.compare_q6_packed and args.quant != "Q6_K":
+        raise ValueError("Packed Q6 comparison requires Q6_K")
     if (
         args.k_start or args.k_count or args.pad_k_to or args.pad_n_to
     ) and args.quant != "Q6_K":
@@ -83,7 +89,7 @@ def main(args):
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.ops.load_library(str(args.library.resolve()))
     b12x_source_hash = None
-    if args.compare_b12x:
+    if args.compare_b12x or args.compare_q6_packed:
         import b12x
 
         source_root = Path(b12x.__file__).parent
@@ -212,6 +218,14 @@ def main(args):
             expanded = torch.empty(
                 args.groups, n, k, device="cuda", dtype=torch.bfloat16
             )
+            packed_weights = None
+            if args.compare_q6_packed:
+                from b12x.gemm.blockscaled import pack_weight
+
+                packed_weights = tuple(
+                    pack_weight(raw[group], recipe="q6_k")
+                    for group in range(args.groups)
+                )
             for m in args.rows:
                 x = (
                     torch.randn(m, args.groups, k, device="cuda", dtype=torch.bfloat16)
@@ -320,9 +334,29 @@ def main(args):
                         for name, fn in candidates
                     ]
                 b12x_call = None
+                if packed_weights is not None:
+
+                    def packed_expand_cublas(
+                        x=x, weights=packed_weights, expanded=expanded, base=base
+                    ):
+                        for group, weight in enumerate(weights):
+                            torch.ops.consumer_int8.gguf_q6_packed_expand(
+                                weight.values, weight.metadata, expanded[group]
+                            )
+                        torch.bmm(
+                            x.transpose(0, 1),
+                            expanded.transpose(1, 2),
+                            out=base.transpose(0, 1),
+                        )
+
+                    packed_expand_cublas()
+                    assert torch.equal(expanded, dense)
+                    candidates.append(("packed_expand_cublas", packed_expand_cublas))
                 if args.compare_b12x:
                     b12x_out = torch.empty_like(out)
-                    b12x_call = prepare_b12x(raw, x, b12x_out, args.quant)
+                    b12x_call = prepare_b12x(
+                        raw, x, b12x_out, args.quant, packed_weights
+                    )
                     candidates.append(("b12x", b12x_call.run))
                 candidate_outputs = {
                     "inline32": out,
@@ -331,6 +365,7 @@ def main(args):
                     "packed_async": out,
                     "resident_cublas": base,
                     "expand_cublas": base,
+                    "packed_expand_cublas": base,
                 }
                 if b12x_call is not None:
                     candidate_outputs["b12x"] = b12x_call.output
@@ -432,6 +467,7 @@ if __name__ == "__main__":
     parser.add_argument("--pad-k-to", type=int)
     parser.add_argument("--pad-n-to", type=int)
     parser.add_argument("--compare-b12x", action="store_true")
+    parser.add_argument("--compare-q6-packed", action="store_true")
     parser.add_argument("--tensor", help="Profile or benchmark one manifest tensor")
     parser.add_argument(
         "--profile-only",

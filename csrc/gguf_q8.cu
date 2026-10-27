@@ -159,3 +159,38 @@ void gguf_q6_mm(const void* x,const uint8_t* raw,void* y,int m,int n,int k,int g
   else q6_mm<32><<<grid,256,0,stream>>>(static_cast<const __nv_bfloat16*>(x),raw,
       static_cast<__nv_bfloat16*>(y),m,n,k,groups,xs,xg);
 }
+
+namespace {
+// b12x Q6 storage: adjacent low nibbles and N128-transposed metadata planes.
+// Stage N32 x K256 metadata coalesced, then write contiguous BF16 pairs.
+__global__ void q6_packed_expand(const uint8_t* values, const uint8_t* metadata,
+    __nv_bfloat16* out, int n, int k) {
+  __shared__ uint8_t meta[82*33];
+  int rowbase=blockIdx.x*32, block=blockIdx.y, t=threadIdx.x;
+  int64_t base=(int64_t(rowbase/128)*(k/256)+block)*10496;
+  for (int i=t;i<82*32;i+=256) {
+    int plane=i/32, row=i%32;
+    meta[plane*33+row]=metadata[base+plane*128+rowbase%128+row];
+  }
+  __syncthreads();
+  for (int i=t;i<32*128;i+=256) {
+    int row=i/128, col=(i%128)*2, globalrow=rowbase+row;
+    if (globalrow<n) {
+      uint8_t low=values[int64_t(globalrow)*(k/2)+block*128+col/2];
+      uint8_t high=meta[(18+col/4)*33+row]>>((col%4)*2);
+      int q0=(low&15)|((high&3)<<4), q1=(low>>4)|(((high>>2)&3)<<4);
+      __half_raw bits;
+      bits.x=uint16_t(meta[row])|(uint16_t(meta[33+row])<<8);
+      float scale=__half2float(__half(bits))*float(static_cast<int8_t>(meta[(2+col/16)*33+row]));
+      *reinterpret_cast<__nv_bfloat162*>(out+int64_t(globalrow)*k+block*256+col)=
+          __floats2bfloat162_rn(scale*float(q0-32),scale*float(q1-32));
+    }
+  }
+}
+}
+void gguf_q6_packed_expand(const uint8_t* values,const uint8_t* metadata,void* out,
+    int n,int k,cudaStream_t stream) {
+  if (!n) return;
+  q6_packed_expand<<<dim3((n+31)/32,k/256),256,0,stream>>>(
+      values,metadata,static_cast<__nv_bfloat16*>(out),n,k);
+}

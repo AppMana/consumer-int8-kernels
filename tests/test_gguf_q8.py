@@ -129,3 +129,42 @@ def test_q6_raw_oracle_and_graph(api, k, m, tile_rows, group_major):
         assert (out.float() - ref).norm() / ref.norm() < 0.001
         assert torch.isfinite(expanded_out).all()
         assert (expanded_out.float() - ref).norm() / ref.norm() < 0.001
+
+
+@pytest.mark.parametrize("n,k", [(8, 256), (40, 768), (128, 1280), (136, 512)])
+def test_q6_b12x_packed_expansion_oracle_graph(api, n, k):
+    """Consume the real public b12x packer's storage without a second weight copy."""
+    import gguf
+    import numpy as np
+    pack_weight = pytest.importorskip("b12x.gemm.blockscaled").pack_weight
+
+    rng = np.random.default_rng(n + k)
+    raw_np = rng.integers(0, 256, (n, k // 256, 210), dtype=np.uint8)
+    raw_np[..., 208:] = (
+        (rng.standard_normal((n, k // 256, 1)) * 0.01).astype("<f2").view(np.uint8)
+    )
+    raw = torch.from_numpy(raw_np).cuda()
+    weight = pack_weight(raw, recipe="q6_k")
+    decoded = gguf.dequantize(raw_np.reshape(-1, 210), gguf.GGMLQuantizationType.Q6_K)
+    reference = torch.from_numpy(decoded.reshape(n, k)).cuda().bfloat16()
+    out = torch.empty_like(reference)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        api.q6_packed_expand(weight.values, weight.metadata, out)
+    for _ in range(3):
+        out.fill_(float("nan"))
+        allocated = torch.cuda.memory_allocated()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated
+        assert torch.equal(out, reference)
+    # Rebind the same storage to changed, independently decoded checkpoint bytes.
+    raw_np[..., :192] ^= 0xFF
+    replacement = pack_weight(torch.from_numpy(raw_np).cuda(), recipe="q6_k")
+    weight.values.copy_(replacement.values)
+    weight.metadata.copy_(replacement.metadata)
+    decoded = gguf.dequantize(raw_np.reshape(-1, 210), gguf.GGMLQuantizationType.Q6_K)
+    reference = torch.from_numpy(decoded.reshape(n, k)).cuda().bfloat16()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, reference)
