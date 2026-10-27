@@ -95,3 +95,32 @@ iq2_xs_routed_mm = torch.ops.consumer_int8.gguf_iq2_xs_routed_mm
 @torch.library.register_fake("consumer_int8::gguf_iq2_xs_routed_mm")
 def _iq2_xs_routed_fake(x, codes, bases, scales, tokens, tasks, out, tile_rows=16):
     return None
+
+
+# Expand into caller-owned, reusable BF16 workspace before a dense GEMM.
+q8_expand = torch.ops.consumer_int8.gguf_q8_expand
+
+
+@torch.library.register_fake("consumer_int8::gguf_q8_expand")
+def _q8_expand_fake(codes, scales, out):
+    return None
+
+
+def q8_expand_mm(x, codes, scales, weight_workspace, out):
+    """Decode Q8 into reusable workspace, then run grouped BF16 cuBLAS.
+
+    x[M,G,K], codes[G,N,K], scales[G,N,K/32], workspace[G,N,K], out[M,G,N].
+    Allocate the weight workspace once and share it across sequential layers;
+    simultaneous streams require separate workspaces or explicit ordering.
+    Callers select this path from device/shape measurements, not quant alone.
+    """
+    if x.ndim != 3 or out.ndim != 3:
+        raise ValueError("Expected x[M,G,K] and out[M,G,N]")
+    if x.shape[1:] != (codes.shape[0], codes.shape[2]):
+        raise ValueError("Q8 activation shape does not match weights")
+    if out.shape != (x.shape[0], codes.shape[0], codes.shape[1]):
+        raise ValueError("Q8 output shape does not match activations/weights")
+    q8_expand(codes, scales, weight_workspace)
+    torch.bmm(
+        x.transpose(0, 1), weight_workspace.transpose(1, 2), out=out.transpose(0, 1)
+    )

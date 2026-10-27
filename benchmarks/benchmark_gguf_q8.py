@@ -65,6 +65,7 @@ def main(args):
                 dense = (
                     torch.from_numpy((scales * values).reshape(n, k)).cuda().bfloat16()
                 )
+            expanded = torch.empty(1, n, k, device="cuda", dtype=torch.bfloat16)
             for m in args.rows:
                 x = torch.randn(m, 1, k, device="cuda", dtype=torch.bfloat16) * 0.1
                 out = torch.empty(m, 1, n, device="cuda", dtype=torch.bfloat16)
@@ -87,6 +88,16 @@ def main(args):
 
                 def cublas(x=x, dense=dense, base=base):
                     torch.mm(x[:, 0], dense.T, out=base[:, 0])
+
+                def expand_cublas(
+                    x=x,
+                    codes=codes,
+                    scales_gpu=scales_gpu,
+                    expanded=expanded,
+                    base=base,
+                ):
+                    torch.ops.consumer_int8.gguf_q8_expand(codes, scales_gpu, expanded)
+                    torch.mm(x[:, 0], expanded[0].T, out=base[:, 0])
 
                 if args.quant == "Q8_0":
                     native()
@@ -113,7 +124,13 @@ def main(args):
                 graphs = {}
                 candidates = [("packed_async", packed), ("resident_cublas", cublas)]
                 if args.quant == "Q8_0":
+                    expand_cublas()
+                    assert torch.equal(expanded[0], dense)
+                    cublas_result = base.clone()
+                    cublas()
+                    assert torch.equal(base, cublas_result)
                     candidates.insert(0, ("native", native))
+                    candidates.append(("expand_cublas", expand_cublas))
                 for name, fn in candidates:
                     for _ in range(3):
                         fn()
@@ -135,6 +152,7 @@ def main(args):
                         end.synchronize()
                         measurements[name].append(start.elapsed_time(end))
                 record = dict(
+                    workspace_bytes=expanded.numel() * expanded.element_size(),
                     quant=args.quant,
                     checkpoint=manifest["repo"],
                     revision=manifest["revision"],

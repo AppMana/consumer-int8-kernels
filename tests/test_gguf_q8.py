@@ -58,3 +58,23 @@ def test_raw_q8_grouped_oracle_and_graph(m, group_major, packed):
         relative = (out.float() - reference).norm() / reference.norm()
         assert relative < 0.001
         assert torch.isfinite(out).all() and out.abs().max() > 0
+
+
+@pytest.mark.parametrize("k", [32, 96, 2304, 5120])
+def test_q8_expand_oracle_graph(k):
+    torch.manual_seed(k)
+    codes = torch.randint(-128, 128, (3, 37, k), device="cuda", dtype=torch.int8)
+    scales = torch.randn(3, 37, k // 32, device="cuda", dtype=torch.float16) * 0.1
+    out = torch.empty_like(codes, dtype=torch.bfloat16)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.ops.consumer_int8.gguf_q8_expand(codes, scales, out)
+    for _ in range(3):
+        scales.mul_(0.75)
+        out.fill_(float("nan"))
+        allocated = torch.cuda.memory_allocated()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated
+        ref = codes.view(3, 37, k // 32, 32).float() * scales.float()[..., None]
+        assert torch.equal(out, ref.reshape_as(out).bfloat16())

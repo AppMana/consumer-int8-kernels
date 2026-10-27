@@ -18,6 +18,7 @@ void gguf_iq2_xs_mm(const void*, const int8_t*, const void*, const uint8_t*, voi
     int, int, int, int, int64_t, int64_t, cudaStream_t);
 void gguf_iq2_xs_routed_mm(const void*, const int8_t*, const void*, const uint8_t*,
     const int32_t*, const int32_t*, void*, int, int, int, int, int, int, int, cudaStream_t);
+void gguf_q8_expand(const int8_t*,const void*,void*,int64_t,cudaStream_t);
 namespace {
 void boxed_q8(StableIValue* stack, uint64_t, uint64_t) {
   auto x = to<Tensor>(stack[0]), w = to<Tensor>(stack[1]), y = to<Tensor>(stack[2]);
@@ -171,14 +172,44 @@ void boxed_iq2_xs_routed(StableIValue* stack, uint64_t, uint64_t) {
   STD_TORCH_CHECK(error==cudaSuccess,cudaGetErrorString(error));
 }
 
+void boxed_q8_expand(StableIValue* stack,uint64_t,uint64_t) {
+  auto q=to<Tensor>(stack[0]), s=to<Tensor>(stack[1]), out=to<Tensor>(stack[2]);
+  STD_TORCH_CHECK(q.is_cuda() && s.is_cuda() && out.is_cuda() &&
+      q.get_device_index()==s.get_device_index() && q.get_device_index()==out.get_device_index(),
+      "Q8 expansion requires one CUDA device");
+  STD_TORCH_CHECK(q.scalar_type()==ScalarType::Char && s.scalar_type()==ScalarType::Half &&
+      out.scalar_type()==ScalarType::BFloat16 && q.is_contiguous() &&
+      s.is_contiguous() && out.is_contiguous(), "Invalid Q8 expansion dtype/layout");
+  STD_TORCH_CHECK(q.dim()==3 && s.dim()==3 && out.dim()==3,
+      "Q8 expansion expects codes/out[G,N,K], scales[G,N,K/32]");
+  STD_TORCH_CHECK(q.size(2)>0 && q.size(2)%32==0 && s.size(0)==q.size(0) &&
+      s.size(1)==q.size(1) && s.size(2)==q.size(2)/32 && out.size(0)==q.size(0) &&
+      out.size(1)==q.size(1) && out.size(2)==q.size(2), "Invalid Q8 expansion shape");
+  if (!out.numel()) return;
+  STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(q.data_ptr())%2==0 &&
+      reinterpret_cast<uintptr_t>(out.data_ptr())%4==0 &&
+      out.data_ptr()!=q.data_ptr() && out.data_ptr()!=s.data_ptr(),
+      "Q8 expansion alignment/alias violation");
+  int device=q.get_device_index();
+  torch::stable::accelerator::DeviceGuard guard(device);
+  void* stream=nullptr;
+  TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device,&stream));
+  gguf_q8_expand(static_cast<const int8_t*>(q.data_ptr()),s.data_ptr(),out.data_ptr(),
+      q.numel(),reinterpret_cast<cudaStream_t>(stream));
+  auto error=cudaGetLastError();
+  STD_TORCH_CHECK(error==cudaSuccess,cudaGetErrorString(error));
+}
+
 }
 STABLE_TORCH_LIBRARY_FRAGMENT(consumer_int8, m) {
+  m.def("gguf_q8_expand(Tensor codes, Tensor scales, Tensor(a!) out) -> ()");
   m.def("gguf_iq2_xs_routed_mm(Tensor x, Tensor codes, Tensor bases, Tensor scales, Tensor tokens, Tensor tasks, Tensor(a!) out, int tile_rows=16) -> ()");
   m.def("gguf_iq2_xs_mm(Tensor x, Tensor codes, Tensor bases, Tensor scales, Tensor(a!) out) -> ()");
   m.def("gguf_q8_packed_mm(Tensor x, Tensor codes, Tensor scales, Tensor(a!) out) -> ()");
   m.def("gguf_q8_mm(Tensor x, Tensor weight, Tensor(a!) out) -> ()");
 }
 STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
+  m.impl("gguf_q8_expand", &boxed_q8_expand);
   m.impl("gguf_iq2_xs_routed_mm", &boxed_iq2_xs_routed);
   m.impl("gguf_iq2_xs_mm", &boxed_iq2_xs);
   m.impl("gguf_q8_packed_mm", &boxed_q8_packed);

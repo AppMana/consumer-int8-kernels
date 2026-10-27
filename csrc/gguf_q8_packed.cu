@@ -212,3 +212,24 @@ void gguf_iq2_xs_routed_mm(const void* x,const int8_t* q,const void* bases,
       static_cast<const __nv_bfloat16*>(x),q,static_cast<const __half*>(bases),scales,
       static_cast<__nv_bfloat16*>(y),rows,n,k,1,k,0,tokens,tasks,xrows,experts);
 }
+
+namespace {
+__global__ void q8_expand(const int8_t* q,const __half* scales,
+    __nv_bfloat16* out,int64_t pairs) {
+  for (int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+       i<pairs;i+=int64_t(gridDim.x)*blockDim.x) {
+    uint16_t codes=*reinterpret_cast<const uint16_t*>(q+i*2);
+    float scale=__half2float(scales[i/16]);
+    *reinterpret_cast<__nv_bfloat162*>(out+i*2)=__floats2bfloat162_rn(
+        float(int8_t(codes&255))*scale,float(int8_t(codes>>8))*scale);
+  }
+}
+}
+void gguf_q8_expand(const int8_t* q,const void* scales,void* out,int64_t elements,
+    cudaStream_t stream) {
+  if (!elements) return;
+  int64_t blocks=(elements/2+255)/256;
+  if (blocks>65535) blocks=65535;
+  q8_expand<<<blocks,256,0,stream>>>(q,static_cast<const __half*>(scales),
+      static_cast<__nv_bfloat16*>(out),elements/2);
+}

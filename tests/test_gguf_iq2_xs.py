@@ -124,3 +124,36 @@ def test_routed_tasks_change_during_graph(api, k, tile_rows):
             out[: 3 * tile_rows].float() - reference
         ).norm() / reference.norm() < 0.001
         assert torch.isnan(out[3 * tile_rows]).all()  # Not covered by any active task.
+
+
+@pytest.mark.parametrize("group_major", [False, True])
+def test_q8_expand_grouped_blas_graph(api, group_major):
+    g, m, n, k = 3, 127, 37, 128
+    codes = torch.randint(-128, 128, (g, n, k), device="cuda", dtype=torch.int8)
+    scales = torch.randn(g, n, k // 32, device="cuda", dtype=torch.float16) * 0.1
+    workspace = torch.empty(g, n, k, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(
+        (g, m, k) if group_major else (m, g, k), device="cuda", dtype=torch.bfloat16
+    )
+    if group_major:
+        x = x.transpose(0, 1)
+    out = torch.empty(m, g, n, device="cuda", dtype=torch.bfloat16)
+    api.q8_expand_mm(x, codes, scales, workspace, out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        api.q8_expand_mm(x, codes, scales, workspace, out)
+    for _ in range(3):
+        x.mul_(0.75)
+        scales.mul_(0.5)
+        workspace.fill_(float("nan"))
+        out.fill_(float("nan"))
+        allocated = torch.cuda.memory_allocated()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated
+        dense = codes.view(g, n, k // 32, 32).float() * scales.float()[..., None]
+        dense = dense.reshape(g, n, k).bfloat16().float()
+        ref = torch.bmm(x.transpose(0, 1).float(), dense.transpose(1, 2))
+        ref = ref.transpose(0, 1).bfloat16().float()
+        assert torch.isfinite(out).all()
+        assert (out.float() - ref).norm() / ref.norm() < 0.001
