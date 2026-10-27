@@ -7,6 +7,51 @@ import torch
 from consumer_int8 import ops
 
 
+@pytest.mark.parametrize("rows,groups", [(0, 4), (1, 1), (3, 2), (128, 4), (2048, 4)])
+def test_grouped4096_preserves_native_codes_and_graph_replay(rows, groups):
+    torch.manual_seed(137)
+    x = torch.randn(rows, groups, 4096, device="cuda", dtype=torch.bfloat16)
+    if rows:
+        x[0].zero_()
+    q = torch.empty(groups, rows, 4096, device="cuda", dtype=torch.int8)
+    scales = torch.empty(groups, rows, device="cuda", dtype=torch.float32)
+    ops.quantize_grouped4096(x, q, scales)
+    if not rows:
+        return
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ops.quantize_grouped4096(x, q, scales)
+    x.neg_()
+    q.fill_(-128)
+    scales.fill_(float("nan"))
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+    for group in range(groups):
+        expected_q, expected_s = (
+            torch.empty_like(q[group]),
+            torch.empty_like(scales[group]),
+        )
+        ops.quantize_rows(x[:, group].contiguous(), expected_q, expected_s)
+        assert torch.equal(q[group], expected_q)
+        assert torch.equal(scales[group], expected_s)
+
+
+def test_grouped4096_rejects_wrong_shape_alignment_and_aliases():
+    x = torch.randn(3, 4, 4096, device="cuda", dtype=torch.bfloat16)
+    q = torch.empty(4, 3, 4096, device="cuda", dtype=torch.int8)
+    scales = torch.empty(4, 3, device="cuda")
+    with pytest.raises(RuntimeError, match="Expected BF16"):
+        ops.quantize_grouped4096(x, q.transpose(0, 1).contiguous(), scales)
+    storage = torch.empty(x.numel() + 1, device="cuda", dtype=x.dtype)
+    with pytest.raises(RuntimeError, match="aligned"):
+        ops.quantize_grouped4096(storage[1:].view_as(x), q, scales)
+    aliased = x.view(torch.int8).flatten()[: q.numel()].view_as(q)
+    with pytest.raises(RuntimeError, match="overlap"):
+        ops.quantize_grouped4096(x, aliased, scales)
+
+
 @pytest.mark.parametrize("hq,hv", [(8, 24), (16, 48)])
 @pytest.mark.parametrize("layout", ["DS", "SD"])
 @pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])

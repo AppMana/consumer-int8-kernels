@@ -17,7 +17,9 @@ import torch
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--device", type=int, default=1)
 parser.add_argument("--library", type=Path, required=True)
-parser.add_argument("--grouped-library", type=Path)
+grouped_args = parser.add_mutually_exclusive_group()
+grouped_args.add_argument("--grouped-library", type=Path)
+grouped_args.add_argument("--grouped-native", action="store_true")
 parser.add_argument("--manifest", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
 args = parser.parse_args()
@@ -39,6 +41,25 @@ if args.grouped_library:
         [ctypes.c_void_p] * 3 + [ctypes.c_int] * 2 + [ctypes.c_void_p]
     )
     grouped_quant.restype = ctypes.c_int
+
+
+def apply_grouped(x, qa, sa, m):
+    if args.grouped_native:
+        ops.quantize_grouped4096(x, qa, sa)
+    else:
+        assert (
+            grouped_quant(
+                x.data_ptr(),
+                qa.data_ptr(),
+                sa.data_ptr(),
+                m,
+                4,
+                torch.cuda.current_stream().cuda_stream,
+            )
+            == 0
+        )
+
+
 raw = np.frombuffer(data, np.uint8).reshape(8192, 128, 34)[4096:].copy()
 sc = np.ascontiguousarray(raw[..., :2]).view("<f2").astype(np.float32)
 w = (
@@ -80,34 +101,16 @@ for m in (8, 128, 512, 2048):
         output = torch.empty(4, m, 1024, device="cuda", dtype=torch.bfloat16)
         qa = torch.empty(4, m, 4096, device="cuda", dtype=torch.int8)
         sa = torch.empty(4, m, device="cuda")
-        error = grouped_quant(
-            x.data_ptr(),
-            qa.data_ptr(),
-            sa.data_ptr(),
-            m,
-            4,
-            torch.cuda.current_stream().cuda_stream,
-        )
-        assert error == 0
+        apply_grouped(x, qa, sa, m)
         for g in range(4):
             ops.fused_channel_mm(qa[g], qw[g], sa[g], sw[g], output[g], 0)
         return output.transpose(0, 1).contiguous()
 
     candidates = [("sequential", sequential), ("batched", batched)]
-    if grouped_quant is not None:
+    if grouped_quant is not None or args.grouped_native:
         qa = torch.empty(4, m, 4096, device="cuda", dtype=torch.int8)
         sa = torch.empty(4, m, device="cuda")
-        assert (
-            grouped_quant(
-                x.data_ptr(),
-                qa.data_ptr(),
-                sa.data_ptr(),
-                m,
-                4,
-                torch.cuda.current_stream().cuda_stream,
-            )
-            == 0
-        )
+        apply_grouped(x, qa, sa, m)
         for g in range(4):
             reference_q = torch.empty_like(qa[g])
             reference_s = torch.empty_like(sa[g])
@@ -156,6 +159,7 @@ for m in (8, 128, 512, 2048):
             if args.grouped_library
             else None
         ),
+        grouped_native=args.grouped_native,
         benchmark_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         device=str(torch.cuda.get_device_properties(args.device)),
         scope=(

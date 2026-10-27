@@ -207,6 +207,34 @@ void boxed_quant(StableIValue* stack, uint64_t, uint64_t) {
                 stream_for(device));
   launch_check();
 }
+void boxed_grouped_quant(StableIValue* stack, uint64_t, uint64_t) {
+  auto x = to<Tensor>(stack[0]), codes = to<Tensor>(stack[1]), scales = to<Tensor>(stack[2]);
+  const int device = x.get_device_index();
+  check(x, ScalarType::BFloat16, device);
+  check(codes, ScalarType::Char, device);
+  check(scales, ScalarType::Float, device);
+  STD_TORCH_CHECK(x.dim() == 3 && x.size(1) > 0 && x.size(2) == 4096 &&
+      codes.dim() == 3 && codes.size(0) == x.size(1) && codes.size(1) == x.size(0) &&
+      codes.size(2) == 4096 && scales.dim() == 2 && scales.size(0) == x.size(1) &&
+      scales.size(1) == x.size(0) && x.numel() <= std::numeric_limits<int>::max(),
+      "Expected BF16 input[M,G,4096], INT8 codes[G,M,4096], FP32 scales[G,M]");
+  STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(codes.data_ptr()) % 8 == 0 &&
+      reinterpret_cast<uintptr_t>(scales.data_ptr()) % 4 == 0,
+      "Grouped quantization requires aligned buffers");
+  auto overlap = [](const Tensor& a, int bytes_a, const Tensor& b, int bytes_b) {
+    auto first = reinterpret_cast<uintptr_t>(a.data_ptr());
+    auto second = reinterpret_cast<uintptr_t>(b.data_ptr());
+    return a.numel() && b.numel() && first < second + b.numel() * bytes_b &&
+        second < first + a.numel() * bytes_a;
+  };
+  STD_TORCH_CHECK(!overlap(x, 2, codes, 1) && !overlap(x, 2, scales, 4) &&
+      !overlap(codes, 1, scales, 4), "Grouped quantization buffers must not overlap");
+  torch::stable::accelerator::DeviceGuard guard(device);
+  quantize_grouped4096(x.data_ptr(), static_cast<int8_t*>(codes.data_ptr()),
+      static_cast<float*>(scales.data_ptr()), x.size(0), x.size(1), stream_for(device));
+  launch_check();
+}
 void boxed_mm(StableIValue* stack, uint64_t, uint64_t) {
   auto a = to<Tensor>(stack[0]);
   auto w = to<Tensor>(stack[1]);
@@ -567,6 +595,7 @@ STABLE_TORCH_LIBRARY(consumer_int8, m) {
   m.def("paged_decode(Tensor query, Tensor cache, Tensor table, Tensor offsets, Tensor lengths, Tensor(a!) out, int max_query, float scale, Tensor(b!) scratch) -> ()");
   m.def("paged_attention(Tensor query, Tensor cache, Tensor table, Tensor offsets, Tensor lengths, Tensor(a!) out, int max_query, float scale) -> ()");
   m.def("quantize_rows(Tensor input, Tensor(a!) codes, Tensor(b!) scales) -> ()");
+  m.def("quantize_grouped4096(Tensor input, Tensor(a!) codes, Tensor(b!) scales) -> ()");
   m.def("channel_mm(Tensor a, Tensor w, Tensor a_scale, Tensor w_scale, Tensor(a!) out) -> ()");
   m.def("channel_gemv(Tensor x, Tensor w, Tensor scale, Tensor(a!) out) -> ()");
   m.def("unpack_allspark(Tensor packed, Tensor packed_scales, Tensor(a!) weight, Tensor(b!) scales) -> ()");
@@ -587,6 +616,7 @@ STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
   m.impl("paged_attention", &boxed_paged_attention<false>);
   m.impl("paged_decode", &boxed_paged_attention<true>);
   m.impl("quantize_rows", &boxed_quant);
+  m.impl("quantize_grouped4096", &boxed_grouped_quant);
   m.impl("channel_mm", &boxed_mm);
   m.impl("channel_gemv", &boxed_gemv);
   m.impl("unpack_allspark", &boxed_unpack_allspark);
