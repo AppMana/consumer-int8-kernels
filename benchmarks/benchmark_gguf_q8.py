@@ -25,6 +25,8 @@ def main(args):
     flush = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
     with args.output.open("x") as report:
         for item in manifest["samples"]:
+            if args.tensor and item["name"] != args.tensor:
+                continue
             path = args.manifest.parent / Path(item["path"]).name
             data = path.read_bytes()
             assert hashlib.sha256(data).hexdigest() == item["sha256"]
@@ -58,6 +60,12 @@ def main(args):
                     and torch.isfinite(out).all()
                     and out.abs().max() > 0
                 )
+                if args.profile_only:
+                    torch.cuda.synchronize()
+                    record = {"tensor": item["name"], "m": m, "relative_l2": relative}
+                    report.write(json.dumps(record) + "\n")
+                    report.flush()
+                    continue
                 graphs = {}
                 for name, fn in [("native", native), ("resident_cublas", cublas)]:
                     for _ in range(3):
@@ -121,5 +129,11 @@ if __name__ == "__main__":
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", type=int, default=1)
+    parser.add_argument("--tensor", help="Profile or benchmark one manifest tensor")
+    parser.add_argument(
+        "--profile-only",
+        action="store_true",
+        help="One eager native call per shape, checked against FP32",
+    )
     parser.add_argument("--rows", type=int, nargs="+", default=[128, 512, 1024, 2048])
     main(parser.parse_args())
