@@ -172,22 +172,53 @@ def test_q8_expand_grouped_blas_graph(api, group_major):
 
 
 @pytest.mark.parametrize("tile_rows", [16, 32])
-def test_mixed_iq_mx_chain_graph(api, tile_rows):
+@pytest.mark.parametrize(
+    "first_format,second_format",
+    [
+        ("IQ2_XS", "MXFP4"),
+        ("IQ2_XXS", "IQ2_XXS"),
+        ("IQ2_XXS", "IQ3_XXS"),
+        ("IQ3_XXS", "IQ3_XXS"),
+    ],
+)
+def test_mixed_iq_mx_chain_graph(api, tile_rows, first_format, second_format):
     gguf = pytest.importorskip("gguf")
     rng = np.random.default_rng(374)
-    experts, h, intermediate, count, topk = 3, 256, 128, 19, 2
+    experts, h, intermediate, count, topk = 3, 256, 256, 19, 2
+    first_bytes = {"IQ2_XS": 74, "IQ2_XXS": 66, "IQ3_XXS": 98}[first_format]
+    second_bytes = {"MXFP4": 17, "IQ2_XXS": 66, "IQ3_XXS": 98}[second_format]
     first = rng.integers(
-        0, 256, (experts, 2 * intermediate, h // 256, 74), dtype=np.uint8
+        0, 256, (experts, 2 * intermediate, h // 256, first_bytes), dtype=np.uint8
     )
     first[..., :2] = np.full((*first.shape[:-1], 1), 0.01, dtype=np.float16).view(
         np.uint8
     )
-    second = rng.integers(0, 256, (experts, h, intermediate // 32, 17), dtype=np.uint8)
-    second[..., 0] = rng.integers(120, 125, second.shape[:-1], dtype=np.uint8)
+    second = rng.integers(
+        0,
+        256,
+        (
+            experts,
+            h,
+            intermediate // (32 if second_format == "MXFP4" else 256),
+            second_bytes,
+        ),
+        dtype=np.uint8,
+    )
+    if second_format == "MXFP4":
+        second[..., 0] = rng.integers(120, 125, second.shape[:-1], dtype=np.uint8)
+        packed2 = api.pack_mxfp4(torch.from_numpy(second).cuda())
+    else:
+        second[..., :2] = np.full((*second.shape[:-1], 1), 0.01, dtype=np.float16).view(
+            np.uint8
+        )
+        packed2 = api.pack_iq_xxs(
+            torch.from_numpy(second).cuda(), int(second_format[2])
+        )
     w13 = (
         torch.from_numpy(
             gguf.dequantize(
-                first.reshape(-1, 74), gguf.GGMLQuantizationType.IQ2_XS
+                first.reshape(-1, first_bytes),
+                getattr(gguf.GGMLQuantizationType, first_format),
             ).reshape(experts, 2 * intermediate, h)
         )
         .cuda()
@@ -196,14 +227,18 @@ def test_mixed_iq_mx_chain_graph(api, tile_rows):
     w2 = (
         torch.from_numpy(
             gguf.dequantize(
-                second.reshape(-1, 17), gguf.GGMLQuantizationType.MXFP4
+                second.reshape(-1, second_bytes),
+                getattr(gguf.GGMLQuantizationType, second_format),
             ).reshape(experts, h, intermediate)
         )
         .cuda()
         .bfloat16()
     )
-    packed13 = api.pack_iq2_xs(torch.from_numpy(first).cuda())
-    packed2 = api.pack_mxfp4(torch.from_numpy(second).cuda())
+    packed13 = (
+        api.pack_iq2_xs(torch.from_numpy(first).cuda())
+        if first_format == "IQ2_XS"
+        else api.pack_iq_xxs(torch.from_numpy(first).cuda(), int(first_format[2]))
+    )
     routes = count * topk + experts * (tile_rows - 1)
     x = torch.randn(count, h, device="cuda", dtype=torch.bfloat16) * 20
     tokens = torch.full((routes,), -1, device="cuda", dtype=torch.int32)
@@ -236,7 +271,7 @@ def test_mixed_iq_mx_chain_graph(api, tile_rows):
             tasks,
             tile_rows,
         )
-        api.mixed_iq2_xs_mxfp4(
+        api.mixed_iq_moe(
             x,
             packed13,
             packed2,
@@ -250,6 +285,8 @@ def test_mixed_iq_mx_chain_graph(api, tile_rows):
             contributions,
             output,
             tile_rows=tile_rows,
+            first_format=first_format,
+            second_format=second_format,
         )
 
     run()
@@ -364,3 +401,65 @@ def test_device_route_plan_graph(api, count, experts, tile):
             (tasks, expected_tasks),
         ):
             np.testing.assert_array_equal(actual.cpu().numpy(), expected)
+
+
+@pytest.mark.parametrize("bits", [2, 3])
+@pytest.mark.parametrize("tile", [16, 32])
+@pytest.mark.parametrize("k", [768, 2304, 5120])
+@pytest.mark.parametrize("weighted", [False, True])
+def test_xxs_routed_oracle_graph(api, bits, tile, k, weighted):
+    gguf = pytest.importorskip("gguf")
+    rng = np.random.default_rng(948)
+    experts, n, capacity = 3, 37, 64
+    block_bytes = 66 if bits == 2 else 98
+    raw = rng.integers(0, 256, (experts, n, k // 256, block_bytes), dtype=np.uint8)
+    raw[..., :2] = (
+        rng.uniform(-0.01, 0.01, (*raw.shape[:-1], 1)).astype(np.float16).view(np.uint8)
+    )
+    dense = gguf.dequantize(
+        raw.reshape(-1, block_bytes),
+        getattr(gguf.GGMLQuantizationType, f"IQ{bits}_XXS"),
+    )
+    dense = torch.from_numpy(dense.reshape(experts, n, k)).cuda().bfloat16()
+    packed = api.pack_iq_xxs(torch.from_numpy(raw).cuda(), bits)
+    x = torch.randn(27, k, device="cuda", dtype=torch.bfloat16)
+    tokens = torch.randint(
+        -1, 27, (experts * capacity,), device="cuda", dtype=torch.int32
+    )
+    tasks = torch.tensor(
+        [
+            (e, e * capacity + r)
+            for e in range(experts)
+            for r in range(0, capacity, tile)
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    weights = torch.rand(experts * capacity, device="cuda") * 0.9 + 0.05
+    out = torch.empty(experts * capacity, n, device="cuda", dtype=torch.bfloat16)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        api.iq_xxs_routed_mm(
+            x, *packed, tokens, tasks, weights, out, bits, tile, weighted
+        )
+    for trial in range(3):
+        x.mul_(0.75)
+        weights.mul_(0.8)
+        tokens[0] = trial
+        out.fill_(float("nan"))
+        allocated = torch.cuda.memory_allocated()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated
+        references = []
+        for expert in range(experts):
+            sl = slice(expert * capacity, (expert + 1) * capacity)
+            selected = tokens[sl].long()
+            ref = x[selected.clamp_min(0)].float() @ dense[expert].float().T
+            ref[selected < 0] = 0
+            if weighted:
+                ref *= weights[sl, None]
+            references.append(ref.bfloat16())
+        ref = torch.cat(references).float()
+        assert torch.isfinite(out).all()
+        assert (out.float() - ref).norm() / ref.norm() < 0.001

@@ -24,6 +24,7 @@ def main(args):
     ops = torch.ops.consumer_int8
     manifest = json.loads(args.manifest.read_text())
     hashes = {}
+    formats = {}
 
     def sample(name):
         item = next(s for s in manifest["samples"] if s["name"] == name)
@@ -32,11 +33,15 @@ def main(args):
         assert item["experts"] == 1
         hashes[name] = item["sha256"]
         k, n = item["dims"][:2]
-        iq = item["type"] == "IQ2_XS"
+        formats[name] = item["type"]
+        iq = item["type"] != "MXFP4"
+        block_bytes = {"IQ2_XS": 74, "IQ2_XXS": 66, "IQ3_XXS": 98, "MXFP4": 17}[
+            item["type"]
+        ]
         raw = (
             np.frombuffer(data, dtype=np.uint8)
             .copy()
-            .reshape(n, k // (256 if iq else 32), 74 if iq else 17)
+            .reshape(n, k // (256 if iq else 32), block_bytes)
         )
         dense = gguf.dequantize(
             raw.reshape(-1, raw.shape[-1]),
@@ -46,22 +51,37 @@ def main(args):
             dense.reshape(n, k)
         ).cuda().bfloat16()
 
-    gate, gate_dense = sample("blk.0.ffn_gate_exps.weight")
-    up, up_dense = sample("blk.0.ffn_up_exps.weight")
-    down, down_dense = sample("blk.0.ffn_down_exps.weight")
-    raw13 = torch.cat((gate, up), 0)
-    codes13 = raw13[..., 2:66].contiguous().view(torch.int16).flatten(1)
-    bases13 = raw13[..., :2].contiguous().view(torch.float16).squeeze(-1)
-    scales13 = raw13[..., 66:].contiguous().flatten(1)
-    if bases13.shape[-1] % 2:
-        bases13 = torch.nn.functional.pad(bases13, (0, 1))
-    packed13 = tuple(
-        v.unsqueeze(0).repeat(args.experts, 1, 1) for v in (codes13, bases13, scales13)
-    )
-    packed2 = tuple(
-        v.unsqueeze(0).repeat(args.experts, 1, 1)
-        for v in (down[..., 1:].contiguous().flatten(1), down[..., 0].contiguous())
-    )
+    gate_name = f"blk.{args.block}.ffn_gate_exps.weight"
+    up_name = f"blk.{args.block}.ffn_up_exps.weight"
+    down_name = f"blk.{args.block}.ffn_down_exps.weight"
+    gate, gate_dense = sample(gate_name)
+    up, up_dense = sample(up_name)
+    down, down_dense = sample(down_name)
+    first_format, second_format = formats[gate_name], formats[down_name]
+    assert formats[up_name] == first_format
+
+    def pack(raw, kind):
+        if kind == "MXFP4":
+            parts = (raw[..., 1:].contiguous().flatten(1), raw[..., 0].contiguous())
+        else:
+            bases = raw[..., :2].contiguous().view(torch.float16).squeeze(-1)
+            if bases.shape[-1] % 2:
+                bases = torch.nn.functional.pad(bases, (0, 1))
+            if kind == "IQ2_XS":
+                codes = raw[..., 2:66].contiguous().view(torch.int16).flatten(1)
+                metadata = raw[..., 66:].contiguous().flatten(1)
+            elif kind == "IQ2_XXS":
+                chunks = raw[..., 2:].reshape(*raw.shape[:2], 8, 8)
+                codes = chunks[..., :4].contiguous().flatten(1)
+                metadata = chunks[..., 4:].contiguous().view(torch.int32).flatten(1)
+            else:
+                codes = raw[..., 2:66].contiguous().flatten(1)
+                metadata = raw[..., 66:].contiguous().view(torch.int32).flatten(1)
+            parts = codes, bases, metadata
+        return tuple(v.unsqueeze(0).repeat(args.experts, 1, 1) for v in parts)
+
+    packed13 = pack(torch.cat((gate, up), 0), first_format)
+    packed2 = pack(down, second_format)
     count, h, intermediate, topk = (
         args.tokens,
         gate_dense.shape[1],
@@ -166,11 +186,37 @@ def main(args):
                     tasks,
                     tile,
                 )
-            ops.gguf_iq2_xs_routed_mm(x, *packed13, tokens, tasks, projected, tile)
+            if first_format == "IQ2_XS":
+                ops.gguf_iq2_xs_routed_mm(x, *packed13, tokens, tasks, projected, tile)
+            else:
+                ops.gguf_iq_xxs_routed_mm(
+                    x,
+                    *packed13,
+                    tokens,
+                    tasks,
+                    weights,
+                    projected,
+                    int(first_format[2]),
+                    tile,
+                    False,
+                )
             ops.gguf_swiglu(projected, hidden, 10.0)
-            ops.gguf_mxfp4_routed_weighted_mm(
-                hidden, *packed2, identity, tasks, weights, contributions, tile
-            )
+            if second_format == "MXFP4":
+                ops.gguf_mxfp4_routed_weighted_mm(
+                    hidden, *packed2, identity, tasks, weights, contributions, tile
+                )
+            else:
+                ops.gguf_iq_xxs_routed_mm(
+                    hidden,
+                    *packed2,
+                    identity,
+                    tasks,
+                    weights,
+                    contributions,
+                    int(second_format[2]),
+                    tile,
+                    True,
+                )
             ops.gguf_route_reduce(contributions, inverse, output)
 
         for _ in range(3):
@@ -231,6 +277,8 @@ def main(args):
             end.synchronize()
             plan_times[tile].append(begin.elapsed_time(end))
     record = dict(
+        formats=formats,
+        block=args.block,
         checkpoint=manifest["repo"],
         revision=manifest["revision"],
         samples=hashes,
@@ -273,6 +321,7 @@ if __name__ == "__main__":
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--block", type=int, default=0)
     parser.add_argument("--experts", type=int, default=192)
     parser.add_argument("--tokens", type=int, default=512)
     parser.add_argument("--device-plan", action="store_true")

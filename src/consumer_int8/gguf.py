@@ -169,7 +169,7 @@ def _route_reduce_fake(contributions, rows, out):
     return None
 
 
-def mixed_iq2_xs_mxfp4(
+def mixed_iq_moe(
     x,
     packed_gate_up,
     packed_down,
@@ -185,6 +185,8 @@ def mixed_iq2_xs_mxfp4(
     *,
     tile_rows=16,
     swiglu_limit=10.0,
+    first_format="IQ2_XS",
+    second_format="MXFP4",
 ):
     """Execute one local mixed expert partition using caller-owned buffers.
 
@@ -199,12 +201,53 @@ def mixed_iq2_xs_mxfp4(
     outputs must be disjoint and prepared before capture. Routing construction
     is separate; this function performs no allocation or host synchronization.
     """
-    iq2_xs_routed_mm(x, *packed_gate_up, tokens, tasks, projected, tile_rows)
+    if first_format not in {"IQ2_XS", "IQ2_XXS", "IQ3_XXS"} or second_format not in {
+        "MXFP4",
+        "IQ2_XXS",
+        "IQ3_XXS",
+    }:
+        raise ValueError("Unsupported native mixed IQ formats")
+    if first_format == "IQ2_XS":
+        iq2_xs_routed_mm(x, *packed_gate_up, tokens, tasks, projected, tile_rows)
+    else:
+        iq_xxs_routed_mm(
+            x,
+            *packed_gate_up,
+            tokens,
+            tasks,
+            weights,
+            projected,
+            int(first_format[2]),
+            tile_rows,
+            False,
+        )
     swiglu(projected, hidden, swiglu_limit)
-    mxfp4_routed_weighted_mm(
-        hidden, *packed_down, identity_rows, tasks, weights, contributions, tile_rows
-    )
+    if second_format == "MXFP4":
+        mxfp4_routed_weighted_mm(
+            hidden,
+            *packed_down,
+            identity_rows,
+            tasks,
+            weights,
+            contributions,
+            tile_rows,
+        )
+    else:
+        iq_xxs_routed_mm(
+            hidden,
+            *packed_down,
+            identity_rows,
+            tasks,
+            weights,
+            contributions,
+            int(second_format[2]),
+            tile_rows,
+            True,
+        )
     route_reduce(contributions, inverse_routes, out)
+
+
+mixed_iq2_xs_mxfp4 = mixed_iq_moe
 
 
 # Build stable expert-major routes entirely on-device. expert_map[global_id]
@@ -220,3 +263,55 @@ def _plan_routes_fake(
     ids, top_weights, expert_map, info, tokens, weights, inverse, tasks, tile_rows=16
 ):
     return None
+
+
+iq_xxs_routed_mm = torch.ops.consumer_int8.gguf_iq_xxs_routed_mm
+
+
+@torch.library.register_fake("consumer_int8::gguf_iq_xxs_routed_mm")
+def _iq_xxs_fake(
+    x,
+    codes,
+    bases,
+    metadata,
+    tokens,
+    tasks,
+    weights,
+    out,
+    bits,
+    tile_rows=16,
+    weighted=False,
+):
+    return None
+
+
+def pack_iq_xxs(raw, bits):
+    """Losslessly separate IQ2_XXS/IQ3_XXS without expanding descriptors.
+
+    Codes remain uint8, bases FP16 padded to an even block count, and original
+    packed sign/scale words int32. Only one extra FP16 per odd-block row is added.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("XXS packing must precede graph capture")
+    if (
+        bits not in (2, 3)
+        or not raw.is_cuda
+        or raw.dtype != torch.uint8
+        or raw.ndim != 4
+    ):
+        raise ValueError("Expected CUDA uint8 IQ2_XXS/IQ3_XXS blocks and bits2/3")
+    if min(raw.shape) <= 0 or raw.shape[-1] != (66 if bits == 2 else 98):
+        raise ValueError("Invalid XXS block shape")
+    bases = raw[..., :2].contiguous().view(torch.float16).squeeze(-1)
+    if not torch.isfinite(bases).all().item():
+        raise ValueError("XXS scale bases must be finite")
+    if bases.shape[-1] % 2:
+        bases = torch.nn.functional.pad(bases, (0, 1))
+    if bits == 2:
+        chunks = raw[..., 2:].reshape(*raw.shape[:3], 8, 8)
+        codes = chunks[..., :4].contiguous().flatten(2)
+        metadata = chunks[..., 4:].contiguous().view(torch.int32).flatten(2)
+    else:
+        codes = raw[..., 2:66].contiguous().flatten(2)
+        metadata = raw[..., 66:].contiguous().view(torch.int32).flatten(2)
+    return codes, bases, metadata

@@ -20,15 +20,15 @@ __device__ __forceinline__ void copy4(void* dst, const void* src, bool valid) {
   asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::
       "r"(address), "l"(src), "r"(valid ? 4 : 0));
 }
-template<bool IQ, int TM, bool MX=false> struct Storage {
+template<bool IQ, int TM, bool MX=false, int XX=0> struct Storage {
   __nv_bfloat16 a[2][TM*LD];
   int8_t q[2][BN*(IQ ? BK/4 : MX ? BK/2 : BK)];
-  uint8_t iq_scales[2][BN*4];
+  uint8_t iq_scales[2][BN*(XX ? 8 : 4)];
   __half scales[2][BN*2];
   __nv_bfloat16 b[TM==16 ? 1 : BN*LD];
 };
-template<bool IQ, int TM, bool Routed, bool MX=false>
-__device__ __forceinline__ void load(Storage<IQ,TM,MX>& s, int stage, int start,
+template<bool IQ, int TM, bool Routed, bool MX=false, int XX=0>
+__device__ __forceinline__ void load(Storage<IQ,TM,MX,XX>& s, int stage, int start,
     const __nv_bfloat16* x, const int8_t* q, const __half* scales,
     const uint8_t* iq_scales, int m, int n, int k, int64_t xs, int64_t xg,
     int group, int rowbase, const int32_t* tokens, int xrows) {
@@ -44,13 +44,20 @@ __device__ __forceinline__ void load(Storage<IQ,TM,MX>& s, int stage, int start,
   if constexpr (IQ) {
     if (t<BN) {
       row=blockIdx.x*BN+t;
-      auto qp=row<n ? q+(int64_t(group)*n+row)*(k/4)+start/4 : q;
+      auto qp=row<n ? q+(int64_t(group)*n+row)*(XX==2 ? k/8 : k/4)+
+          (XX==2 ? (start/128)*16 : start/4) : q;
       copy16(s.q[stage]+t*(BK/4),qp,row<n);
       const int dstride=((k/256)+1)&~1;
       auto dp=row<n ? scales+(int64_t(group)*n+row)*dstride+((start/256)&~1) : scales;
       copy4(s.scales[stage]+t*2,dp,row<n);
+      if constexpr (XX) {
+        auto sp=row<n ? iq_scales+((int64_t(group)*n+row)*(k/32)+start/32)*4 : iq_scales;
+        copy4(s.iq_scales[stage]+t*8,sp,row<n);
+        copy4(s.iq_scales[stage]+t*8+4,row<n ? sp+4 : sp,row<n);
+      } else {
       auto sp=row<n ? iq_scales+(int64_t(group)*n+row)*(k/32)+(start/128)*4 : iq_scales;
       copy4(s.iq_scales[stage]+t*4,sp,row<n);
+      }
     }
   } else if constexpr (MX) {
     if (t<BN*2) {
@@ -75,16 +82,27 @@ __device__ __forceinline__ void load(Storage<IQ,TM,MX>& s, int stage, int start,
   }
   asm volatile("cp.async.commit_group;");
 }
-template<int TM>
-__device__ __forceinline__ uint32_t decode_iq_pair(Storage<true,TM>& s,
+template<int TM, int XX=0>
+__device__ __forceinline__ uint32_t decode_iq_pair(Storage<true,TM,false,XX>& s,
     const uint32_t* codebook,int stage,int start,int row,int col) {
-  uint16_t code=*reinterpret_cast<const uint16_t*>(s.q[stage]+row*(BK/4)+(col/8)*2);
-  uint32_t signs=code>>9;
+  uint32_t signs,pair;
+  int scale4;
+  if constexpr (XX) {
+    uint32_t metadata=*reinterpret_cast<const uint32_t*>(s.iq_scales[stage]+row*8+(col/32)*4);
+    signs=(metadata>>(((col%32)/8)*7))&127;
+    scale4=metadata>>28;
+    int index=static_cast<uint8_t>(s.q[stage][row*(BK/4)+
+        (XX==2 ? ((start/64)%2)*8+col/8 : col/4)]);
+    pair=codebook[index*(XX==2 ? 4 : 2)+(XX==2 ? (col%8)/2 : (col%4)/2)];
+  } else {
+    uint16_t code=*reinterpret_cast<const uint16_t*>(s.q[stage]+row*(BK/4)+(col/8)*2);
+    signs=code>>9;
+    pair=codebook[(code&511)*4+(col%8)/2];
+    uint8_t sb=s.iq_scales[stage][row*4+((start/64)%2)*2+col/32];
+    scale4=(sb>>(((col%32)/16)*4))&15;
+  }
   signs|=(__popc(signs)&1)<<7;
-  uint32_t pair=codebook[(code&511)*4+(col%8)/2];
-  uint8_t sb=s.iq_scales[stage][row*4+((start/64)%2)*2+col/32];
-  int scale4=(sb>>(((col%32)/16)*4))&15;
-  float d=__half2float(s.scales[stage][row*2+((start/256)%2)])*(0.5f+scale4)*0.25f;
+  float d=__half2float(s.scales[stage][row*2+((start/256)%2)])*(0.5f+scale4)*(XX==3 ? 0.5f : 0.25f);
   float v0=d*__uint_as_float(pair<<16);
   float v1=d*__uint_as_float(pair&0xffff0000u);
   auto value=__floats2bfloat162_rn(v0,v1);
@@ -106,7 +124,7 @@ __device__ __forceinline__ uint32_t decode_mx_pair(Storage<false,TM,true>& s,
   auto value=__floats2bfloat162_rn(v0,v1);
   return (*reinterpret_cast<uint32_t*>(&value)) ^ ((c0&8)<<12) ^ ((c1&8)<<28);
 }
-template<bool IQ, int TM=32, bool Routed=false, bool MX=false, bool Weighted=false>
+template<bool IQ, int TM=32, bool Routed=false, bool MX=false, bool Weighted=false, int XX=0>
 __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
     const __half* scales, const uint8_t* iq_scales, __nv_bfloat16* y, int m, int n, int k, int groups,
     int64_t xs, int64_t xg, const int32_t* tokens=nullptr,
@@ -117,24 +135,27 @@ __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
   if constexpr (Routed) {
     if (group<0 || group>=experts || rowbase<0 || rowbase>=m) return;
   }
-  __shared__ __align__(32) Storage<IQ,TM,MX> s;
-  __shared__ uint32_t codebook[IQ ? 2048 : 1];
+  __shared__ __align__(32) Storage<IQ,TM,MX,XX> s;
+  __shared__ uint32_t codebook[IQ ? (XX==2 ? 1024 : XX==3 ? 512 : 2048) : 1];
   int t=threadIdx.x, warp=t/32;
   if constexpr (IQ) {
-    for (int i=t;i<2048;i+=TM*8) {
-      uint64_t grid=iq2xs_grid[i/4];
-      uint32_t pair=uint32_t(grid>>((i%4)*16));
+    for (int i=t;i<(XX==2 ? 1024 : XX==3 ? 512 : 2048);i+=TM*8) {
+      uint64_t grid;
+      if constexpr (XX==2) grid=iq2xxs_grid[i/4];
+      else if constexpr (XX==3) grid=iq3xxs_grid[i/2];
+      else grid=iq2xs_grid[i/4];
+      uint32_t pair=uint32_t(grid>>((i%(XX==3 ? 2 : 4))*16));
       codebook[i]=(__float_as_uint(float(pair&255))>>16) |
                    (__float_as_uint(float((pair>>8)&255))&0xffff0000u);
     }
   }
   float acc[2][4] = {};
   const int lane=t%32;
-  load<IQ,TM,Routed,MX>(s,0,0,x,q,scales,iq_scales,m,n,k,xs,xg,group,rowbase,tokens,xrows);
+  load<IQ,TM,Routed,MX,XX>(s,0,0,x,q,scales,iq_scales,m,n,k,xs,xg,group,rowbase,tokens,xrows);
   asm volatile("cp.async.wait_group 0;");
   __syncthreads();
   for (int start=0, stage=0; start<k; start+=BK, stage^=1) {
-    if (start+BK<k) load<IQ,TM,Routed,MX>(s,stage^1,start+BK,x,q,scales,iq_scales,m,n,k,xs,xg,group,rowbase,tokens,xrows);
+    if (start+BK<k) load<IQ,TM,Routed,MX,XX>(s,stage^1,start+BK,x,q,scales,iq_scales,m,n,k,xs,xg,group,rowbase,tokens,xrows);
     if constexpr (TM!=16) {
     for (int i=t; i<BN*BK/2; i+=TM*8) {
       int row=i/(BK/2), col=(i%(BK/2))*2;
@@ -428,4 +449,32 @@ void gguf_plan_routes(const int32_t* ids,const float* top_weights,const int32_t*
   route_offsets<<<1,256,0,stream>>>(info,tasks,experts,tile);
   route_assign<<<experts,256,0,stream>>>(ids,top_weights,map,info,tokens,weights,inverse,
       pairs,topk,globals,experts);
+}
+
+namespace {
+template<int XX,int TM,bool Weighted>
+void launch_xxs(const void* x,const uint8_t* q,const void* bases,const uint8_t* metadata,
+    const int32_t* tokens,const int32_t* tasks,const float* weights,void* out,
+    int rows,int n,int k,int experts,int taskcount,int xrows,cudaStream_t stream) {
+  packed_mm<true,TM,true,false,Weighted,XX><<<dim3((n+BN-1)/BN,taskcount),TM*8,0,stream>>>(
+      static_cast<const __nv_bfloat16*>(x),reinterpret_cast<const int8_t*>(q),
+      static_cast<const __half*>(bases),metadata,static_cast<__nv_bfloat16*>(out),
+      rows,n,k,1,k,0,tokens,tasks,xrows,experts,weights);
+}
+template<int XX,int TM>
+void launch_xxs_weight(const void* x,const uint8_t* q,const void* bases,const uint8_t* metadata,
+    const int32_t* tokens,const int32_t* tasks,const float* weights,void* out,
+    int rows,int n,int k,int experts,int taskcount,int xrows,bool weighted,cudaStream_t stream) {
+  if (weighted) launch_xxs<XX,TM,true>(x,q,bases,metadata,tokens,tasks,weights,out,rows,n,k,experts,taskcount,xrows,stream);
+  else launch_xxs<XX,TM,false>(x,q,bases,metadata,tokens,tasks,weights,out,rows,n,k,experts,taskcount,xrows,stream);
+}
+}
+void gguf_iq_xxs_routed_mm(const void* x,const uint8_t* q,const void* bases,const uint8_t* metadata,
+    const int32_t* tokens,const int32_t* tasks,const float* weights,void* out,
+    int rows,int n,int k,int experts,int taskcount,int xrows,int bits,int tile,bool weighted,cudaStream_t stream) {
+  if (!rows || !n || !taskcount) return;
+  if (bits==2 && tile==16) launch_xxs_weight<2,16>(x,q,bases,metadata,tokens,tasks,weights,out,rows,n,k,experts,taskcount,xrows,weighted,stream);
+  else if (bits==2) launch_xxs_weight<2,32>(x,q,bases,metadata,tokens,tasks,weights,out,rows,n,k,experts,taskcount,xrows,weighted,stream);
+  else if (tile==16) launch_xxs_weight<3,16>(x,q,bases,metadata,tokens,tasks,weights,out,rows,n,k,experts,taskcount,xrows,weighted,stream);
+  else launch_xxs_weight<3,32>(x,q,bases,metadata,tokens,tasks,weights,out,rows,n,k,experts,taskcount,xrows,weighted,stream);
 }
