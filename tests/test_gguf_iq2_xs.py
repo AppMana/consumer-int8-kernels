@@ -12,7 +12,7 @@ import pytest
 import torch
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def api():
     library = os.environ.get("GGUF_NATIVE_LIBRARY")
     if not library:
