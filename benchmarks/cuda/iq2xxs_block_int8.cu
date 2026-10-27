@@ -10,14 +10,22 @@ __device__ __forceinline__ uint32_t signed_bytes(uint32_t v, uint32_t signs) {
                   ((signs >> 2) & 1) * 0xff0000u | ((signs >> 3) & 1) * 0xff000000u;
   return __vsub4(v ^ mask, mask);
 }
-template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false>
-__global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k) {
+template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false>
+__global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
+    const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1) {
   constexpr int Rows = BM + BN, Threads = (BM / 16) * (BN / 32) * 32;
   __shared__ int8_t tile[Rows][144];
   __shared__ float scales[Rows][4];
   const int lane = threadIdx.x & 31, group = lane >> 2, tid = lane & 3;
   const int warp = threadIdx.x >> 5;
-  const int rb = blockIdx.y * BM, cb = blockIdx.x * BN;
+  int rb = blockIdx.y * BM;
+  if constexpr (Routed) {
+    const int expert = tasks[blockIdx.y * 2];
+    rb = tasks[blockIdx.y * 2 + 1];
+    if (expert < 0 || expert >= experts || rb < 0 || rb >= m) return;
+    w += int64_t(expert) * n * (k / 256) * 66;
+  }
+  const int cb = blockIdx.x * BN;
   const int wr = (warp / (BN / 32)) * 16, wc = (warp % (BN / 32)) * 32;
   __shared__ uint64_t lut[SharedLUT ? 256 : 1];
   if constexpr (SharedLUT) {
@@ -29,13 +37,25 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
     for (int index = threadIdx.x; index < BM * 8; index += Threads) {
       int row = index / 8, col = (index % 8) * 16;
       int4 value = {};
-      if (rb + row < m)
-        value = *reinterpret_cast<const int4*>(a + (rb + row) * k + base + col);
+      int input = rb + row;
+      bool valid = input < m;
+      if constexpr (Routed) {
+        input = valid ? tokens[input] : -1;
+        valid = input >= 0 && input < xrows;
+      }
+      if (valid)
+        value = *reinterpret_cast<const int4*>(a + int64_t(input) * k + base + col);
       *reinterpret_cast<int4*>(&tile[row][col]) = value;
     }
     for (int index = threadIdx.x; index < BM * 4; index += Threads) {
       int row = index / 4, block = index % 4;
-      scales[row][block] = rb + row < m ? sa[(rb + row) * (k / 32) + base / 32 + block] : 0;
+      int input = rb + row;
+      bool valid = input < m;
+      if constexpr (Routed) {
+        input = valid ? tokens[input] : -1;
+        valid = input >= 0 && input < xrows;
+      }
+      scales[row][block] = valid ? sa[int64_t(input) * (k / 32) + base / 32 + block] : 0;
     }
     for (int index = threadIdx.x; index < BN * 4; index += Threads) {
       int row = index / 4, block = index % 4;
@@ -171,5 +191,27 @@ extern "C" int iq2xxs_block_int8_lut(const void* x, void* a, float* sa,
     iq2xxs_tiled<64,64,true,true><<<dim3((n + 63) / 64, (m + 63) / 64), 256, 0, stream>>>(
         static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
         static_cast<__nv_bfloat16*>(y), m, n, k);
+  return cudaGetLastError();
+}
+
+// Benchmark-only routed projection: caller validates task spans and buffers.
+// Quantize each input once; routes gather codes/scales inside the MMA kernel.
+extern "C" int iq2xxs_routed_int8(const void* x, void* a, float* sa,
+    const void* raw, const int32_t* tokens, const int32_t* tasks, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || (tile_m != 16 && tile_m != 32 && tile_m != 64))
+    return cudaErrorInvalidValue;
+  quantize<<<(xrows * (k / 32) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 32));
+#define ROUTED_LAUNCH(M,N) \
+  iq2xxs_tiled<M,N,true,true,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
+      static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts)
+  if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
+  else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
+  else { ROUTED_LAUNCH(64,64); }
+#undef ROUTED_LAUNCH
   return cudaGetLastError();
 }
