@@ -201,16 +201,25 @@ def mixed_iq_moe(
     outputs must be disjoint and prepared before capture. Routing construction
     is separate; this function performs no allocation or host synchronization.
     """
-    if first_format not in {"IQ2_XS", "IQ2_XXS", "IQ3_XXS"} or second_format not in {
+    if first_format not in {
+        "IQ2_XS",
+        "IQ2_XXS",
+        "IQ3_XXS",
+        "IQ2_S",
+        "IQ3_S",
+    } or second_format not in {
         "MXFP4",
         "IQ2_XXS",
         "IQ3_XXS",
+        "IQ2_S",
+        "IQ3_S",
     }:
         raise ValueError("Unsupported native mixed IQ formats")
     if first_format == "IQ2_XS":
         iq2_xs_routed_mm(x, *packed_gate_up, tokens, tasks, projected, tile_rows)
     else:
-        iq_xxs_routed_mm(
+        op = iq_s_routed_mm if first_format.endswith("_S") else iq_xxs_routed_mm
+        op(
             x,
             *packed_gate_up,
             tokens,
@@ -233,7 +242,8 @@ def mixed_iq_moe(
             tile_rows,
         )
     else:
-        iq_xxs_routed_mm(
+        op = iq_s_routed_mm if second_format.endswith("_S") else iq_xxs_routed_mm
+        op(
             hidden,
             *packed_down,
             identity_rows,
@@ -314,4 +324,54 @@ def pack_iq_xxs(raw, bits):
     else:
         codes = raw[..., 2:66].contiguous().flatten(2)
         metadata = raw[..., 66:].contiguous().view(torch.int32).flatten(2)
+    return codes, bases, metadata
+
+
+iq_s_routed_mm = torch.ops.consumer_int8.gguf_iq_s_routed_mm
+
+
+@torch.library.register_fake("consumer_int8::gguf_iq_s_routed_mm")
+def _iq_s_fake(
+    x,
+    codes,
+    bases,
+    metadata,
+    tokens,
+    tasks,
+    weights,
+    out,
+    bits,
+    tile_rows=16,
+    weighted=False,
+):
+    return None
+
+
+def pack_iq_s(raw, bits):
+    """Losslessly separate IQ2_S/IQ3_S codes, bases and compact metadata."""
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("IQ_S packing must precede graph capture")
+    if (
+        bits not in (2, 3)
+        or not raw.is_cuda
+        or raw.dtype != torch.uint8
+        or raw.ndim != 4
+    ):
+        raise ValueError("Expected CUDA uint8 IQ2_S/IQ3_S blocks and bits2/3")
+    if min(raw.shape) <= 0 or raw.shape[-1] != (82 if bits == 2 else 110):
+        raise ValueError("Invalid IQ_S block shape")
+    bases = raw[..., :2].contiguous().view(torch.float16).squeeze(-1)
+    if not torch.isfinite(bases).all().item():
+        raise ValueError("IQ_S scale bases must be finite")
+    if bases.shape[-1] % 2:
+        bases = torch.nn.functional.pad(bases, (0, 1))
+    if bits == 2:
+        codes = raw[..., 2:34].contiguous().flatten(2)
+        highscale = torch.stack((raw[..., 66:74], raw[..., 74:82]), -1).flatten(-2)
+        metadata = torch.cat((raw[..., 34:66], highscale), -1).flatten(2)
+    else:
+        codes = raw[..., 2:66].contiguous().flatten(2)
+        metadata = torch.cat(
+            (raw[..., 74:106], raw[..., 66:74], raw[..., 106:110]), -1
+        ).flatten(2)
     return codes, bases, metadata

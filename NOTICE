@@ -34,8 +34,12 @@ https://github.com/vllm-project/flash-attention
 The pinned source and license remain in third_party/flash_attention. The
 adapter specializes D256/GQA6 prefill over caller-owned contiguous KV scratch.
 
-The IQ2_XS, IQ2_XXS and IQ3_XXS lookup data in csrc/gguf_iq_tables.cuh is from ggml-common.h
+The IQ2_XS, IQ2_XXS, IQ3_XXS and IQ2_S lookup data in csrc/gguf_iq_tables.cuh is from ggml-common.h
 in llama.cpp b2899 (MIT), as retained by vllm-gguf-plugin at
 e454affe0ca23c9dc8754ec3033270cb30622ed5. The original MIT license is
 retained in third_party/ggml/LICENSE. CUDA staging and MMA scheduling
 are independently authored in this repository.
+
+IQ3_S lookup data in the same header is decoded from the MIT-licensed
+gguf Python package (llama.cpp GGML grid_hex), as used by the upstream
+plugin. It retains the original GGML values and license above.

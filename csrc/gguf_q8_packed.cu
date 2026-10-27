@@ -23,7 +23,7 @@ __device__ __forceinline__ void copy4(void* dst, const void* src, bool valid) {
 template<bool IQ, int TM, bool MX=false, int XX=0> struct Storage {
   __nv_bfloat16 a[2][TM*LD];
   int8_t q[2][BN*(IQ ? BK/4 : MX ? BK/2 : BK)];
-  uint8_t iq_scales[2][BN*(XX ? 8 : 4)];
+  uint8_t iq_scales[2][BN*(XX==4 ? 12 : XX==5 ? 16 : XX ? 8 : 4)];
   __half scales[2][BN*2];
   __nv_bfloat16 b[TM==16 ? 1 : BN*LD];
 };
@@ -44,13 +44,23 @@ __device__ __forceinline__ void load(Storage<IQ,TM,MX,XX>& s, int stage, int sta
   if constexpr (IQ) {
     if (t<BN) {
       row=blockIdx.x*BN+t;
-      auto qp=row<n ? q+(int64_t(group)*n+row)*(XX==2 ? k/8 : k/4)+
-          (XX==2 ? (start/128)*16 : start/4) : q;
+      auto qp=row<n ? q+(int64_t(group)*n+row)*((XX==2 || XX==4) ? k/8 : k/4)+
+          ((XX==2 || XX==4) ? (start/128)*16 : start/4) : q;
       copy16(s.q[stage]+t*(BK/4),qp,row<n);
       const int dstride=((k/256)+1)&~1;
       auto dp=row<n ? scales+(int64_t(group)*n+row)*dstride+((start/256)&~1) : scales;
       copy4(s.scales[stage]+t*2,dp,row<n);
-      if constexpr (XX) {
+      if constexpr (XX==4 || XX==5) {
+        constexpr int stride=XX==4 ? 12 : 16;
+        constexpr int meta=XX==4 ? 48 : 44;
+        auto base=row<n ? iq_scales+((int64_t(group)*n+row)*(k/256)+start/256)*meta : iq_scales;
+        auto signs=row<n ? base+(start%256)/8 : base;
+        copy4(s.iq_scales[stage]+t*stride,signs,row<n);
+        copy4(s.iq_scales[stage]+t*stride+4,row<n ? signs+4 : signs,row<n);
+        auto extra=row<n ? base+32+(XX==4 ? (start%256)/16 : ((start%256)/128)*4) : base;
+        copy4(s.iq_scales[stage]+t*stride+8,extra,row<n);
+        if constexpr (XX==5) copy4(s.iq_scales[stage]+t*stride+12,row<n ? base+40 : base,row<n);
+      } else if constexpr (XX) {
         auto sp=row<n ? iq_scales+((int64_t(group)*n+row)*(k/32)+start/32)*4 : iq_scales;
         copy4(s.iq_scales[stage]+t*8,sp,row<n);
         copy4(s.iq_scales[stage]+t*8+4,row<n ? sp+4 : sp,row<n);
@@ -87,7 +97,24 @@ __device__ __forceinline__ uint32_t decode_iq_pair(Storage<true,TM,false,XX>& s,
     const uint32_t* codebook,int stage,int start,int row,int col) {
   uint32_t signs,pair;
   int scale4;
-  if constexpr (XX) {
+  if constexpr (XX==4 || XX==5) {
+    constexpr int stride=XX==4 ? 12 : 16;
+    signs=s.iq_scales[stage][row*stride+col/8];
+    int index;
+    if constexpr (XX==4) {
+      uint16_t highscale=*reinterpret_cast<const uint16_t*>(s.iq_scales[stage]+row*stride+8+(col/32)*2);
+      int high=(highscale>>(((col%32)/8)*2))&3;
+      scale4=(highscale>>(8+((col%32)/16)*4))&15;
+      index=static_cast<uint8_t>(s.q[stage][row*(BK/4)+((start/64)%2)*8+col/8]) | (high<<8);
+      pair=codebook[index*4+(col%8)/2];
+    } else {
+      uint8_t high=s.iq_scales[stage][row*stride+8+((start/64)%2)*2+col/32];
+      high=(high>>((col%32)/4))&1;
+      scale4=(s.iq_scales[stage][row*stride+12+(start%256)/64]>>((col/32)*4))&15;
+      index=static_cast<uint8_t>(s.q[stage][row*(BK/4)+col/4]) | (int(high)<<8);
+      pair=codebook[index*2+(col%4)/2];
+    }
+  } else if constexpr (XX) {
     uint32_t metadata=*reinterpret_cast<const uint32_t*>(s.iq_scales[stage]+row*8+(col/32)*4);
     signs=(metadata>>(((col%32)/8)*7))&127;
     scale4=metadata>>28;
@@ -101,8 +128,9 @@ __device__ __forceinline__ uint32_t decode_iq_pair(Storage<true,TM,false,XX>& s,
     uint8_t sb=s.iq_scales[stage][row*4+((start/64)%2)*2+col/32];
     scale4=(sb>>(((col%32)/16)*4))&15;
   }
-  signs|=(__popc(signs)&1)<<7;
-  float d=__half2float(s.scales[stage][row*2+((start/256)%2)])*(0.5f+scale4)*(XX==3 ? 0.5f : 0.25f);
+  if constexpr (XX!=4 && XX!=5) signs|=(__popc(signs)&1)<<7;
+  float d=__half2float(s.scales[stage][row*2+((start/256)%2)])*
+      (XX==5 ? float(1+2*scale4) : (0.5f+scale4)*(XX==3 ? 0.5f : 0.25f));
   float v0=d*__uint_as_float(pair<<16);
   float v1=d*__uint_as_float(pair&0xffff0000u);
   auto value=__floats2bfloat162_rn(v0,v1);
@@ -136,15 +164,17 @@ __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
     if (group<0 || group>=experts || rowbase<0 || rowbase>=m) return;
   }
   __shared__ __align__(32) Storage<IQ,TM,MX,XX> s;
-  __shared__ uint32_t codebook[IQ ? (XX==2 ? 1024 : XX==3 ? 512 : 2048) : 1];
+  __shared__ uint32_t codebook[IQ ? (XX==4 ? 4096 : XX==5 ? 1024 : XX==2 ? 1024 : XX==3 ? 512 : 2048) : 1];
   int t=threadIdx.x, warp=t/32;
   if constexpr (IQ) {
-    for (int i=t;i<(XX==2 ? 1024 : XX==3 ? 512 : 2048);i+=TM*8) {
+    for (int i=t;i<(XX==4 ? 4096 : XX==5 ? 1024 : XX==2 ? 1024 : XX==3 ? 512 : 2048);i+=TM*8) {
       uint64_t grid;
-      if constexpr (XX==2) grid=iq2xxs_grid[i/4];
+      if constexpr (XX==4) grid=iq2s_grid[i/4];
+      else if constexpr (XX==5) grid=iq3s_grid[i/2];
+      else if constexpr (XX==2) grid=iq2xxs_grid[i/4];
       else if constexpr (XX==3) grid=iq3xxs_grid[i/2];
       else grid=iq2xs_grid[i/4];
-      uint32_t pair=uint32_t(grid>>((i%(XX==3 ? 2 : 4))*16));
+      uint32_t pair=uint32_t(grid>>((i%((XX==3 || XX==5) ? 2 : 4))*16));
       codebook[i]=(__float_as_uint(float(pair&255))>>16) |
                    (__float_as_uint(float((pair>>8)&255))&0xffff0000u);
     }
@@ -473,7 +503,11 @@ void gguf_iq_xxs_routed_mm(const void* x,const uint8_t* q,const void* bases,cons
     const int32_t* tokens,const int32_t* tasks,const float* weights,void* out,
     int rows,int n,int k,int experts,int taskcount,int xrows,int bits,int tile,bool weighted,cudaStream_t stream) {
   if (!rows || !n || !taskcount) return;
-  if (bits==2 && tile==16) launch_xxs_weight<2,16>(x,q,bases,metadata,tokens,tasks,weights,out,rows,n,k,experts,taskcount,xrows,weighted,stream);
+  if (bits==4 && tile==16) launch_xxs_weight<4,16>(x,q,bases,metadata,tokens,tasks,weights,out,rows,n,k,experts,taskcount,xrows,weighted,stream);
+  else if (bits==4) launch_xxs_weight<4,32>(x,q,bases,metadata,tokens,tasks,weights,out,rows,n,k,experts,taskcount,xrows,weighted,stream);
+  else if (bits==5 && tile==16) launch_xxs_weight<5,16>(x,q,bases,metadata,tokens,tasks,weights,out,rows,n,k,experts,taskcount,xrows,weighted,stream);
+  else if (bits==5) launch_xxs_weight<5,32>(x,q,bases,metadata,tokens,tasks,weights,out,rows,n,k,experts,taskcount,xrows,weighted,stream);
+  else if (bits==2 && tile==16) launch_xxs_weight<2,16>(x,q,bases,metadata,tokens,tasks,weights,out,rows,n,k,experts,taskcount,xrows,weighted,stream);
   else if (bits==2) launch_xxs_weight<2,32>(x,q,bases,metadata,tokens,tasks,weights,out,rows,n,k,experts,taskcount,xrows,weighted,stream);
   else if (tile==16) launch_xxs_weight<3,16>(x,q,bases,metadata,tokens,tasks,weights,out,rows,n,k,experts,taskcount,xrows,weighted,stream);
   else launch_xxs_weight<3,32>(x,q,bases,metadata,tokens,tasks,weights,out,rows,n,k,experts,taskcount,xrows,weighted,stream);

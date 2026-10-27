@@ -35,9 +35,14 @@ def main(args):
         k, n = item["dims"][:2]
         formats[name] = item["type"]
         iq = item["type"] != "MXFP4"
-        block_bytes = {"IQ2_XS": 74, "IQ2_XXS": 66, "IQ3_XXS": 98, "MXFP4": 17}[
-            item["type"]
-        ]
+        block_bytes = {
+            "IQ2_XS": 74,
+            "IQ2_XXS": 66,
+            "IQ3_XXS": 98,
+            "IQ2_S": 82,
+            "IQ3_S": 110,
+            "MXFP4": 17,
+        }[item["type"]]
         raw = (
             np.frombuffer(data, dtype=np.uint8)
             .copy()
@@ -70,6 +75,17 @@ def main(args):
             if kind == "IQ2_XS":
                 codes = raw[..., 2:66].contiguous().view(torch.int16).flatten(1)
                 metadata = raw[..., 66:].contiguous().flatten(1)
+            elif kind == "IQ2_S":
+                codes = raw[..., 2:34].contiguous().flatten(1)
+                highscale = torch.stack((raw[..., 66:74], raw[..., 74:82]), -1).flatten(
+                    -2
+                )
+                metadata = torch.cat((raw[..., 34:66], highscale), -1).flatten(1)
+            elif kind == "IQ3_S":
+                codes = raw[..., 2:66].contiguous().flatten(1)
+                metadata = torch.cat(
+                    (raw[..., 74:106], raw[..., 66:74], raw[..., 106:110]), -1
+                ).flatten(1)
             elif kind == "IQ2_XXS":
                 chunks = raw[..., 2:].reshape(*raw.shape[:2], 8, 8)
                 codes = chunks[..., :4].contiguous().flatten(1)
@@ -189,7 +205,12 @@ def main(args):
             if first_format == "IQ2_XS":
                 ops.gguf_iq2_xs_routed_mm(x, *packed13, tokens, tasks, projected, tile)
             else:
-                ops.gguf_iq_xxs_routed_mm(
+                op = (
+                    ops.gguf_iq_s_routed_mm
+                    if first_format.endswith("_S")
+                    else ops.gguf_iq_xxs_routed_mm
+                )
+                op(
                     x,
                     *packed13,
                     tokens,
@@ -206,7 +227,12 @@ def main(args):
                     hidden, *packed2, identity, tasks, weights, contributions, tile
                 )
             else:
-                ops.gguf_iq_xxs_routed_mm(
+                op = (
+                    ops.gguf_iq_s_routed_mm
+                    if second_format.endswith("_S")
+                    else ops.gguf_iq_xxs_routed_mm
+                )
+                op(
                     hidden,
                     *packed2,
                     identity,

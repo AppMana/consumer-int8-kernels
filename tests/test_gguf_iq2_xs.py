@@ -179,14 +179,21 @@ def test_q8_expand_grouped_blas_graph(api, group_major):
         ("IQ2_XXS", "IQ2_XXS"),
         ("IQ2_XXS", "IQ3_XXS"),
         ("IQ3_XXS", "IQ3_XXS"),
+        ("IQ2_S", "MXFP4"),
+        ("IQ2_S", "IQ3_S"),
+        ("IQ3_XXS", "IQ3_S"),
     ],
 )
 def test_mixed_iq_mx_chain_graph(api, tile_rows, first_format, second_format):
     gguf = pytest.importorskip("gguf")
     rng = np.random.default_rng(374)
     experts, h, intermediate, count, topk = 3, 256, 256, 19, 2
-    first_bytes = {"IQ2_XS": 74, "IQ2_XXS": 66, "IQ3_XXS": 98}[first_format]
-    second_bytes = {"MXFP4": 17, "IQ2_XXS": 66, "IQ3_XXS": 98}[second_format]
+    first_bytes = {"IQ2_XS": 74, "IQ2_XXS": 66, "IQ3_XXS": 98, "IQ2_S": 82}[
+        first_format
+    ]
+    second_bytes = {"MXFP4": 17, "IQ2_XXS": 66, "IQ3_XXS": 98, "IQ3_S": 110}[
+        second_format
+    ]
     first = rng.integers(
         0, 256, (experts, 2 * intermediate, h // 256, first_bytes), dtype=np.uint8
     )
@@ -211,9 +218,8 @@ def test_mixed_iq_mx_chain_graph(api, tile_rows, first_format, second_format):
         second[..., :2] = np.full((*second.shape[:-1], 1), 0.01, dtype=np.float16).view(
             np.uint8
         )
-        packed2 = api.pack_iq_xxs(
-            torch.from_numpy(second).cuda(), int(second_format[2])
-        )
+        pack = api.pack_iq_s if second_format.endswith("_S") else api.pack_iq_xxs
+        packed2 = pack(torch.from_numpy(second).cuda(), int(second_format[2]))
     w13 = (
         torch.from_numpy(
             gguf.dequantize(
@@ -237,7 +243,9 @@ def test_mixed_iq_mx_chain_graph(api, tile_rows, first_format, second_format):
     packed13 = (
         api.pack_iq2_xs(torch.from_numpy(first).cuda())
         if first_format == "IQ2_XS"
-        else api.pack_iq_xxs(torch.from_numpy(first).cuda(), int(first_format[2]))
+        else (api.pack_iq_s if first_format.endswith("_S") else api.pack_iq_xxs)(
+            torch.from_numpy(first).cuda(), int(first_format[2])
+        )
     )
     routes = count * topk + experts * (tile_rows - 1)
     x = torch.randn(count, h, device="cuda", dtype=torch.bfloat16) * 20
@@ -407,21 +415,26 @@ def test_device_route_plan_graph(api, count, experts, tile):
 @pytest.mark.parametrize("tile", [16, 32])
 @pytest.mark.parametrize("k", [768, 2304, 5120])
 @pytest.mark.parametrize("weighted", [False, True])
-def test_xxs_routed_oracle_graph(api, bits, tile, k, weighted):
+@pytest.mark.parametrize("family", ["XXS", "S"])
+def test_xxs_routed_oracle_graph(api, bits, tile, k, weighted, family):
     gguf = pytest.importorskip("gguf")
     rng = np.random.default_rng(948)
     experts, n, capacity = 3, 37, 64
-    block_bytes = 66 if bits == 2 else 98
+    block_bytes = (
+        (66 if bits == 2 else 98) if family == "XXS" else (82 if bits == 2 else 110)
+    )
     raw = rng.integers(0, 256, (experts, n, k // 256, block_bytes), dtype=np.uint8)
     raw[..., :2] = (
         rng.uniform(-0.01, 0.01, (*raw.shape[:-1], 1)).astype(np.float16).view(np.uint8)
     )
     dense = gguf.dequantize(
         raw.reshape(-1, block_bytes),
-        getattr(gguf.GGMLQuantizationType, f"IQ{bits}_XXS"),
+        getattr(gguf.GGMLQuantizationType, f"IQ{bits}_{family}"),
     )
     dense = torch.from_numpy(dense.reshape(experts, n, k)).cuda().bfloat16()
-    packed = api.pack_iq_xxs(torch.from_numpy(raw).cuda(), bits)
+    pack = api.pack_iq_xxs if family == "XXS" else api.pack_iq_s
+    op = api.iq_xxs_routed_mm if family == "XXS" else api.iq_s_routed_mm
+    packed = pack(torch.from_numpy(raw).cuda(), bits)
     x = torch.randn(27, k, device="cuda", dtype=torch.bfloat16)
     tokens = torch.randint(
         -1, 27, (experts * capacity,), device="cuda", dtype=torch.int32
@@ -439,9 +452,7 @@ def test_xxs_routed_oracle_graph(api, bits, tile, k, weighted):
     out = torch.empty(experts * capacity, n, device="cuda", dtype=torch.bfloat16)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        api.iq_xxs_routed_mm(
-            x, *packed, tokens, tasks, weights, out, bits, tile, weighted
-        )
+        op(x, *packed, tokens, tasks, weights, out, bits, tile, weighted)
     for trial in range(3):
         x.mul_(0.75)
         weights.mul_(0.8)

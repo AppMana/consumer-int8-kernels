@@ -181,6 +181,7 @@ void boxed_iq2_xs_routed(StableIValue* stack, uint64_t, uint64_t) {
   auto error=cudaGetLastError();
   STD_TORCH_CHECK(error==cudaSuccess,cudaGetErrorString(error));
 }
+template<bool Small>
 void boxed_iq_xxs_routed(StableIValue* stack, uint64_t, uint64_t) {
   int64_t tile_rows=to<int64_t>(stack[9]);
   int64_t bits=to<int64_t>(stack[8]);
@@ -197,7 +198,7 @@ void boxed_iq_xxs_routed(StableIValue* stack, uint64_t, uint64_t) {
   }
   STD_TORCH_CHECK(x.is_contiguous() && x.scalar_type()==ScalarType::BFloat16 &&
       q.scalar_type()==ScalarType::Byte && d.scalar_type()==ScalarType::Half &&
-      s.scalar_type()==ScalarType::Int && weights.scalar_type()==ScalarType::Float && tokens.scalar_type()==ScalarType::Int &&
+      s.scalar_type()==(Small ? ScalarType::Byte : ScalarType::Int) && weights.scalar_type()==ScalarType::Float && tokens.scalar_type()==ScalarType::Int &&
       tasks.scalar_type()==ScalarType::Int && out.scalar_type()==ScalarType::BFloat16,
       "Invalid routed IQ_XXS dtype or activation layout");
   STD_TORCH_CHECK(x.dim()==2 && q.dim()==3 && d.dim()==3 && s.dim()==3 &&
@@ -205,7 +206,7 @@ void boxed_iq_xxs_routed(StableIValue* stack, uint64_t, uint64_t) {
   STD_TORCH_CHECK(x.size(1)>0 && x.size(1)%256==0 && q.size(2)==x.size(1)/(bits==2 ? 8 : 4) &&
       d.size(0)==q.size(0) && d.size(1)==q.size(1) &&
       d.size(2)==((x.size(1)/256+1)&~int64_t(1)) && s.size(0)==q.size(0) &&
-      s.size(1)==q.size(1) && s.size(2)==x.size(1)/32 && tasks.size(1)==2 &&
+      s.size(1)==q.size(1) && s.size(2)==(Small ? (x.size(1)/256)*(bits==2 ? 48 : 44) : x.size(1)/32) && tasks.size(1)==2 &&
       out.size(0)==tokens.size(0) && out.size(1)==q.size(1), "Invalid routed IQ_XXS shapes");
   STD_TORCH_CHECK(tasks.size(0)<=65535 && x.size(0)<=2147483647 &&
       tokens.size(0)<=2147483632 && x.size(1)<=2147483392 && q.size(0)<=2147483647 &&
@@ -224,7 +225,7 @@ void boxed_iq_xxs_routed(StableIValue* stack, uint64_t, uint64_t) {
   gguf_iq_xxs_routed_mm(x.data_ptr(),static_cast<const uint8_t*>(q.data_ptr()),d.data_ptr(),
       static_cast<const uint8_t*>(s.data_ptr()),static_cast<const int32_t*>(tokens.data_ptr()),
       static_cast<const int32_t*>(tasks.data_ptr()),static_cast<const float*>(weights.data_ptr()),out.data_ptr(),tokens.size(0),q.size(1),
-      x.size(1),q.size(0),tasks.size(0),x.size(0),bits,tile_rows,weighted,reinterpret_cast<cudaStream_t>(stream));
+      x.size(1),q.size(0),tasks.size(0),x.size(0),bits+(Small ? 2 : 0),tile_rows,weighted,reinterpret_cast<cudaStream_t>(stream));
   auto error=cudaGetLastError();
   STD_TORCH_CHECK(error==cudaSuccess,cudaGetErrorString(error));
 }
@@ -403,6 +404,7 @@ void boxed_plan_routes(StableIValue* stack,uint64_t,uint64_t) {
 
 }
 STABLE_TORCH_LIBRARY_FRAGMENT(consumer_int8, m) {
+  m.def("gguf_iq_s_routed_mm(Tensor x, Tensor codes, Tensor bases, Tensor metadata, Tensor tokens, Tensor tasks, Tensor weights, Tensor(a!) out, int bits, int tile_rows=16, bool weighted=False) -> ()");
   m.def("gguf_iq_xxs_routed_mm(Tensor x, Tensor codes, Tensor bases, Tensor metadata, Tensor tokens, Tensor tasks, Tensor weights, Tensor(a!) out, int bits, int tile_rows=16, bool weighted=False) -> ()");
   m.def("gguf_plan_routes(Tensor ids, Tensor top_weights, Tensor expert_map, Tensor(a!) info, Tensor(b!) tokens, Tensor(c!) weights, Tensor(d!) inverse, Tensor(e!) tasks, int tile_rows=16) -> ()");
   m.def("gguf_mxfp4_routed_weighted_mm(Tensor x, Tensor codes, Tensor scales, Tensor tokens, Tensor tasks, Tensor weights, Tensor(a!) out, int tile_rows=16) -> ()");
@@ -416,7 +418,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(consumer_int8, m) {
   m.def("gguf_q8_mm(Tensor x, Tensor weight, Tensor(a!) out) -> ()");
 }
 STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
-  m.impl("gguf_iq_xxs_routed_mm", &boxed_iq_xxs_routed);
+  m.impl("gguf_iq_xxs_routed_mm", &boxed_iq_xxs_routed<false>);
+  m.impl("gguf_iq_s_routed_mm", &boxed_iq_xxs_routed<true>);
   m.impl("gguf_plan_routes", &boxed_plan_routes);
   m.impl("gguf_mxfp4_routed_weighted_mm", &boxed_mxfp4_routed<true>);
   m.impl("gguf_swiglu", &boxed_swiglu);
