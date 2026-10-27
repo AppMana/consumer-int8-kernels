@@ -86,6 +86,10 @@ def main(args):
     call = lib.iq2xxs_routed_int8
     call.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 7 + [ctypes.c_void_p]
     call.restype = ctypes.c_int
+    if args.aligned_loads:
+        half_call = lib.iq2xxs_routed_int8_half
+        half_call.argtypes = call.argtypes
+        half_call.restype = ctypes.c_int
     flush = torch.empty(64 << 20, device="cuda", dtype=torch.uint8)
     with args.output.open("x") as report:
         for count in args.tokens:
@@ -100,6 +104,8 @@ def main(args):
             slots = [np.where(ids == first + e)[0] for e in range(experts)]
             graphs, owners, errors, capacities = {}, [], {}, {}
             variants = [("int8", t) for t in (16, 32, 64)]
+            if args.aligned_loads:
+                variants += [("half", t) for t in (16, 32, 64)]
             if args.native_library:
                 variants += [("bf16", t) for t in (16, 32)]
             for backend, tile in variants:
@@ -118,6 +124,7 @@ def main(args):
                     rows=len(tokens), tasks=len(tasks), live=sum(map(len, slots))
                 )
 
+                selected_call = half_call if backend == "half" else call
                 weights = torch.ones(len(tokens), device="cuda")
 
                 def run(
@@ -131,6 +138,7 @@ def main(args):
                     count=count,
                     backend=backend,
                     weights=weights,
+                    selected_call=selected_call,
                 ):
                     if backend == "bf16":
                         torch.ops.consumer_int8.gguf_iq_xxs_routed_mm(
@@ -148,7 +156,7 @@ def main(args):
                         )
                         return
                     assert (
-                        call(
+                        selected_call(
                             *[v.data_ptr() for v in (x, a, sa, raw, token, task, out)],
                             count,
                             out.shape[0],
@@ -188,7 +196,7 @@ def main(args):
                     graph.replay()
                     assert torch.isfinite(out).all()
                     assert (out[token < 0] == 0).all()
-                    if backend == "int8":
+                    if backend != "bf16":
                         xb = x.float().reshape(count, k // 32, 32)
                         expected = (xb.abs().amax(-1) / 127).clamp_min(1e-20)
                         torch.testing.assert_close(sa, expected, rtol=1e-6, atol=0)
@@ -256,6 +264,7 @@ if __name__ == "__main__":
     source.add_argument("--checkpoint", type=Path)
     source.add_argument("--manifest", type=Path)
     p.add_argument("--library", type=Path, required=True)
+    p.add_argument("--aligned-loads", action="store_true")
     p.add_argument("--native-library", type=Path)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--tensor", default="blk.2.ffn_gate_exps.weight")
