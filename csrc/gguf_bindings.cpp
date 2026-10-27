@@ -21,6 +21,10 @@ void gguf_iq2_xs_routed_mm(const void*, const int8_t*, const void*, const uint8_
 void gguf_q8_expand(const int8_t*,const void*,void*,int64_t,cudaStream_t);
 void gguf_mxfp4_routed_mm(const void*,const uint8_t*,const uint8_t*,const int32_t*,
     const int32_t*,void*,int,int,int,int,int,int,int,cudaStream_t);
+void gguf_mxfp4_routed_weighted_mm(const void*,const uint8_t*,const uint8_t*,const int32_t*,
+    const int32_t*,const float*,void*,int,int,int,int,int,int,int,cudaStream_t);
+void gguf_swiglu(const void*,void*,int64_t,int,float,cudaStream_t);
+void gguf_route_reduce(const void*,const int32_t*,void*,int64_t,int,int,int,cudaStream_t);
 namespace {
 void boxed_q8(StableIValue* stack, uint64_t, uint64_t) {
   auto x = to<Tensor>(stack[0]), w = to<Tensor>(stack[1]), y = to<Tensor>(stack[2]);
@@ -173,11 +177,12 @@ void boxed_iq2_xs_routed(StableIValue* stack, uint64_t, uint64_t) {
   auto error=cudaGetLastError();
   STD_TORCH_CHECK(error==cudaSuccess,cudaGetErrorString(error));
 }
+template<bool Weighted>
 void boxed_mxfp4_routed(StableIValue* stack, uint64_t, uint64_t) {
-  int64_t tile_rows=to<int64_t>(stack[6]);
+  int64_t tile_rows=to<int64_t>(stack[Weighted ? 7 : 6]);
   STD_TORCH_CHECK(tile_rows==16 || tile_rows==32, "Routed MXFP4 tile must be 16 or 32");
   auto x=to<Tensor>(stack[0]), q=to<Tensor>(stack[1]), s=to<Tensor>(stack[2]);
-  auto tokens=to<Tensor>(stack[3]), tasks=to<Tensor>(stack[4]), out=to<Tensor>(stack[5]);
+  auto tokens=to<Tensor>(stack[3]), tasks=to<Tensor>(stack[4]), out=to<Tensor>(stack[Weighted ? 6 : 5]);
   STD_TORCH_CHECK(x.is_cuda(), "Routed MXFP4 requires CUDA");
   for (const auto& tensor : {q,s,tokens,tasks,out}) {
     STD_TORCH_CHECK(tensor.is_cuda() && tensor.get_device_index()==x.get_device_index() &&
@@ -206,10 +211,23 @@ void boxed_mxfp4_routed(StableIValue* stack, uint64_t, uint64_t) {
   torch::stable::accelerator::DeviceGuard guard(device);
   void* stream=nullptr;
   TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device,&stream));
+  if constexpr (Weighted) {
+    auto weights=to<Tensor>(stack[5]);
+    STD_TORCH_CHECK(weights.is_cuda() && weights.get_device_index()==device &&
+        weights.scalar_type()==ScalarType::Float && weights.dim()==1 &&
+        weights.numel()==tokens.numel() && weights.is_contiguous() &&
+        weights.data_ptr()!=out.data_ptr(), "Invalid routed MXFP4 weights");
+    gguf_mxfp4_routed_weighted_mm(x.data_ptr(),static_cast<const uint8_t*>(q.data_ptr()),
+        static_cast<const uint8_t*>(s.data_ptr()),static_cast<const int32_t*>(tokens.data_ptr()),
+        static_cast<const int32_t*>(tasks.data_ptr()),static_cast<const float*>(weights.data_ptr()),
+        out.data_ptr(),tokens.size(0),q.size(1),x.size(1),q.size(0),tasks.size(0),
+        x.size(0),tile_rows,reinterpret_cast<cudaStream_t>(stream));
+  } else {
   gguf_mxfp4_routed_mm(x.data_ptr(),static_cast<const uint8_t*>(q.data_ptr()),
       static_cast<const uint8_t*>(s.data_ptr()),static_cast<const int32_t*>(tokens.data_ptr()),
       static_cast<const int32_t*>(tasks.data_ptr()),out.data_ptr(),tokens.size(0),q.size(1),
       x.size(1),q.size(0),tasks.size(0),x.size(0),tile_rows,reinterpret_cast<cudaStream_t>(stream));
+  }
   auto error=cudaGetLastError();
   STD_TORCH_CHECK(error==cudaSuccess,cudaGetErrorString(error));
 }
@@ -242,8 +260,55 @@ void boxed_q8_expand(StableIValue* stack,uint64_t,uint64_t) {
   STD_TORCH_CHECK(error==cudaSuccess,cudaGetErrorString(error));
 }
 
+void boxed_swiglu(StableIValue* stack,uint64_t,uint64_t) {
+  auto x=to<Tensor>(stack[0]), out=to<Tensor>(stack[1]);
+  double limit=to<double>(stack[2]);
+  STD_TORCH_CHECK(x.is_cuda() && out.is_cuda() && x.get_device_index()==out.get_device_index() &&
+      x.scalar_type()==ScalarType::BFloat16 && out.scalar_type()==ScalarType::BFloat16 &&
+      x.is_contiguous() && out.is_contiguous() && x.dim()==2 && out.dim()==2,
+      "SwiGLU requires contiguous BF16 matrices on one CUDA device");
+  STD_TORCH_CHECK(x.size(0)==out.size(0) && x.size(1)==2*out.size(1) &&
+      out.size(1)>0 && out.size(1)<=2147483647 && limit>0 && limit<=1e30,
+      "Invalid SwiGLU shape or limit");
+  if (!out.numel()) return;
+  STD_TORCH_CHECK(x.data_ptr()!=out.data_ptr(), "SwiGLU output must not alias input");
+  int device=x.get_device_index();
+  torch::stable::accelerator::DeviceGuard guard(device);
+  void* stream=nullptr;
+  TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device,&stream));
+  gguf_swiglu(x.data_ptr(),out.data_ptr(),out.size(0),out.size(1),limit,reinterpret_cast<cudaStream_t>(stream));
+  auto error=cudaGetLastError();
+  STD_TORCH_CHECK(error==cudaSuccess,cudaGetErrorString(error));
+}
+void boxed_route_reduce(StableIValue* stack,uint64_t,uint64_t) {
+  auto x=to<Tensor>(stack[0]), indices=to<Tensor>(stack[1]), out=to<Tensor>(stack[2]);
+  STD_TORCH_CHECK(x.is_cuda() && indices.is_cuda() && out.is_cuda() &&
+      x.get_device_index()==indices.get_device_index() && x.get_device_index()==out.get_device_index() &&
+      x.scalar_type()==ScalarType::BFloat16 && indices.scalar_type()==ScalarType::Int &&
+      out.scalar_type()==ScalarType::BFloat16 && x.is_contiguous() && indices.is_contiguous() &&
+      out.is_contiguous() && x.dim()==2 && indices.dim()==2 && out.dim()==2,
+      "Invalid route reduction tensors");
+  STD_TORCH_CHECK(indices.size(0)==out.size(0) && x.size(1)==out.size(1) &&
+      x.size(0)<=2147483647 && x.size(1)>0 && x.size(1)<=2147483647 &&
+      indices.size(1)>0 && indices.size(1)<=2147483647, "Invalid route reduction shape");
+  if (!out.numel()) return;
+  STD_TORCH_CHECK(x.data_ptr()!=out.data_ptr() && indices.data_ptr()!=out.data_ptr(),
+      "Route reduction output must not alias inputs");
+  int device=x.get_device_index();
+  torch::stable::accelerator::DeviceGuard guard(device);
+  void* stream=nullptr;
+  TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device,&stream));
+  gguf_route_reduce(x.data_ptr(),static_cast<const int32_t*>(indices.data_ptr()),out.data_ptr(),
+      out.size(0),out.size(1),indices.size(1),x.size(0),reinterpret_cast<cudaStream_t>(stream));
+  auto error=cudaGetLastError();
+  STD_TORCH_CHECK(error==cudaSuccess,cudaGetErrorString(error));
+}
+
 }
 STABLE_TORCH_LIBRARY_FRAGMENT(consumer_int8, m) {
+  m.def("gguf_mxfp4_routed_weighted_mm(Tensor x, Tensor codes, Tensor scales, Tensor tokens, Tensor tasks, Tensor weights, Tensor(a!) out, int tile_rows=16) -> ()");
+  m.def("gguf_swiglu(Tensor x, Tensor(a!) out, float limit=10.) -> ()");
+  m.def("gguf_route_reduce(Tensor contributions, Tensor rows, Tensor(a!) out) -> ()");
   m.def("gguf_mxfp4_routed_mm(Tensor x, Tensor codes, Tensor scales, Tensor tokens, Tensor tasks, Tensor(a!) out, int tile_rows=16) -> ()");
   m.def("gguf_q8_expand(Tensor codes, Tensor scales, Tensor(a!) out) -> ()");
   m.def("gguf_iq2_xs_routed_mm(Tensor x, Tensor codes, Tensor bases, Tensor scales, Tensor tokens, Tensor tasks, Tensor(a!) out, int tile_rows=16) -> ()");
@@ -252,7 +317,10 @@ STABLE_TORCH_LIBRARY_FRAGMENT(consumer_int8, m) {
   m.def("gguf_q8_mm(Tensor x, Tensor weight, Tensor(a!) out) -> ()");
 }
 STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
-  m.impl("gguf_mxfp4_routed_mm", &boxed_mxfp4_routed);
+  m.impl("gguf_mxfp4_routed_weighted_mm", &boxed_mxfp4_routed<true>);
+  m.impl("gguf_swiglu", &boxed_swiglu);
+  m.impl("gguf_route_reduce", &boxed_route_reduce);
+  m.impl("gguf_mxfp4_routed_mm", &boxed_mxfp4_routed<false>);
   m.impl("gguf_q8_expand", &boxed_q8_expand);
   m.impl("gguf_iq2_xs_routed_mm", &boxed_iq2_xs_routed);
   m.impl("gguf_iq2_xs_mm", &boxed_iq2_xs);

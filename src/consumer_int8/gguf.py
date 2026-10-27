@@ -147,3 +147,61 @@ def pack_mxfp4(raw):
     if raw.shape[-1] != 17 or min(raw.shape) <= 0 or raw.shape[-2] % 4:
         raise ValueError("MXFP4 requires positive dimensions and K divisible by 128")
     return raw[..., 1:].contiguous().flatten(2), raw[..., 0].contiguous()
+
+
+mxfp4_routed_weighted_mm = torch.ops.consumer_int8.gguf_mxfp4_routed_weighted_mm
+swiglu = torch.ops.consumer_int8.gguf_swiglu
+route_reduce = torch.ops.consumer_int8.gguf_route_reduce
+
+
+@torch.library.register_fake("consumer_int8::gguf_mxfp4_routed_weighted_mm")
+def _mxfp4_weighted_fake(x, codes, scales, tokens, tasks, weights, out, tile_rows=16):
+    return None
+
+
+@torch.library.register_fake("consumer_int8::gguf_swiglu")
+def _swiglu_fake(x, out, limit=10.0):
+    return None
+
+
+@torch.library.register_fake("consumer_int8::gguf_route_reduce")
+def _route_reduce_fake(contributions, rows, out):
+    return None
+
+
+def mixed_iq2_xs_mxfp4(
+    x,
+    packed_gate_up,
+    packed_down,
+    tokens,
+    identity_rows,
+    tasks,
+    weights,
+    inverse_routes,
+    projected,
+    hidden,
+    contributions,
+    out,
+    *,
+    tile_rows=16,
+    swiglu_limit=10.0,
+):
+    """Execute one local mixed expert partition using caller-owned buffers.
+
+    Gate/up rows are concatenated in that order. Projected BF16 values feed
+    FP32 clipped SwiGLU with one BF16 intermediate rounding. Down accumulators
+    are weighted in FP32 before BF16 contribution rounding; inverse_routes
+    [tokens,topk] selects contributions for deterministic FP32 summation.
+    Negative inverse entries omit remote experts. No collective is performed.
+
+    Tasks and tokens follow iq2_xs_routed_mm's disjoint padded-row contract.
+    identity_rows maps each down-input route row to itself. All scratch and
+    outputs must be disjoint and prepared before capture. Routing construction
+    is separate; this function performs no allocation or host synchronization.
+    """
+    iq2_xs_routed_mm(x, *packed_gate_up, tokens, tasks, projected, tile_rows)
+    swiglu(projected, hidden, swiglu_limit)
+    mxfp4_routed_weighted_mm(
+        hidden, *packed_down, identity_rows, tasks, weights, contributions, tile_rows
+    )
+    route_reduce(contributions, inverse_routes, out)

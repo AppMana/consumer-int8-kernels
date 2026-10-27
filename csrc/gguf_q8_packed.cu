@@ -106,11 +106,12 @@ __device__ __forceinline__ uint32_t decode_mx_pair(Storage<false,TM,true>& s,
   auto value=__floats2bfloat162_rn(v0,v1);
   return (*reinterpret_cast<uint32_t*>(&value)) ^ ((c0&8)<<12) ^ ((c1&8)<<28);
 }
-template<bool IQ, int TM=32, bool Routed=false, bool MX=false>
+template<bool IQ, int TM=32, bool Routed=false, bool MX=false, bool Weighted=false>
 __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
     const __half* scales, const uint8_t* iq_scales, __nv_bfloat16* y, int m, int n, int k, int groups,
     int64_t xs, int64_t xg, const int32_t* tokens=nullptr,
-    const int32_t* tasks=nullptr, int xrows=0, int experts=0) {
+    const int32_t* tasks=nullptr, int xrows=0, int experts=0,
+    const float* route_weights=nullptr) {
   const int group=Routed ? tasks[blockIdx.y*2] : int(blockIdx.z);
   const int rowbase=Routed ? tasks[blockIdx.y*2+1] : int(blockIdx.y)*TM;
   if constexpr (Routed) {
@@ -199,12 +200,17 @@ __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
       int col=blockIdx.x*BN+(warp%4)*16+nn*8+(lane%4)*2;
       if (row<m && col<n) {
         int64_t dst=(int64_t(row)*groups+(Routed ? 0 : group))*n+col;
+        float v0=acc[nn][r*2], v1=acc[nn][r*2+1];
+        if constexpr (Weighted) {
+          float weight=route_weights[row];
+          v0*=weight; v1*=weight;
+        }
         if (col+1<n && (dst%2)==0)
           *reinterpret_cast<__nv_bfloat162*>(y+dst)=
-              __floats2bfloat162_rn(acc[nn][r*2],acc[nn][r*2+1]);
+              __floats2bfloat162_rn(v0,v1);
         else {
-          y[dst]=__float2bfloat16_rn(acc[nn][r*2]);
-          if (col+1<n) y[dst+1]=__float2bfloat16_rn(acc[nn][r*2+1]);
+          y[dst]=__float2bfloat16_rn(v0);
+          if (col+1<n) y[dst+1]=__float2bfloat16_rn(v1);
         }
       }
     }
@@ -281,4 +287,56 @@ void gguf_mxfp4_routed_mm(const void* x,const uint8_t* q,const uint8_t* scales,
         static_cast<const __nv_bfloat16*>(x),reinterpret_cast<const int8_t*>(q),nullptr,scales,
         static_cast<__nv_bfloat16*>(y),rows,n,k,1,k,0,tokens,tasks,xrows,experts);
   }
+}
+
+void gguf_mxfp4_routed_weighted_mm(const void* x,const uint8_t* q,const uint8_t* scales,
+    const int32_t* tokens,const int32_t* tasks,const float* weights,void* y,
+    int rows,int n,int k,int experts,int taskcount,int xrows,int tile_rows,cudaStream_t stream) {
+  if (!rows || !n || !taskcount) return;
+  if (tile_rows==32) {
+    packed_mm<false,32,true,true,true><<<dim3((n+BN-1)/BN,taskcount),256,0,stream>>>(
+        static_cast<const __nv_bfloat16*>(x),reinterpret_cast<const int8_t*>(q),nullptr,scales,
+        static_cast<__nv_bfloat16*>(y),rows,n,k,1,k,0,tokens,tasks,xrows,experts,weights);
+  } else {
+    packed_mm<false,16,true,true,true><<<dim3((n+BN-1)/BN,taskcount),128,0,stream>>>(
+        static_cast<const __nv_bfloat16*>(x),reinterpret_cast<const int8_t*>(q),nullptr,scales,
+        static_cast<__nv_bfloat16*>(y),rows,n,k,1,k,0,tokens,tasks,xrows,experts,weights);
+  }
+}
+namespace {
+__global__ void swiglu(const __nv_bfloat16* x,__nv_bfloat16* out,int64_t count,int width,float limit) {
+  for (int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;
+       i+=int64_t(gridDim.x)*blockDim.x) {
+    int64_t source=(i/width)*(2*int64_t(width))+i%width;
+    float gate=fminf(__bfloat162float(x[source]),limit);
+    float up=fminf(fmaxf(__bfloat162float(x[source+width]),-limit),limit);
+    out[i]=__float2bfloat16_rn((gate/(1.f+expf(-gate)))*up);
+  }
+}
+__global__ void route_reduce(const __nv_bfloat16* contributions,const int32_t* rows,
+    __nv_bfloat16* out,int64_t count,int width,int topk,int routes) {
+  for (int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;
+       i+=int64_t(gridDim.x)*blockDim.x) {
+    int64_t token=i/width;
+    int col=i%width;
+    float sum=0;
+    for (int slot=0;slot<topk;++slot) {
+      int row=rows[token*topk+slot];
+      if (row>=0 && row<routes) sum+=__bfloat162float(contributions[int64_t(row)*width+col]);
+    }
+    out[i]=__float2bfloat16_rn(sum);
+  }
+}
+int post_blocks(int64_t count) { return int((count+255)/256>65535 ? 65535 : (count+255)/256); }
+}
+void gguf_swiglu(const void* x,void* out,int64_t rows,int width,float limit,cudaStream_t stream) {
+  if (!rows || !width) return;
+  swiglu<<<post_blocks(rows*width),256,0,stream>>>(static_cast<const __nv_bfloat16*>(x),
+      static_cast<__nv_bfloat16*>(out),rows*width,width,limit);
+}
+void gguf_route_reduce(const void* x,const int32_t* indices,void* out,
+    int64_t tokens,int width,int topk,int routes,cudaStream_t stream) {
+  if (!tokens || !width) return;
+  route_reduce<<<post_blocks(tokens*width),256,0,stream>>>(static_cast<const __nv_bfloat16*>(x),
+      indices,static_cast<__nv_bfloat16*>(out),tokens*width,width,topk,routes);
 }
