@@ -124,3 +124,26 @@ def q8_expand_mm(x, codes, scales, weight_workspace, out):
     torch.bmm(
         x.transpose(0, 1), weight_workspace.transpose(1, 2), out=out.transpose(0, 1)
     )
+
+
+mxfp4_routed_mm = torch.ops.consumer_int8.gguf_mxfp4_routed_mm
+
+
+@torch.library.register_fake("consumer_int8::gguf_mxfp4_routed_mm")
+def _mxfp4_routed_fake(x, codes, scales, tokens, tasks, out, tile_rows=16):
+    return None
+
+
+def pack_mxfp4(raw):
+    """Separate original GGUF MXFP4 [G,N,K/32,17] bytes without requantizing.
+
+    Low/high nibbles retain the GGUF split-half layout, not adjacent E2M1
+    ordering. This is MXFP4 with E8M0 scales, not NVFP4 with E4M3 scales.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("MXFP4 packing must precede graph capture")
+    if not raw.is_cuda or raw.dtype != torch.uint8 or raw.ndim != 4:
+        raise ValueError("Expected CUDA uint8 MXFP4 blocks [G,N,K/32,17]")
+    if raw.shape[-1] != 17 or min(raw.shape) <= 0 or raw.shape[-2] % 4:
+        raise ValueError("MXFP4 requires positive dimensions and K divisible by 128")
+    return raw[..., 1:].contiguous().flatten(2), raw[..., 0].contiguous()

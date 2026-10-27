@@ -20,15 +20,15 @@ __device__ __forceinline__ void copy4(void* dst, const void* src, bool valid) {
   asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::
       "r"(address), "l"(src), "r"(valid ? 4 : 0));
 }
-template<bool IQ, int TM> struct Storage {
+template<bool IQ, int TM, bool MX=false> struct Storage {
   __nv_bfloat16 a[2][TM*LD];
-  int8_t q[2][BN*(IQ ? BK/4 : BK)];
+  int8_t q[2][BN*(IQ ? BK/4 : MX ? BK/2 : BK)];
   uint8_t iq_scales[2][BN*4];
   __half scales[2][BN*2];
   __nv_bfloat16 b[TM==16 ? 1 : BN*LD];
 };
-template<bool IQ, int TM, bool Routed>
-__device__ __forceinline__ void load(Storage<IQ,TM>& s, int stage, int start,
+template<bool IQ, int TM, bool Routed, bool MX=false>
+__device__ __forceinline__ void load(Storage<IQ,TM,MX>& s, int stage, int start,
     const __nv_bfloat16* x, const int8_t* q, const __half* scales,
     const uint8_t* iq_scales, int m, int n, int k, int64_t xs, int64_t xg,
     int group, int rowbase, const int32_t* tokens, int xrows) {
@@ -49,6 +49,17 @@ __device__ __forceinline__ void load(Storage<IQ,TM>& s, int stage, int start,
       const int dstride=((k/256)+1)&~1;
       auto dp=row<n ? scales+(int64_t(group)*n+row)*dstride+((start/256)&~1) : scales;
       copy4(s.scales[stage]+t*2,dp,row<n);
+      auto sp=row<n ? iq_scales+(int64_t(group)*n+row)*(k/32)+(start/128)*4 : iq_scales;
+      copy4(s.iq_scales[stage]+t*4,sp,row<n);
+    }
+  } else if constexpr (MX) {
+    if (t<BN*2) {
+      row=blockIdx.x*BN+t/2; col=(t%2)*16;
+      auto qp=row<n ? q+(int64_t(group)*n+row)*(k/2)+start/2+col : q;
+      copy16(s.q[stage]+(t/2)*(BK/2)+col,qp,row<n);
+    }
+    if (t<BN) {
+      row=blockIdx.x*BN+t;
       auto sp=row<n ? iq_scales+(int64_t(group)*n+row)*(k/32)+(start/128)*4 : iq_scales;
       copy4(s.iq_scales[stage]+t*4,sp,row<n);
     }
@@ -80,7 +91,22 @@ __device__ __forceinline__ uint32_t decode_iq_pair(Storage<true,TM>& s,
   uint32_t signpair=signs>>(col%8);
   return (*reinterpret_cast<uint32_t*>(&value)) ^ ((signpair*0x40008000u)&0x80008000u);
 }
-template<bool IQ, int TM=32, bool Routed=false>
+template<int TM>
+__device__ __forceinline__ uint32_t decode_mx_pair(Storage<false,TM,true>& s,
+    int stage,int start,int row,int col) {
+  const uint8_t* q=reinterpret_cast<const uint8_t*>(s.q[stage])+row*(BK/2);
+  uint16_t pair=*reinterpret_cast<const uint16_t*>(q+(col/32)*16+col%16);
+  int shift=((col%32)/16)*4;
+  uint32_t c0=(pair>>shift)&15, c1=(pair>>(shift+8))&15;
+  uint32_t e=s.iq_scales[stage][row*4+((start/64)%2)*2+col/32];
+  uint32_t bits=e<2 ? 0x00200000u<<e : (e-1)<<23;
+  float d=__uint_as_float(bits);
+  float v0=d*float((0xc8643210u>>((c0&7)*4))&15);
+  float v1=d*float((0xc8643210u>>((c1&7)*4))&15);
+  auto value=__floats2bfloat162_rn(v0,v1);
+  return (*reinterpret_cast<uint32_t*>(&value)) ^ ((c0&8)<<12) ^ ((c1&8)<<28);
+}
+template<bool IQ, int TM=32, bool Routed=false, bool MX=false>
 __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
     const __half* scales, const uint8_t* iq_scales, __nv_bfloat16* y, int m, int n, int k, int groups,
     int64_t xs, int64_t xg, const int32_t* tokens=nullptr,
@@ -90,7 +116,7 @@ __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
   if constexpr (Routed) {
     if (group<0 || group>=experts || rowbase<0 || rowbase>=m) return;
   }
-  __shared__ __align__(32) Storage<IQ,TM> s;
+  __shared__ __align__(32) Storage<IQ,TM,MX> s;
   __shared__ uint32_t codebook[IQ ? 2048 : 1];
   int t=threadIdx.x, warp=t/32;
   if constexpr (IQ) {
@@ -103,17 +129,20 @@ __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
   }
   float acc[2][4] = {};
   const int lane=t%32;
-  load<IQ,TM,Routed>(s,0,0,x,q,scales,iq_scales,m,n,k,xs,xg,group,rowbase,tokens,xrows);
+  load<IQ,TM,Routed,MX>(s,0,0,x,q,scales,iq_scales,m,n,k,xs,xg,group,rowbase,tokens,xrows);
   asm volatile("cp.async.wait_group 0;");
   __syncthreads();
   for (int start=0, stage=0; start<k; start+=BK, stage^=1) {
-    if (start+BK<k) load<IQ,TM,Routed>(s,stage^1,start+BK,x,q,scales,iq_scales,m,n,k,xs,xg,group,rowbase,tokens,xrows);
+    if (start+BK<k) load<IQ,TM,Routed,MX>(s,stage^1,start+BK,x,q,scales,iq_scales,m,n,k,xs,xg,group,rowbase,tokens,xrows);
     if constexpr (TM!=16) {
     for (int i=t; i<BN*BK/2; i+=TM*8) {
       int row=i/(BK/2), col=(i%(BK/2))*2;
       __nv_bfloat162 value;
       if constexpr (IQ) {
         uint32_t bits=decode_iq_pair(s,codebook,stage,start,row,col);
+        *reinterpret_cast<uint32_t*>(&value)=bits;
+      } else if constexpr (MX) {
+        uint32_t bits=decode_mx_pair(s,stage,start,row,col);
         *reinterpret_cast<uint32_t*>(&value)=bits;
       } else {
         auto pair=*reinterpret_cast<const uint16_t*>(s.q[stage]+row*BK+col);
@@ -138,8 +167,13 @@ __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
         if constexpr (TM==16) {
           int row=(warp%4)*16+nn*8+lane/4;
           int col=kk+(lane%4)*2;
-          b[0]=decode_iq_pair(s,codebook,stage,start,row,col);
-          b[1]=decode_iq_pair(s,codebook,stage,start,row,col+8);
+          if constexpr (MX) {
+            b[0]=decode_mx_pair(s,stage,start,row,col);
+            b[1]=decode_mx_pair(s,stage,start,row,col+8);
+          } else {
+            b[0]=decode_iq_pair(s,codebook,stage,start,row,col);
+            b[1]=decode_iq_pair(s,codebook,stage,start,row,col+8);
+          }
         } else {
         uint32_t bp=static_cast<uint32_t>(__cvta_generic_to_shared(
             s.b+swizzle((warp%4)*16+nn*8+lane%8,kk+((lane/8)%2)*8)));
@@ -232,4 +266,19 @@ void gguf_q8_expand(const int8_t* q,const void* scales,void* out,int64_t element
   if (blocks>65535) blocks=65535;
   q8_expand<<<blocks,256,0,stream>>>(q,static_cast<const __half*>(scales),
       static_cast<__nv_bfloat16*>(out),elements/2);
+}
+
+void gguf_mxfp4_routed_mm(const void* x,const uint8_t* q,const uint8_t* scales,
+    const int32_t* tokens,const int32_t* tasks,void* y,int rows,int n,int k,
+    int experts,int taskcount,int xrows,int tile_rows,cudaStream_t stream) {
+  if (!rows || !n || !taskcount) return;
+  if (tile_rows==32) {
+    packed_mm<false,32,true,true><<<dim3((n+BN-1)/BN,taskcount),256,0,stream>>>(
+        static_cast<const __nv_bfloat16*>(x),reinterpret_cast<const int8_t*>(q),nullptr,scales,
+        static_cast<__nv_bfloat16*>(y),rows,n,k,1,k,0,tokens,tasks,xrows,experts);
+  } else {
+    packed_mm<false,16,true,true><<<dim3((n+BN-1)/BN,taskcount),128,0,stream>>>(
+        static_cast<const __nv_bfloat16*>(x),reinterpret_cast<const int8_t*>(q),nullptr,scales,
+        static_cast<__nv_bfloat16*>(y),rows,n,k,1,k,0,tokens,tasks,xrows,experts);
+  }
 }

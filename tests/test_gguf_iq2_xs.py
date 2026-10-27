@@ -66,19 +66,31 @@ def test_iq2_xs_oracle_graph(api, m, k, group_major):
         assert (out.float() - ref).norm() / ref.norm() < 0.001
 
 
-@pytest.mark.parametrize("k", [768, 5120])
+@pytest.mark.parametrize("k", [768, 2304, 5120])
 @pytest.mark.parametrize("tile_rows", [16, 32])
-def test_routed_tasks_change_during_graph(api, k, tile_rows):
+@pytest.mark.parametrize("quant", ["IQ2_XS", "MXFP4"])
+def test_routed_tasks_change_during_graph(api, k, tile_rows, quant):
     gguf = pytest.importorskip("gguf")
     rng = np.random.default_rng(971)
     g, n = 3, 37
-    raw = rng.integers(0, 256, (g, n, k // 256, 74), dtype=np.uint8)
-    raw[..., :2] = (
-        rng.uniform(-0.01, 0.01, (g, n, k // 256, 1)).astype(np.float16).view(np.uint8)
+    if quant == "IQ2_XS":
+        raw = rng.integers(0, 256, (g, n, k // 256, 74), dtype=np.uint8)
+        raw[..., :2] = (
+            rng.uniform(-0.01, 0.01, (g, n, k // 256, 1))
+            .astype(np.float16)
+            .view(np.uint8)
+        )
+        packed = api.pack_iq2_xs(torch.from_numpy(raw).cuda())
+        op = api.iq2_xs_routed_mm
+    else:
+        raw = rng.integers(0, 256, (g, n, k // 32, 17), dtype=np.uint8)
+        raw[..., 0] = rng.integers(120, 130, (g, n, k // 32), dtype=np.uint8)
+        packed = api.pack_mxfp4(torch.from_numpy(raw).cuda())
+        op = api.mxfp4_routed_mm
+    dense = gguf.dequantize(
+        raw.reshape(-1, raw.shape[-1]), getattr(gguf.GGMLQuantizationType, quant)
     )
-    dense = gguf.dequantize(raw.reshape(-1, 74), gguf.GGMLQuantizationType.IQ2_XS)
     dense = torch.from_numpy(dense.reshape(g, n, k)).cuda().bfloat16()
-    codes, bases, scales = api.pack_iq2_xs(torch.from_numpy(raw).cuda())
     x = torch.randn(29, k, device="cuda", dtype=torch.bfloat16)
     tokens = torch.full((3 * tile_rows + 1,), -1, device="cuda", dtype=torch.int32)
     tokens[:3] = torch.tensor([4, 4, 23], device="cuda", dtype=torch.int32)
@@ -93,7 +105,7 @@ def test_routed_tasks_change_during_graph(api, k, tile_rows):
     out = torch.empty(3 * tile_rows + 1, n, device="cuda", dtype=torch.bfloat16)
 
     def run():
-        api.iq2_xs_routed_mm(x, codes, bases, scales, tokens, tasks, out, tile_rows)
+        op(x, *packed, tokens, tasks, out, tile_rows)
 
     run()
     graph = torch.cuda.CUDAGraph()
