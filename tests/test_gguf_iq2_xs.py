@@ -175,7 +175,7 @@ def test_q8_expand_grouped_blas_graph(api, group_major):
 def test_mixed_iq_mx_chain_graph(api, tile_rows):
     gguf = pytest.importorskip("gguf")
     rng = np.random.default_rng(374)
-    experts, h, intermediate, count, topk, capacity = 3, 256, 128, 19, 2, 32
+    experts, h, intermediate, count, topk = 3, 256, 128, 19, 2
     first = rng.integers(
         0, 256, (experts, 2 * intermediate, h // 256, 74), dtype=np.uint8
     )
@@ -204,21 +204,19 @@ def test_mixed_iq_mx_chain_graph(api, tile_rows):
     )
     packed13 = api.pack_iq2_xs(torch.from_numpy(first).cuda())
     packed2 = api.pack_mxfp4(torch.from_numpy(second).cuda())
-    routes = experts * capacity
+    routes = count * topk + experts * (tile_rows - 1)
     x = torch.randn(count, h, device="cuda", dtype=torch.bfloat16) * 20
     tokens = torch.full((routes,), -1, device="cuda", dtype=torch.int32)
     identity = torch.arange(routes, device="cuda", dtype=torch.int32)
     weights = torch.zeros(routes, device="cuda", dtype=torch.float32)
     inverse = torch.full((count, topk), -1, device="cuda", dtype=torch.int32)
-    tasks = torch.tensor(
-        [
-            (e, e * capacity + r)
-            for e in range(experts)
-            for r in range(0, capacity, tile_rows)
-        ],
-        device="cuda",
-        dtype=torch.int32,
+    tasks = torch.empty(
+        (routes + tile_rows - 1) // tile_rows, 2, device="cuda", dtype=torch.int32
     )
+    top_ids = torch.zeros(count, topk, device="cuda", dtype=torch.int32)
+    top_weights = torch.zeros(count, topk, device="cuda", dtype=torch.float32)
+    expert_map = torch.tensor([0, 1, 2, -1], device="cuda", dtype=torch.int32)
+    info = torch.empty(experts, 2, device="cuda", dtype=torch.int32)
     projected = torch.empty(
         routes, 2 * intermediate, device="cuda", dtype=torch.bfloat16
     )
@@ -227,6 +225,17 @@ def test_mixed_iq_mx_chain_graph(api, tile_rows):
     output = torch.empty(count, h, device="cuda", dtype=torch.bfloat16)
 
     def run():
+        api.plan_routes(
+            top_ids,
+            top_weights,
+            expert_map,
+            info,
+            tokens,
+            weights,
+            inverse,
+            tasks,
+            tile_rows,
+        )
         api.mixed_iq2_xs_mxfp4(
             x,
             packed13,
@@ -251,19 +260,8 @@ def test_mixed_iq_mx_chain_graph(api, tile_rows):
         # Expert3 is remote: those contributions must be absent on this rank.
         ids = (np.arange(count * topk).reshape(count, topk) + trial) % 4
         tw = rng.uniform(0.05, 0.95, (count, topk)).astype(np.float32)
-        host_tokens = np.full(routes, -1, dtype=np.int32)
-        host_weights = np.zeros(routes, dtype=np.float32)
-        host_inverse = np.full((count, topk), -1, dtype=np.int32)
-        for expert in range(experts):
-            positions = np.argwhere(ids == expert)
-            for j, (token, slot) in enumerate(positions):
-                row = expert * capacity + j
-                host_tokens[row] = token
-                host_weights[row] = tw[token, slot]
-                host_inverse[token, slot] = row
-        tokens.copy_(torch.from_numpy(host_tokens))
-        weights.copy_(torch.from_numpy(host_weights))
-        inverse.copy_(torch.from_numpy(host_inverse))
+        top_ids.copy_(torch.from_numpy(ids.astype(np.int32)))
+        top_weights.copy_(torch.from_numpy(tw))
         x.mul_(0.8)
         for tensor in (projected, hidden, contributions, output):
             tensor.fill_(float("nan"))
@@ -290,10 +288,79 @@ def test_mixed_iq_mx_chain_graph(api, tile_rows):
         assert (output.float() - expected).norm() / expected.norm() < 0.005
         # Independently check the weight-before-round epilogue at its boundary.
         for expert in range(experts):
-            sl = slice(expert * capacity, (expert + 1) * capacity)
+            live, offset = info[expert].cpu().tolist()
+            sl = slice(offset, offset + live)
             ref = (
                 (hidden[sl].float() @ w2[expert].float().T) * weights[sl, None]
             ).bfloat16()
             assert (
                 contributions[sl].float() - ref.float()
             ).norm() / ref.float().norm() < 0.001
+
+
+@pytest.mark.parametrize("count,experts", [(0, 5), (1, 5), (17, 5), (512, 192)])
+@pytest.mark.parametrize("tile", [16, 32])
+def test_device_route_plan_graph(api, count, experts, tile):
+    rng = np.random.default_rng(157)
+    topk, globals_count = 6, experts * 2
+    host_map = np.full(globals_count, -1, dtype=np.int32)
+    host_map[rng.choice(globals_count, experts, replace=False)] = np.arange(experts)
+    mapping = torch.from_numpy(host_map).cuda()
+    ids = torch.zeros(count, topk, device="cuda", dtype=torch.int32)
+    top_weights = torch.empty(count, topk, device="cuda", dtype=torch.float32)
+    capacity = count * topk + experts * (tile - 1)
+    info = torch.empty(experts, 2, device="cuda", dtype=torch.int32)
+    tokens = torch.empty(capacity, device="cuda", dtype=torch.int32)
+    weights = torch.empty(capacity, device="cuda", dtype=torch.float32)
+    inverse = torch.empty_like(ids)
+    tasks = torch.empty(
+        (capacity + tile - 1) // tile, 2, device="cuda", dtype=torch.int32
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        api.plan_routes(
+            ids, top_weights, mapping, info, tokens, weights, inverse, tasks, tile
+        )
+    for trial in range(3):
+        host_ids = rng.integers(-1, globals_count + 1, (count, topk), dtype=np.int32)
+        if trial == 1:
+            host_ids.fill(int(np.flatnonzero(host_map >= 0)[0]))  # Worst-case skew.
+        elif trial == 2:
+            host_ids.fill(-1)  # All previous tasks and routes must be cleared.
+        host_weights = rng.random((count, topk), dtype=np.float32)
+        ids.copy_(torch.from_numpy(host_ids))
+        top_weights.copy_(torch.from_numpy(host_weights))
+        for tensor in (info, tokens, inverse, tasks):
+            tensor.fill_(7123)
+        weights.fill_(float("nan"))
+        allocated = torch.cuda.memory_allocated()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated
+        expected_tokens = np.full(capacity, -1, dtype=np.int32)
+        expected_weights = np.zeros(capacity, dtype=np.float32)
+        expected_inverse = np.full((count, topk), -1, dtype=np.int32)
+        expected_tasks = np.full(tuple(tasks.shape), -1, dtype=np.int32)
+        expected_info = np.zeros((experts, 2), dtype=np.int32)
+        local = np.full((count, topk), -1, dtype=np.int32)
+        valid = (host_ids >= 0) & (host_ids < globals_count)
+        local[valid] = host_map[host_ids[valid]]
+        offset = 0
+        for expert in range(experts):
+            positions = np.argwhere(local == expert)
+            expected_info[expert] = len(positions), offset
+            for j, (token, slot) in enumerate(positions):
+                expected_tokens[offset + j] = token
+                expected_weights[offset + j] = host_weights[token, slot]
+                expected_inverse[token, slot] = offset + j
+            for start in range(0, len(positions), tile):
+                expected_tasks[(offset + start) // tile] = expert, offset + start
+            offset += (len(positions) + tile - 1) // tile * tile
+        for actual, expected in (
+            (info, expected_info),
+            (tokens, expected_tokens),
+            (weights, expected_weights),
+            (inverse, expected_inverse),
+            (tasks, expected_tasks),
+        ):
+            np.testing.assert_array_equal(actual.cpu().numpy(), expected)

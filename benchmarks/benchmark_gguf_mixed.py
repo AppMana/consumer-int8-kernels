@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Actual IQ2_XS/MXFP4 expert bytes, replicated; complete local MoE chain race.
 
-Includes FC1, clipped SwiGLU, weighted FC2 and route reduction. CPU route
-preparation is excluded. This is not full-model serving or varied expert data.
+Includes FC1, clipped SwiGLU, weighted FC2 and route reduction. --device-plan
+includes GPU routing; otherwise CPU preparation is excluded. This is not
+full-model serving or varied expert data.
 """
 
 import argparse
@@ -80,6 +81,8 @@ def main(args):
     counts = [int((ids == e).sum()) for e in range(args.experts)]
     capacity = (max(counts) + 31) // 32 * 32
     routes = args.experts * capacity
+    if args.device_plan:
+        routes = max(routes, count * topk + args.experts * 31)
     rng = np.random.default_rng(194)
     tw = rng.uniform(0.01, 0.3, (count, topk)).astype(np.float32)
     host_tokens = np.full(routes, -1, dtype=np.int32)
@@ -94,6 +97,15 @@ def main(args):
     tokens = torch.from_numpy(host_tokens).cuda()
     weights = torch.from_numpy(host_weights).cuda()
     inverse = torch.from_numpy(host_inverse).cuda()
+    top_ids = torch.from_numpy(ids.astype(np.int32)).cuda()
+    top_weights = torch.from_numpy(tw).cuda()
+    expert_map = torch.cat(
+        (
+            torch.arange(args.experts, device="cuda", dtype=torch.int32),
+            torch.full((args.experts,), -1, device="cuda", dtype=torch.int32),
+        )
+    )
+    info = torch.empty(args.experts, 2, device="cuda", dtype=torch.int32)
     identity = torch.arange(routes, device="cuda", dtype=torch.int32)
     x = torch.randn(count, h, device="cuda", dtype=torch.bfloat16) * 0.1
     projected = torch.zeros(
@@ -120,6 +132,7 @@ def main(args):
     expected = expected.bfloat16().float()
     graphs = {}
     task_buffers = {}
+    plan_graphs = {}
     errors = {}
     outputs = []
     for tile in (16, 32):
@@ -133,9 +146,26 @@ def main(args):
             dtype=torch.int32,
         )
 
+        if args.device_plan:
+            required = count * topk + args.experts * (tile - 1)
+            tasks = torch.empty(
+                (required + tile - 1) // tile, 2, device="cuda", dtype=torch.int32
+            )
         task_buffers[tile] = tasks  # Graph input storage must outlive every replay.
 
         def run(tile=tile, tasks=tasks):
+            if args.device_plan:
+                ops.gguf_plan_routes(
+                    top_ids,
+                    top_weights,
+                    expert_map,
+                    info,
+                    tokens,
+                    weights,
+                    inverse,
+                    tasks,
+                    tile,
+                )
             ops.gguf_iq2_xs_routed_mm(x, *packed13, tokens, tasks, projected, tile)
             ops.gguf_swiglu(projected, hidden, 10.0)
             ops.gguf_mxfp4_routed_weighted_mm(
@@ -153,6 +183,21 @@ def main(args):
         with torch.cuda.graph(graph):
             run()
         graphs[tile] = graph
+        if args.device_plan:
+            plan_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(plan_graph):
+                ops.gguf_plan_routes(
+                    top_ids,
+                    top_weights,
+                    expert_map,
+                    info,
+                    tokens,
+                    weights,
+                    inverse,
+                    tasks,
+                    tile,
+                )
+            plan_graphs[tile] = plan_graph
     assert torch.equal(*outputs)
     for tile, graph in graphs.items():
         output.fill_(float("nan"))
@@ -174,11 +219,25 @@ def main(args):
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(output, outputs[0])
+    plan_times = {tile: [] for tile in plan_graphs}
+    for trial in range(10):
+        for tile in list(plan_graphs)[:: 1 if trial % 2 else -1]:
+            graph = plan_graphs[tile]
+            flush.zero_()
+            begin, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+            begin.record()
+            graph.replay()
+            end.record()
+            end.synchronize()
+            plan_times[tile].append(begin.elapsed_time(end))
     record = dict(
         checkpoint=manifest["repo"],
         revision=manifest["revision"],
         samples=hashes,
         library_sha256=hashlib.sha256(args.library.read_bytes()).hexdigest(),
+        device_plan=args.device_plan,
+        plan_medians_ms={tile: statistics.median(v) for tile, v in plan_times.items()},
+        plan_milliseconds=plan_times,
         routing=args.routing,
         experts=args.experts,
         tokens=count,
@@ -189,7 +248,7 @@ def main(args):
         medians_ms={tile: statistics.median(v) for tile, v in times.items()},
         device=str(torch.cuda.get_device_properties(args.device)),
         torch=torch.__version__,
-        scope="Replicated experts; full local chain; prepared routing; no collectives",
+        scope="Replicated experts; full local chain; no collectives",
     )
     with args.output.open("x") as report:
         report.write(json.dumps(record) + "\n")
@@ -197,7 +256,13 @@ def main(args):
         json.dumps(
             {
                 key: record[key]
-                for key in ("experts", "tokens", "relative_l2", "medians_ms")
+                for key in (
+                    "experts",
+                    "tokens",
+                    "relative_l2",
+                    "medians_ms",
+                    "plan_medians_ms",
+                )
             }
         )
     )
@@ -210,6 +275,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--experts", type=int, default=192)
     parser.add_argument("--tokens", type=int, default=512)
+    parser.add_argument("--device-plan", action="store_true")
     parser.add_argument("--routing", choices=["random", "balanced"], default="random")
     parser.add_argument("--device", type=int, default=1)
     main(parser.parse_args())

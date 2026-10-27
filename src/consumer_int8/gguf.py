@@ -205,3 +205,18 @@ def mixed_iq2_xs_mxfp4(
         hidden, *packed_down, identity_rows, tasks, weights, contributions, tile_rows
     )
     route_reduce(contributions, inverse_routes, out)
+
+
+# Build stable expert-major routes entirely on-device. expert_map[global_id]
+# gives the local weight index, or -1 for a remote expert. info[E,2] receives
+# (count, padded offset). Other outputs follow mixed_iq2_xs_mxfp4's contracts.
+# Allocate >=T*topk + E*(tile_rows-1) route rows and ceil(that/tile_rows)
+# tasks. Every output buffer must be disjoint. Unused entries reset each call.
+plan_routes = torch.ops.consumer_int8.gguf_plan_routes
+
+
+@torch.library.register_fake("consumer_int8::gguf_plan_routes")
+def _plan_routes_fake(
+    ids, top_weights, expert_map, info, tokens, weights, inverse, tasks, tile_rows=16
+):
+    return None

@@ -340,3 +340,92 @@ void gguf_route_reduce(const void* x,const int32_t* indices,void* out,
   route_reduce<<<post_blocks(tokens*width),256,0,stream>>>(static_cast<const __nv_bfloat16*>(x),
       indices,static_cast<__nv_bfloat16*>(out),tokens*width,width,topk,routes);
 }
+
+namespace {
+__device__ __forceinline__ int local_expert(int global,const int32_t* map,int globals,int experts) {
+  int local=(global>=0 && global<globals) ? map[global] : -1;
+  return local>=0 && local<experts ? local : -1;
+}
+__global__ void route_count_init(const int32_t* ids,const int32_t* map,int32_t* info,
+    int32_t* tokens,float* weights,int32_t* inverse,int32_t* tasks,
+    int pairs,int globals,int experts,int capacity,int task_capacity) {
+  int t=threadIdx.x,e=blockIdx.x;
+  int index=e*256+t, stride=gridDim.x*256;
+  for (int64_t i=index;i<capacity;i+=stride) { tokens[i]=-1; weights[i]=0; }
+  for (int64_t i=index;i<pairs;i+=stride) inverse[i]=-1;
+  for (int64_t i=index;i<task_capacity*2;i+=stride) tasks[i]=-1;
+  int count=0;
+  for (int i=t;i<pairs;i+=256) count+=local_expert(ids[i],map,globals,experts)==e;
+  for (int offset=16;offset;offset/=2) count+=__shfl_down_sync(0xffffffff,count,offset);
+  __shared__ int sums[8];
+  if (t%32==0) sums[t/32]=count;
+  __syncthreads();
+  if (t==0) {
+    int total=0;
+    for (int w=0;w<8;++w) total+=sums[w];
+    info[e*2]=total;
+  }
+}
+__global__ void route_offsets(int32_t* info,int32_t* tasks,int experts,int tile) {
+  if (threadIdx.x==0) {
+    int offset=0;
+    for (int e=0;e<experts;++e) {
+      info[e*2+1]=offset;
+      offset+=((info[e*2]+tile-1)/tile)*tile;
+    }
+  }
+  __syncthreads();
+  for (int e=threadIdx.x;e<experts;e+=blockDim.x) {
+    int offset=info[e*2+1];
+    for (int r=0;r<info[e*2];r+=tile) {
+      int task=(offset+r)/tile;
+      tasks[task*2]=e;
+      tasks[task*2+1]=offset+r;
+    }
+  }
+}
+__global__ void route_assign(const int32_t* ids,const float* top_weights,const int32_t* map,
+    const int32_t* info,int32_t* tokens,float* weights,int32_t* inverse,
+    int pairs,int topk,int globals,int experts) {
+  int t=threadIdx.x,e=blockIdx.x,warp=t/32,lane=t%32;
+  if (!info[e*2]) return;
+  __shared__ int warp_offsets[8], cursor;
+  if (t==0) cursor=0;
+  __syncthreads();
+  for (int start=0;start<pairs;start+=256) {
+    int i=start+t;
+    bool match=i<pairs && local_expert(ids[i],map,globals,experts)==e;
+    uint32_t ballot=__ballot_sync(0xffffffff,match);
+    if (lane==0) warp_offsets[warp]=__popc(ballot);
+    __syncthreads();
+    if (t==0) {
+      int running=cursor;
+      for (int w=0;w<8;++w) {
+        int count=warp_offsets[w];
+        warp_offsets[w]=running;
+        running+=count;
+      }
+      cursor=running;
+    }
+    __syncthreads();
+    if (match) {
+      uint32_t lower=(uint32_t(1)<<lane)-1;
+      int row=info[e*2+1]+warp_offsets[warp]+__popc(ballot&lower);
+      tokens[row]=i/topk;
+      weights[row]=top_weights[i];
+      inverse[i]=row;
+    }
+    __syncthreads();
+  }
+}
+}
+void gguf_plan_routes(const int32_t* ids,const float* top_weights,const int32_t* map,
+    int32_t* info,int32_t* tokens,float* weights,int32_t* inverse,int32_t* tasks,
+    int pairs,int topk,int globals,int experts,int capacity,int task_capacity,int tile,
+    cudaStream_t stream) {
+  route_count_init<<<experts,256,0,stream>>>(ids,map,info,tokens,weights,inverse,tasks,
+      pairs,globals,experts,capacity,task_capacity);
+  route_offsets<<<1,256,0,stream>>>(info,tasks,experts,tile);
+  route_assign<<<experts,256,0,stream>>>(ids,top_weights,map,info,tokens,weights,inverse,
+      pairs,topk,globals,experts);
+}

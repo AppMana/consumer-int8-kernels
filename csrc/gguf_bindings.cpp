@@ -25,6 +25,8 @@ void gguf_mxfp4_routed_weighted_mm(const void*,const uint8_t*,const uint8_t*,con
     const int32_t*,const float*,void*,int,int,int,int,int,int,int,cudaStream_t);
 void gguf_swiglu(const void*,void*,int64_t,int,float,cudaStream_t);
 void gguf_route_reduce(const void*,const int32_t*,void*,int64_t,int,int,int,cudaStream_t);
+void gguf_plan_routes(const int32_t*,const float*,const int32_t*,int32_t*,int32_t*,float*,
+    int32_t*,int32_t*,int,int,int,int,int,int,int,cudaStream_t);
 namespace {
 void boxed_q8(StableIValue* stack, uint64_t, uint64_t) {
   auto x = to<Tensor>(stack[0]), w = to<Tensor>(stack[1]), y = to<Tensor>(stack[2]);
@@ -304,8 +306,55 @@ void boxed_route_reduce(StableIValue* stack,uint64_t,uint64_t) {
   STD_TORCH_CHECK(error==cudaSuccess,cudaGetErrorString(error));
 }
 
+void boxed_plan_routes(StableIValue* stack,uint64_t,uint64_t) {
+  auto ids=to<Tensor>(stack[0]), top_weights=to<Tensor>(stack[1]), map=to<Tensor>(stack[2]);
+  auto info=to<Tensor>(stack[3]), tokens=to<Tensor>(stack[4]), weights=to<Tensor>(stack[5]);
+  auto inverse=to<Tensor>(stack[6]), tasks=to<Tensor>(stack[7]);
+  int64_t tile=to<int64_t>(stack[8]);
+  STD_TORCH_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.scalar_type()==ScalarType::Int &&
+      ids.dim()==2 && ids.size(1)>0 && ids.size(1)<=2147483647 && ids.numel()<=2147480000,
+      "Routing ids must be contiguous CUDA int32 [T,topk]");
+  int device=ids.get_device_index();
+  for (const auto& tensor : {top_weights,map,info,tokens,weights,inverse,tasks})
+    STD_TORCH_CHECK(tensor.is_cuda() && tensor.get_device_index()==device && tensor.is_contiguous(),
+        "Routing tensors must be contiguous on one CUDA device");
+  STD_TORCH_CHECK(top_weights.scalar_type()==ScalarType::Float && weights.scalar_type()==ScalarType::Float &&
+      map.scalar_type()==ScalarType::Int && info.scalar_type()==ScalarType::Int &&
+      tokens.scalar_type()==ScalarType::Int && inverse.scalar_type()==ScalarType::Int &&
+      tasks.scalar_type()==ScalarType::Int, "Invalid routing dtype");
+  STD_TORCH_CHECK(top_weights.dim()==2 && inverse.dim()==2 && map.dim()==1 && info.dim()==2 &&
+      tokens.dim()==1 && weights.dim()==1 && tasks.dim()==2, "Invalid routing dimensions");
+  STD_TORCH_CHECK(top_weights.size(0)==ids.size(0) && top_weights.size(1)==ids.size(1) &&
+      inverse.size(0)==ids.size(0) && inverse.size(1)==ids.size(1) && info.size(1)==2 &&
+      info.size(0)>0 && info.size(0)<=65535 && map.numel()<=2147483647 &&
+      tasks.size(1)==2 && tasks.size(0)<=65535 && (tile==16 || tile==32),
+      "Invalid routing shape, expert count, or tile");
+  int64_t required=ids.numel()+info.size(0)*(tile-1);
+  STD_TORCH_CHECK(tokens.numel()>=required && tokens.numel()<=2147480000 &&
+      weights.numel()==tokens.numel() && tasks.size(0)>=(required+tile-1)/tile,
+      "Routing capacity must cover T*topk + experts*(tile-1) rows and ceil(rows/tile) tasks");
+  for (const auto& output : {info,tokens,weights,inverse,tasks}) {
+    for (const auto& input : {ids,top_weights,map})
+      STD_TORCH_CHECK(!output.numel() || !input.numel() || output.data_ptr()!=input.data_ptr(),
+          "Routing outputs must not alias inputs");
+  }
+  // All output buffers must also have disjoint storage ranges (caller contract).
+  torch::stable::accelerator::DeviceGuard guard(device);
+  void* stream=nullptr;
+  TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device,&stream));
+  gguf_plan_routes(static_cast<const int32_t*>(ids.data_ptr()),static_cast<const float*>(top_weights.data_ptr()),
+      static_cast<const int32_t*>(map.data_ptr()),static_cast<int32_t*>(info.data_ptr()),
+      static_cast<int32_t*>(tokens.data_ptr()),static_cast<float*>(weights.data_ptr()),
+      static_cast<int32_t*>(inverse.data_ptr()),static_cast<int32_t*>(tasks.data_ptr()),
+      ids.numel(),ids.size(1),map.numel(),info.size(0),tokens.numel(),tasks.size(0),tile,
+      reinterpret_cast<cudaStream_t>(stream));
+  auto error=cudaGetLastError();
+  STD_TORCH_CHECK(error==cudaSuccess,cudaGetErrorString(error));
+}
+
 }
 STABLE_TORCH_LIBRARY_FRAGMENT(consumer_int8, m) {
+  m.def("gguf_plan_routes(Tensor ids, Tensor top_weights, Tensor expert_map, Tensor(a!) info, Tensor(b!) tokens, Tensor(c!) weights, Tensor(d!) inverse, Tensor(e!) tasks, int tile_rows=16) -> ()");
   m.def("gguf_mxfp4_routed_weighted_mm(Tensor x, Tensor codes, Tensor scales, Tensor tokens, Tensor tasks, Tensor weights, Tensor(a!) out, int tile_rows=16) -> ()");
   m.def("gguf_swiglu(Tensor x, Tensor(a!) out, float limit=10.) -> ()");
   m.def("gguf_route_reduce(Tensor contributions, Tensor rows, Tensor(a!) out) -> ()");
@@ -317,6 +366,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(consumer_int8, m) {
   m.def("gguf_q8_mm(Tensor x, Tensor weight, Tensor(a!) out) -> ()");
 }
 STABLE_TORCH_LIBRARY_IMPL(consumer_int8, CUDA, m) {
+  m.impl("gguf_plan_routes", &boxed_plan_routes);
   m.impl("gguf_mxfp4_routed_weighted_mm", &boxed_mxfp4_routed<true>);
   m.impl("gguf_swiglu", &boxed_swiglu);
   m.impl("gguf_route_reduce", &boxed_route_reduce);
