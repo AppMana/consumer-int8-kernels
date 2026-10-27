@@ -62,11 +62,15 @@ __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
     const __half* scales, const uint8_t* iq_scales, __nv_bfloat16* y, int m, int n, int k, int groups,
     int64_t xs, int64_t xg) {
   __shared__ __align__(32) Storage<IQ> s;
-  __shared__ uint64_t codebook[IQ ? 512 : 1];
+  __shared__ uint32_t codebook[IQ ? 2048 : 1];
   int t=threadIdx.x, warp=t/32;
   if constexpr (IQ) {
-    codebook[t]=iq2xs_grid[t];
-    codebook[t+256]=iq2xs_grid[t+256];
+    for (int i=t;i<2048;i+=256) {
+      uint64_t grid=iq2xs_grid[i/4];
+      uint32_t pair=uint32_t(grid>>((i%4)*16));
+      codebook[i]=(__float_as_uint(float(pair&255))>>16) |
+                   (__float_as_uint(float((pair>>8)&255))&0xffff0000u);
+    }
   }
   float acc[2][4] = {};
   const int lane=t%32;
@@ -82,14 +86,16 @@ __global__ void packed_mm(const __nv_bfloat16* x, const int8_t* q,
         uint16_t code=*reinterpret_cast<const uint16_t*>(s.q[stage]+row*(BK/4)+(col/8)*2);
         uint32_t signs=code>>9;
         signs|=(__popc(signs)&1)<<7;
-        uint64_t grid=codebook[code&511];
-        uint32_t pair=uint32_t(grid>>((col%8)*8));
+        uint32_t pair=codebook[(code&511)*4+(col%8)/2];
         uint8_t sb=s.iq_scales[stage][row*4+((start/64)%2)*2+col/32];
         int scale4=(sb>>(((col%32)/16)*4))&15;
         float d=__half2float(s.scales[stage][row*2+((start/256)%2)])*(0.5f+scale4)*0.25f;
-        float v0=d*float(pair&255)*(signs&(1<<(col%8)) ? -1.f:1.f);
-        float v1=d*float((pair>>8)&255)*(signs&(1<<((col%8)+1)) ? -1.f:1.f);
+        float v0=d*__uint_as_float(pair<<16);
+        float v1=d*__uint_as_float(pair&0xffff0000u);
         value=__floats2bfloat162_rn(v0,v1);
+        uint32_t signpair=signs>>(col%8);
+        uint32_t bits=(*reinterpret_cast<uint32_t*>(&value)) ^ ((signpair*0x40008000u)&0x80008000u);
+        *reinterpret_cast<uint32_t*>(&value)=bits;
       } else {
         auto pair=*reinterpret_cast<const uint16_t*>(s.q[stage]+row*BK+col);
         float scale=__half2float(s.scales[stage][row*2+col/32]);
