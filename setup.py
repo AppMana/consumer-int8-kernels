@@ -44,7 +44,7 @@ setup(
     ext_modules=[
         extension(
             "consumer_int8._gguf",
-            ["csrc/gguf_bindings.cpp", "csrc/gguf_q8.cu"],
+            ["csrc/gguf_bindings.cpp", "csrc/gguf_q8.cu", "csrc/gguf_q8_packed.cu"],
         ),
         extension(
             "consumer_int8._C",

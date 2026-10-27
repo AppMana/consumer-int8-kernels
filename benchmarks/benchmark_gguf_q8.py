@@ -37,6 +37,8 @@ def main(args):
             )
             values = raw_np[..., 2:].view(np.int8).astype(np.float32)
             raw = torch.from_numpy(raw_np).unsqueeze(0).cuda()
+            codes = raw[..., 2:].contiguous().view(torch.int8).reshape(1, n, k)
+            scales_gpu = raw[..., :2].contiguous().view(torch.float16).squeeze(-1)
             dense = torch.from_numpy((scales * values).reshape(n, k)).cuda().bfloat16()
             for m in args.rows:
                 x = torch.randn(m, 1, k, device="cuda", dtype=torch.bfloat16) * 0.1
@@ -46,10 +48,16 @@ def main(args):
                 def native(x=x, raw=raw, out=out):
                     torch.ops.consumer_int8.gguf_q8_mm(x, raw, out)
 
+                def packed(x=x, codes=codes, scales_gpu=scales_gpu, out=out):
+                    torch.ops.consumer_int8.gguf_q8_packed_mm(x, codes, scales_gpu, out)
+
                 def cublas(x=x, dense=dense, base=base):
                     torch.mm(x[:, 0], dense.T, out=base[:, 0])
 
                 native()
+                raw_result = out.clone()
+                packed()
+                assert torch.equal(out, raw_result)
                 reference = (x[:, 0].float() @ dense.float().T).bfloat16()
                 relative = (
                     (out[:, 0].float() - reference.float()).norm()
@@ -67,7 +75,11 @@ def main(args):
                     report.flush()
                     continue
                 graphs = {}
-                for name, fn in [("native", native), ("resident_cublas", cublas)]:
+                for name, fn in [
+                    ("native", native),
+                    ("packed_async", packed),
+                    ("resident_cublas", cublas),
+                ]:
                     for _ in range(3):
                         fn()
                     graph = torch.cuda.CUDAGraph()

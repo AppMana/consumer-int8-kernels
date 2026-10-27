@@ -18,9 +18,10 @@ def library():
 
 @pytest.mark.parametrize("m", [1, 17, 32, 127, 128, 513])
 @pytest.mark.parametrize("group_major", [False, True])
-def test_raw_q8_grouped_oracle_and_graph(m, group_major):
+@pytest.mark.parametrize("packed", [False, True])
+def test_raw_q8_grouped_oracle_and_graph(m, group_major, packed):
     torch.manual_seed(37 + m)
-    groups, n, k = 3, 37, 96
+    groups, n, k = 3, 37, 128 if packed else 96
     scales = (torch.rand(groups, n, k // 32, 1) * 0.1).half()
     codes = torch.randint(-128, 128, (groups, n, k // 32, 32), dtype=torch.int8)
     raw = torch.cat((scales.view(torch.uint8), codes.view(torch.uint8)), dim=-1).cuda()
@@ -30,11 +31,21 @@ def test_raw_q8_grouped_oracle_and_graph(m, group_major):
     if group_major:
         x = x.transpose(0, 1)
     out = torch.empty(m, groups, n, device="cuda", dtype=torch.bfloat16)
-    op = torch.ops.consumer_int8.gguf_q8_mm
-    op(x, raw, out)
+    packed_codes = codes.reshape(groups, n, k).cuda()
+    packed_scales = scales.squeeze(-1).cuda()
+
+    def run():
+        if packed:
+            torch.ops.consumer_int8.gguf_q8_packed_mm(
+                x, packed_codes, packed_scales, out
+            )
+        else:
+            torch.ops.consumer_int8.gguf_q8_mm(x, raw, out)
+
+    run()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        op(x, raw, out)
+        run()
     for _ in range(3):
         x.mul_(0.75)
         out.fill_(float("nan"))

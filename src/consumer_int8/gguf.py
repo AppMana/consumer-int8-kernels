@@ -25,3 +25,30 @@ q8_mm = torch.ops.consumer_int8.gguf_q8_mm
 @torch.library.register_fake("consumer_int8::gguf_q8_mm")
 def _q8_fake(x, weight, out):
     return None
+
+
+q8_packed_mm = torch.ops.consumer_int8.gguf_q8_packed_mm
+
+
+@torch.library.register_fake("consumer_int8::gguf_q8_packed_mm")
+def _q8_packed_fake(x, codes, scales, out):
+    return None
+
+
+def pack_q8(raw):
+    """Losslessly separate raw [G,N,K/32,34] GGUF bytes before serving.
+
+    Original FP16 bases and signed INT8 codes are retained. K must align to
+    64 for asynchronous copies. The caller can release raw after preparation.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Q8 packing must precede graph capture")
+    if not raw.is_cuda or raw.dtype != torch.uint8 or raw.ndim != 4:
+        raise ValueError("Expected CUDA uint8 raw Q8 blocks [G,N,K/32,34]")
+    if raw.shape[-1] != 34 or raw.shape[-2] % 2 or min(raw.shape) <= 0:
+        raise ValueError("Packed Q8 requires positive dimensions and K divisible by 64")
+    scales = raw[..., :2].contiguous().view(torch.float16).squeeze(-1)
+    if not torch.isfinite(scales).all().item():
+        raise ValueError("Q8 scale bases must be finite")
+    codes = raw[..., 2:].contiguous().view(torch.int8)
+    return codes.reshape(*raw.shape[:2], raw.shape[2] * 32), scales
