@@ -13,7 +13,8 @@ from pathlib import Path
 import torch
 
 
-def install(library):
+def install(library, *, enabled=True):
+    """Use enabled=False for a control with identical resident experimental weights."""
     from iq2xxs_int8_moe import Int8MoE, repack
     from vllm.model_executor.layers.quantization.b12x_iq import B12xIQMoEMethod
     from vllm.v1.worker.workspace import (
@@ -99,7 +100,7 @@ def install(library):
         self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
     ):
         plan = getattr(self, "_integer_prefill_plan", None)
-        if plan is None or x.shape[0] != 512:
+        if not enabled or plan is None or x.shape[0] != 512:
             return original_apply(
                 self,
                 layer,
