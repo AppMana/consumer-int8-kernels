@@ -36,9 +36,20 @@ class Int8MoE:
         fused_swiglu=False,
         masked_swiglu=False,
         accumulate256=False,
+        hybrid1632=False,
     ):
         if (native.first_format, native.second_format) != ("IQ2_XXS", "IQ2_XXS"):
             raise ValueError("Complete INT8 candidate only supports IQ2_XXS pairs")
+        if hybrid1632 and not (
+            tile == 32
+            and register_decode
+            and fused_swiglu
+            and masked_swiglu
+            and not accumulate256
+            and activation_block == 32
+            and down_activation_block in (None, 32)
+        ):
+            raise ValueError("Hybrid16/32 requires masked fused per32 path and tile32")
         self.native = native
         self.packed = packed
         # Benchmark C ABI uses tile=0 for disjoint sparse8/dense16 task arrays.
@@ -62,7 +73,7 @@ class Int8MoE:
         )
         self.lib = ctypes.CDLL(str(library.resolve()))
         self.small_tasks = None
-        if tile in (0, 8):
+        if tile in (0, 8) or hybrid1632:
             tasks = self.scratch[4]
             if tasks.shape[0] > 32767:
                 raise ValueError("Retiled task capacity exceeds CUDA grid")
@@ -70,7 +81,11 @@ class Int8MoE:
                 tasks.shape[0] * 2, 2, device=native.device, dtype=torch.int32
             )
             self.retile = (
-                self.lib.iq2xxs_retile_mixed if tile == 0 else self.lib.iq2xxs_retile8
+                self.lib.iq2xxs_classify1632
+                if hybrid1632
+                else self.lib.iq2xxs_retile_mixed
+                if tile == 0
+                else self.lib.iq2xxs_retile8
             )
             self.retile.argtypes = (
                 [ctypes.c_void_p] * 3 + [ctypes.c_int] * 2 + [ctypes.c_void_p]
@@ -136,6 +151,9 @@ class Int8MoE:
             + "_weighted"
             + ("_quantized" if fused_swiglu else ""),
         )
+        if hybrid1632:
+            self.fc1 = self.lib.iq2xxs_routed_int8_slab_hybrid1632
+            self.fc2 = self.lib.iq2xxs_routed_int8_slab_hybrid1632_weighted_quantized
         for fn, pointers in ((self.fc1, 8), (self.fc2, 9)):
             fn.argtypes = (
                 [ctypes.c_void_p] * pointers + [ctypes.c_int] * 7 + [ctypes.c_void_p]

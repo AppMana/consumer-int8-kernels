@@ -779,13 +779,14 @@ extern "C" int iq2xxs_retile8(const int32_t* input, const int32_t* tokens,
 }
 
 namespace {
+template<int Threshold=8>
 __global__ void iq_classify_rows(const int32_t* input, const int32_t* tokens,
                                 int32_t* output, int count, int rows) {
   int index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index >= count) return;
   int expert = input[index * 2], row = input[index * 2 + 1];
   bool valid = expert >= 0 && row >= 0 && row < rows && tokens[row] >= 0;
-  bool dense = valid && row + 8 < rows && tokens[row + 8] >= 0;
+  bool dense = valid && row + Threshold < rows && tokens[row + Threshold] >= 0;
   output[index * 2] = valid && !dense ? expert : -1;
   output[index * 2 + 1] = valid && !dense ? row : -1;
   output[(count + index) * 2] = dense ? expert : -1;
@@ -796,7 +797,7 @@ __global__ void iq_classify_rows(const int32_t* input, const int32_t* tokens,
 extern "C" int iq2xxs_retile_mixed(const int32_t* input, const int32_t* tokens,
                                   int32_t* output, int count, int rows, cudaStream_t stream) {
   if (count <= 0 || count > 32767 || rows <= 0) return cudaErrorInvalidValue;
-  iq_classify_rows<<<(count + 255) / 256, 256, 0, stream>>>(input, tokens, output, count, rows);
+  iq_classify_rows<><<<(count + 255) / 256, 256, 0, stream>>>(input, tokens, output, count, rows);
   return cudaGetLastError();
 }
 
@@ -845,5 +846,58 @@ extern "C" int iq2xxs_routed_int8_slab_weighted_quantized(const void* x, void* a
   else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
   else { ROUTED_LAUNCH(64,64); }
 #undef ROUTED_LAUNCH
+  return cudaGetLastError();
+}
+
+// Input native32-row tasks; sparse16 list followed by shared32 list.
+extern "C" int iq2xxs_classify1632(const int32_t* input, const int32_t* tokens,
+                                 int32_t* output, int count, int rows, cudaStream_t stream) {
+  if (count <= 0 || count > 32767 || rows <= 0) return cudaErrorInvalidValue;
+  iq_classify_rows<16><<<(count + 255) / 256, 256, 0, stream>>>(input, tokens, output, count, rows);
+  return cudaGetLastError();
+}
+
+extern "C" int iq2xxs_routed_int8_slab_hybrid1632(const void* x, void* a, float* sa,
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || taskcount % 2 || taskcount > 65534 || tile_m != 32)
+    return cudaErrorInvalidValue;
+  quantize<<<(xrows * (k / 32) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 32));
+  taskcount /= 2;
+  iq2xxs_tiled<16,IQ2XXS_REGISTER_N,true,true,true,false,true,false,false,true><<<dim3((n+IQ2XXS_REGISTER_N-1)/IQ2XXS_REGISTER_N,taskcount), (16/16)*(IQ2XXS_REGISTER_N/32)*32, 0, stream>>>(
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+      static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts,
+      static_cast<const __half*>(bases));
+  tasks += taskcount * 2;
+  iq2xxs_tiled<32,64,true,true,true,false,true,false,false,false><<<dim3((n+64-1)/64,taskcount), (32/16)*(64/32)*32, 0, stream>>>(
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+      static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts,
+      static_cast<const __half*>(bases));
+
+  return cudaGetLastError();
+}
+
+extern "C" int iq2xxs_routed_int8_slab_hybrid1632_weighted_quantized(const void* x, void* a, float* sa,
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, const float* weights, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || taskcount % 2 || taskcount > 65534 || tile_m != 32)
+    return cudaErrorInvalidValue;
+  // x is unused: a/sa already contain the fused quantizer output.
+  taskcount /= 2;
+  iq2xxs_tiled<16,IQ2XXS_REGISTER_N,true,true,true,false,true,true,false,true><<<dim3((n+IQ2XXS_REGISTER_N-1)/IQ2XXS_REGISTER_N,taskcount), (16/16)*(IQ2XXS_REGISTER_N/32)*32, 0, stream>>>(
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+      static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts,
+      static_cast<const __half*>(bases), weights);
+  tasks += taskcount * 2;
+  iq2xxs_tiled<32,64,true,true,true,false,true,true,false,false><<<dim3((n+64-1)/64,taskcount), (32/16)*(64/32)*32, 0, stream>>>(
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+      static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts,
+      static_cast<const __half*>(bases), weights);
+
   return cudaGetLastError();
 }

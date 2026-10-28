@@ -166,6 +166,7 @@ def main(args):
         int8_control_mixed_row=args.int8_control_mixed_row,
         int8_accumulate256=args.int8_accumulate256,
         int8_shared_fused=args.int8_shared_fused,
+        int8_hybrid1632=args.int8_hybrid1632,
         int8_activation_block=args.int8_activation_block,
         int8_down_activation_block=args.int8_down_activation_block,
         int8_library_sha256=(
@@ -301,6 +302,25 @@ def main(args):
                                 fused_out,
                             )
                             owners.append(fused)
+                if args.int8_hybrid1632:
+                    hybrid = Int8MoE(
+                        native,
+                        int8_packed,
+                        args.int8_library,
+                        count,
+                        6,
+                        32,
+                        register_decode=True,
+                        fused_swiglu=True,
+                        masked_swiglu=True,
+                        hybrid1632=True,
+                    )
+                    hybrid_out = torch.empty_like(x)
+                    calls["int8-hybrid1632"] = (
+                        partial(hybrid.run, x, ids, weights, hybrid_out),
+                        hybrid_out,
+                    )
+                    owners.append(hybrid)
                 b12x = None
                 if not args.native_only:
                     b12x = prepare_b12x(
@@ -412,6 +432,11 @@ def main(args):
                                         references[f"int8{tile}-shared-fused"],
                                         references[f"int8{tile}-shared-control"],
                                     )
+                        if args.int8_hybrid1632:
+                            assert torch.equal(
+                                references["int8-hybrid1632"],
+                                references["int832-shared"],
+                            )
                         flush = torch.empty(64 << 20, device=device, dtype=torch.uint8)
                         timings = {label: [] for label in graphs}
                         for trial in range(args.trials):
@@ -503,6 +528,7 @@ if __name__ == "__main__":
     parser.add_argument("--int8-control-mixed-row", action="store_true")
     parser.add_argument("--int8-accumulate256", action="store_true")
     parser.add_argument("--int8-shared-fused", action="store_true")
+    parser.add_argument("--int8-hybrid1632", action="store_true")
     parser.add_argument(
         "--int8-activation-block", type=int, choices=(32, 256), default=32
     )
@@ -564,7 +590,7 @@ if __name__ == "__main__":
             "Accumulator scaling requires FC1 per256/FC2 per32; "
             "shared folded path is its exact control"
         )
-    if args.int8_shared_fused and not (
+    if (args.int8_shared_fused or args.int8_hybrid1632) and not (
         args.int8_library
         and args.int8_register_decode
         and args.int8_activation_block == 32
