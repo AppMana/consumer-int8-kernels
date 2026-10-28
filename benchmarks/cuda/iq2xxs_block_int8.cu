@@ -16,6 +16,16 @@
 #ifndef IQ2XXS_REGISTER_N
 #define IQ2XXS_REGISTER_N 64
 #endif
+// SM12x M16/N128 regresses with explicit min1: restore the max-thread-only
+// heuristic there. Keep SM86 unchanged; other budgets remain opt-in.
+#ifndef IQ2XXS_REGISTER_MIN_BLOCKS
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#define IQ2XXS_REGISTER_MIN_BLOCKS 0
+#else
+#define IQ2XXS_REGISTER_MIN_BLOCKS 1
+#endif
+#endif
+static_assert(IQ2XXS_REGISTER_MIN_BLOCKS >= 0 && IQ2XXS_REGISTER_MIN_BLOCKS <= 6);
 // Group adjacent routed row tasks at each output tile to test L2 weight reuse.
 // Default preserves the original column-fast block order.
 #ifndef IQ2XXS_TASK_GROUP
@@ -150,7 +160,10 @@ __device__ __forceinline__ void iq_async_copy(void* dst, const void* src, bool v
 }
 template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false, bool Fold256=false, bool RegisterDecode=false, bool Acc256=false, bool IQ3=false, int IQ3MinBlocks=IQ3XXS_MIN_BLOCKS>
 __global__ __launch_bounds__(((BM + 15) / 16) * (BN / 32) * 32,
-    (Routed && Slab && !Fold256 && !RegisterDecode && BM == 32 && BN == 64) ? (IQ3 ? IQ3MinBlocks : IQ2XXS_SHARED_MIN_BLOCKS) : 1)
+    (Routed && Slab && RegisterDecode && !Fold256 && !Acc256 && BM == 16 && BN == 128)
+        ? IQ2XXS_REGISTER_MIN_BLOCKS
+        : (Routed && Slab && !Fold256 && !RegisterDecode && BM == 32 && BN == 64)
+            ? (IQ3 ? IQ3MinBlocks : IQ2XXS_SHARED_MIN_BLOCKS) : 1)
 void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
     const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr) {
   static_assert(!IQ3 || (Slab && SharedLUT && Routed && !RegisterDecode && !Fold256));
