@@ -213,7 +213,7 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
   __shared__ uint2 descriptor_storage[Stages][RegisterDecode ? BN * Blocks : 1];
   __shared__ uint32_t descriptor_high_storage[IQ3 && RegisterDecode ? BN * Blocks : 1];
   __shared__ int8_t high_tile[Fold256 ? BN : 1][144];
-  __shared__ float scale_storage[Stages][Shuffle ? BM : Rows][Blocks];
+  __shared__ float scale_storage[Stages][Shuffle ? BM : Rows][Blocks + (Pipeline ? 0 : 1)];
   __shared__ int subscales[Acc256 ? BN : 1][Blocks];
   __shared__ float pipeline_bases[Stages][Pipeline ? BN : 1];
   __shared__ float weight_bases[Shuffle ? BN : 1];
@@ -676,23 +676,25 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
     auto* rounded = RegisterDecode
         ? reinterpret_cast<__nv_bfloat16*>(descriptor_storage)
         : reinterpret_cast<__nv_bfloat16*>(tile_storage);
+    auto* rounded2 = reinterpret_cast<__nv_bfloat162*>(rounded);
     #pragma unroll
     for (int j = 0; j < 4; ++j) {
       #pragma unroll
-      for (int r = 0; r < 4; ++r) {
-        const int row = wr + group + (r >> 1) * 8;
-        const int col = wc + j * 8 + tid * 2 + (r & 1);
-        rounded[row * BN + col] = __float2bfloat16(sum[j][r]);
+      for (int r = 0; r < 2; ++r) {
+        const int row = wr + group + r * 8;
+        const int pair = (wc / 2 + j * 4 + tid) ^ ((row & 7) * 4);
+        rounded2[row * (BN / 2) + pair] = __floats2bfloat162_rn(sum[j][r * 2], sum[j][r * 2 + 1]);
       }
     }
     __syncthreads();
     for (int block = warp; block < BM * (BN / 2) / 32; block += Threads / 32) {
       const int row = block / ((BN / 2) / 32);
       const int col = (block % ((BN / 2) / 32)) * 32 + lane;
+      const int swz = (row & 7) * 8;
       float value = 0;
       if (rb + row < m && tokens[rb + row] >= 0) {
-        const float gate = fminf(__bfloat162float(rounded[row * BN + col]), limit);
-        const float up = fminf(fmaxf(__bfloat162float(rounded[row * BN + col + BN / 2]), -limit), limit);
+        const float gate = fminf(__bfloat162float(rounded[row * BN + (col ^ swz)]), limit);
+        const float up = fminf(fmaxf(__bfloat162float(rounded[row * BN + ((col + BN / 2) ^ swz)]), -limit), limit);
         value = __bfloat162float(__float2bfloat16_rn((gate / (1.f + expf(-gate))) * up));
       }
       float maximum = fabsf(value);
@@ -1057,22 +1059,68 @@ namespace {
 template<int Threshold=8>
 __global__ void iq_classify_rows(const int32_t* input, const int32_t* tokens,
                                 int32_t* output, int count, int rows) {
-  int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= count) return;
-  int expert = input[index * 2], row = input[index * 2 + 1];
-  bool valid = expert >= 0 && row >= 0 && row < rows && tokens[row] >= 0;
-  bool dense = valid && row + Threshold < rows && tokens[row + Threshold] >= 0;
-  output[index * 2] = valid && !dense ? expert : -1;
-  output[index * 2 + 1] = valid && !dense ? row : -1;
-  output[(count + index) * 2] = dense ? expert : -1;
-  output[(count + index) * 2 + 1] = dense ? row : -1;
+  __shared__ int s_sp[8];
+  __shared__ int s_dn[8];
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const uint32_t lane_mask = (1u << lane) - 1u;
+  int sparse_out = 0, dense_out = 0;
+  for (int base = 0; base < count; base += 256) {
+    const int index = base + tid;
+    int expert = -1, row = -1;
+    bool is_sparse = false, is_dense = false;
+    if (index < count) {
+      expert = input[index * 2];
+      row = input[index * 2 + 1];
+      const bool valid = expert >= 0 && row >= 0 && row < rows && tokens[row] >= 0;
+      is_dense = valid && row + Threshold < rows && tokens[row + Threshold] >= 0;
+      is_sparse = valid && !is_dense;
+    }
+    const uint32_t sp_mask = __ballot_sync(0xffffffff, is_sparse);
+    const uint32_t dn_mask = __ballot_sync(0xffffffff, is_dense);
+    if (!lane) {
+      s_sp[warp] = __popc(sp_mask);
+      s_dn[warp] = __popc(dn_mask);
+    }
+    __syncthreads();
+    int sp_offset = sparse_out, dn_offset = dense_out;
+    #pragma unroll
+    for (int w = 0; w < 8; ++w) {
+      if (w < warp) {
+        sp_offset += s_sp[w];
+        dn_offset += s_dn[w];
+      }
+      sparse_out += s_sp[w];
+      dense_out += s_dn[w];
+    }
+    if (is_sparse) {
+      const int pos = sp_offset + __popc(sp_mask & lane_mask);
+      output[pos * 2] = expert;
+      output[pos * 2 + 1] = row;
+    }
+    if (is_dense) {
+      const int pos = count + dn_offset + __popc(dn_mask & lane_mask);
+      output[pos * 2] = expert;
+      output[pos * 2 + 1] = row;
+    }
+    __syncthreads();
+  }
+  for (int i = sparse_out + tid; i < count; i += 256) {
+    output[i * 2] = -1;
+    output[i * 2 + 1] = -1;
+  }
+  for (int i = dense_out + tid; i < count; i += 256) {
+    output[(count + i) * 2] = -1;
+    output[(count + i) * 2 + 1] = -1;
+  }
 }
 }
 // Input must be native16-row route tasks; output is disjoint [2*count,2].
 extern "C" int iq2xxs_retile_mixed(const int32_t* input, const int32_t* tokens,
                                   int32_t* output, int count, int rows, cudaStream_t stream) {
   if (count <= 0 || count > 32767 || rows <= 0) return cudaErrorInvalidValue;
-  iq_classify_rows<><<<(count + 255) / 256, 256, 0, stream>>>(input, tokens, output, count, rows);
+  iq_classify_rows<><<<1, 256, 0, stream>>>(input, tokens, output, count, rows);
   return cudaGetLastError();
 }
 
@@ -1128,7 +1176,7 @@ extern "C" int iq2xxs_routed_int8_slab_weighted_quantized(const void* x, void* a
 extern "C" int iq2xxs_classify1632(const int32_t* input, const int32_t* tokens,
                                  int32_t* output, int count, int rows, cudaStream_t stream) {
   if (count <= 0 || count > 32767 || rows <= 0) return cudaErrorInvalidValue;
-  iq_classify_rows<16><<<(count + 255) / 256, 256, 0, stream>>>(input, tokens, output, count, rows);
+  iq_classify_rows<16><<<1, 256, 0, stream>>>(input, tokens, output, count, rows);
   return cudaGetLastError();
 }
 
@@ -1261,7 +1309,7 @@ extern "C" int iq3xxs_routed_int8_slab_weighted_quantized(const void* x, void* a
 extern "C" int iq3xxs_classify_full32(const int32_t* input, const int32_t* tokens,
     int32_t* output, int count, int rows, cudaStream_t stream) {
   if (count <= 0 || count > 32767 || rows <= 0) return cudaErrorInvalidValue;
-  iq_classify_rows<31><<<(count + 255) / 256, 256, 0, stream>>>(input, tokens, output, count, rows);
+  iq_classify_rows<31><<<1, 256, 0, stream>>>(input, tokens, output, count, rows);
   return cudaGetLastError();
 }
 
