@@ -167,6 +167,7 @@ def main(args):
         int8_accumulate256=args.int8_accumulate256,
         int8_shared_fused=args.int8_shared_fused,
         int8_hybrid1632=args.int8_hybrid1632,
+        int8_split_decoder=args.int8_split_decoder,
         int8_activation_block=args.int8_activation_block,
         int8_down_activation_block=args.int8_down_activation_block,
         int8_library_sha256=(
@@ -302,6 +303,35 @@ def main(args):
                                 fused_out,
                             )
                             owners.append(fused)
+                if args.int8_split_decoder:
+                    for tile in (16, 32):
+                        for first_register, down_register in (
+                            (True, False),
+                            (False, True),
+                        ):
+                            label = (
+                                "register-shared"
+                                if first_register
+                                else "shared-register"
+                            )
+                            split = Int8MoE(
+                                native,
+                                int8_packed,
+                                args.int8_library,
+                                count,
+                                6,
+                                tile,
+                                register_decode=first_register,
+                                down_register_decode=down_register,
+                                fused_swiglu=True,
+                                masked_swiglu=True,
+                            )
+                            split_out = torch.empty_like(x)
+                            calls[f"int8{tile}-{label}"] = (
+                                partial(split.run, x, ids, weights, split_out),
+                                split_out,
+                            )
+                            owners.append(split)
                 if args.int8_hybrid1632:
                     hybrid = Int8MoE(
                         native,
@@ -432,6 +462,13 @@ def main(args):
                                         references[f"int8{tile}-shared-fused"],
                                         references[f"int8{tile}-shared-control"],
                                     )
+                        if args.int8_split_decoder:
+                            for tile in (16, 32):
+                                for label in ("register-shared", "shared-register"):
+                                    assert torch.equal(
+                                        references[f"int8{tile}-{label}"],
+                                        references[f"int8{tile}-shared"],
+                                    )
                         if args.int8_hybrid1632:
                             assert torch.equal(
                                 references["int8-hybrid1632"],
@@ -529,6 +566,7 @@ if __name__ == "__main__":
     parser.add_argument("--int8-accumulate256", action="store_true")
     parser.add_argument("--int8-shared-fused", action="store_true")
     parser.add_argument("--int8-hybrid1632", action="store_true")
+    parser.add_argument("--int8-split-decoder", action="store_true")
     parser.add_argument(
         "--int8-activation-block", type=int, choices=(32, 256), default=32
     )
@@ -590,7 +628,9 @@ if __name__ == "__main__":
             "Accumulator scaling requires FC1 per256/FC2 per32; "
             "shared folded path is its exact control"
         )
-    if (args.int8_shared_fused or args.int8_hybrid1632) and not (
+    if (
+        args.int8_shared_fused or args.int8_hybrid1632 or args.int8_split_decoder
+    ) and not (
         args.int8_library
         and args.int8_register_decode
         and args.int8_activation_block == 32

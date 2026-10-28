@@ -37,7 +37,18 @@ class Int8MoE:
         masked_swiglu=False,
         accumulate256=False,
         hybrid1632=False,
+        down_register_decode=None,
     ):
+        if down_register_decode is not None and not (
+            tile in (16, 32, 64)
+            and not hybrid1632
+            and not accumulate256
+            and activation_block == 32
+            and down_activation_block in (None, 32)
+        ):
+            raise ValueError("Independent down decoder requires ordinary per32 tiles")
+        if down_register_decode is None:
+            down_register_decode = register_decode
         if (native.first_format, native.second_format) != ("IQ2_XXS", "IQ2_XXS"):
             raise ValueError("Complete INT8 candidate only supports IQ2_XXS pairs")
         if hybrid1632 and not (
@@ -119,7 +130,7 @@ class Int8MoE:
         self.fc1 = getattr(self.lib, "iq2xxs_routed_int8_slab" + suffix)
         down_suffix = (
             "_register"
-            if register_decode
+            if down_register_decode
             else "_fold256"
             if down_activation_block == 256
             else ""
