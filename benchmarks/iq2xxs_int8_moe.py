@@ -80,10 +80,17 @@ class Int8MoE:
             or accumulate256
             or activation_block != 32
             or down_activation_block not in (None, 32)
-            or (native.first_format == "IQ3_XXS" and register_decode)
-            or (native.second_format == "IQ3_XXS" and down_register_decode)
+            or (
+                tile not in (16, 32)
+                and (
+                    (native.first_format == "IQ3_XXS" and register_decode)
+                    or (native.second_format == "IQ3_XXS" and down_register_decode)
+                )
+            )
         ):
-            raise ValueError("IQ3_XXS requires shared decoding and per32 quantization")
+            raise ValueError(
+                "IQ3 requires per32 scales; register decoding supports M16/32"
+            )
         first_prefix = "iq3xxs" if native.first_format == "IQ3_XXS" else "iq2xxs"
         down_prefix = "iq3xxs" if native.second_format == "IQ3_XXS" else "iq2xxs"
         if hybrid1632 and not (

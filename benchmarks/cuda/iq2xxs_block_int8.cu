@@ -72,6 +72,13 @@ static_assert(IQ2XXS_REGISTER_K == 128 || IQ2XXS_REGISTER_K == 256);
 #ifndef IQ3XXS_STREAM_STORE
 #define IQ3XXS_STREAM_STORE 0
 #endif
+#ifndef IQ3XXS_REGISTER_DECODE
+#define IQ3XXS_REGISTER_DECODE 0
+#endif
+#ifndef IQ3XXS_REGISTER_N
+#define IQ3XXS_REGISTER_N IQ2XXS_REGISTER_N
+#endif
+static_assert(IQ3XXS_REGISTER_N == 64 || IQ3XXS_REGISTER_N == 128);
 #ifndef IQ3XXS_DECODE_UNROLL
 #define IQ3XXS_DECODE_UNROLL 4
 #endif
@@ -166,7 +173,10 @@ __global__ __launch_bounds__(((BM + 15) / 16) * (BN / 32) * 32,
             ? (IQ3 ? IQ3MinBlocks : IQ2XXS_SHARED_MIN_BLOCKS) : 1)
 void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
     const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr) {
-  static_assert(!IQ3 || (Slab && SharedLUT && Routed && !RegisterDecode && !Fold256));
+  static_assert(!IQ3 || (Slab && SharedLUT && Routed && !Fold256 && !Acc256));
+  static_assert(!(IQ3 && RegisterDecode) ||
+      (!IQ3XXS_COOPERATIVE_DECODE && !IQ3XXS_STREAM_STORE &&
+       !IQ2XXS_PIPELINE && !IQ2XXS_SHUFFLE_SCALE && IQ2XXS_REGISTER_K == 128));
   constexpr int DecodeUnroll = IQ3 ? IQ3XXS_DECODE_UNROLL : 4;
   constexpr bool Cooperative = IQ3 && IQ3XXS_COOPERATIVE_DECODE;
   static_assert(!RegisterDecode || (Slab && SharedLUT && !Fold256));
@@ -189,6 +199,7 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
   };
   __shared__ int8_t tile_storage[Stages][RegisterDecode ? BM : Rows][BK + (Swizzle ? 0 : 16)];
   __shared__ uint2 descriptor_storage[Stages][RegisterDecode ? BN * Blocks : 1];
+  __shared__ uint32_t descriptor_high_storage[IQ3 && RegisterDecode ? BN * Blocks : 1];
   __shared__ int8_t high_tile[Fold256 ? BN : 1][144];
   __shared__ float scale_storage[Stages][Shuffle ? BM : Rows][Blocks];
   __shared__ int subscales[Acc256 ? BN : 1][Blocks];
@@ -349,7 +360,11 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
           } else descriptor = reinterpret_cast<const uint2*>(w)[descriptor_index];
           indices = descriptor.x;
           metadata = descriptor.y;
-          if constexpr (RegisterDecode) descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + row : row * Blocks + block] = descriptor;
+          if constexpr (RegisterDecode) {
+            const int slot = IQ2XXS_TRANSPOSE_DESC ? block * BN + row : row * Blocks + block;
+            descriptors[slot] = descriptor;
+            if constexpr (IQ3) descriptor_high_storage[slot] = indices_high;
+          }
           base_scale = __half2float(wb[int64_t(base / 256) * n + cb + row]);
           if constexpr (Shuffle)
             if (block == 0) weight_bases[row] = base_scale;
@@ -418,6 +433,8 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
         if (cb + row >= n) subscales[row][block] = 0;
       if constexpr (RegisterDecode) {
         if (cb + row >= n) descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + row : row * Blocks + block] = make_uint2(0, 0);
+        if constexpr (IQ3)
+          if (cb + row >= n) descriptor_high_storage[IQ2XXS_TRANSPOSE_DESC ? block * BN + row : row * Blocks + block] = 0;
         if constexpr (Shuffle)
           if (cb + row >= n && block == 0) weight_bases[row] = 0;
       }
@@ -449,7 +466,8 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
         uint32_t bv[2];
         float weight_scale = 0;
         if constexpr (RegisterDecode) {
-          const uint2 descriptor = descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + wc + j * 8 + group : (wc + j * 8 + group) * Blocks + block];
+          const int slot = IQ2XXS_TRANSPOSE_DESC ? block * BN + wc + j * 8 + group : (wc + j * 8 + group) * Blocks + block;
+          const uint2 descriptor = descriptors[slot];
           if constexpr (Shuffle)
             weight_scale = weight_bases[wc + j * 8 + group] *
                            (0.5f + float(descriptor.y >> 28)) * 0.25f;
@@ -460,7 +478,11 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
             uint32_t signs = (descriptor.y >> (part * 7)) & 127;
             signs |= (__popc(signs) & 1) << 7;
             uint32_t values;
-            if constexpr (CompactLUT) {
+            if constexpr (IQ3) {
+              const uint32_t codes = part < 2 ? descriptor.x : descriptor_high_storage[slot];
+              code = (codes >> ((part & 1) * 16 + (tid & 1) * 8)) & 255;
+              values = lut[code];
+            } else if constexpr (CompactLUT) {
               uint32_t selectors = lut[code] >> ((tid & 1) * 16);
               values = __byte_perm(0x002b1908u, 0, selectors);
             } else {
@@ -1118,3 +1140,68 @@ extern "C" int iq3xxs_routed_int8_slab_adaptive(const void* x, void* a, float* s
 #undef IQ3_ADAPTIVE_LAUNCH
   return cudaGetLastError();
 }
+
+#if IQ3XXS_REGISTER_DECODE
+extern "C" int iq3xxs_routed_int8_slab_register(const void* x, void* a, float* sa,
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || taskcount > 65535 || (tile_m != 16 && tile_m != 32))
+    return cudaErrorInvalidValue;
+  quantize<<<(xrows * (k / 32) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 32));
+  if (tile_m == 16)
+    iq2xxs_tiled<16,IQ3XXS_REGISTER_N,true,true,true,false,true,false,false,true,false,true><<<dim3((n+IQ3XXS_REGISTER_N-1)/IQ3XXS_REGISTER_N,taskcount), (16/16)*(IQ3XXS_REGISTER_N/32)*32, 0, stream>>>(
+        static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+        static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts,
+        static_cast<const __half*>(bases));
+  else if (tile_m == 32)
+    iq2xxs_tiled<32,IQ3XXS_REGISTER_N,true,true,true,false,true,false,false,true,false,true><<<dim3((n+IQ3XXS_REGISTER_N-1)/IQ3XXS_REGISTER_N,taskcount), (32/16)*(IQ3XXS_REGISTER_N/32)*32, 0, stream>>>(
+        static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+        static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts,
+        static_cast<const __half*>(bases));
+  return cudaGetLastError();
+}
+extern "C" int iq3xxs_routed_int8_slab_register_weighted(const void* x, void* a, float* sa,
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, const float* weights, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || taskcount > 65535 || (tile_m != 16 && tile_m != 32))
+    return cudaErrorInvalidValue;
+  quantize<<<(xrows * (k / 32) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 32));
+  if (tile_m == 16)
+    iq2xxs_tiled<16,IQ3XXS_REGISTER_N,true,true,true,false,true,true,false,true,false,true><<<dim3((n+IQ3XXS_REGISTER_N-1)/IQ3XXS_REGISTER_N,taskcount), (16/16)*(IQ3XXS_REGISTER_N/32)*32, 0, stream>>>(
+        static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+        static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts,
+        static_cast<const __half*>(bases), weights);
+  else if (tile_m == 32)
+    iq2xxs_tiled<32,IQ3XXS_REGISTER_N,true,true,true,false,true,true,false,true,false,true><<<dim3((n+IQ3XXS_REGISTER_N-1)/IQ3XXS_REGISTER_N,taskcount), (32/16)*(IQ3XXS_REGISTER_N/32)*32, 0, stream>>>(
+        static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+        static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts,
+        static_cast<const __half*>(bases), weights);
+  return cudaGetLastError();
+}
+extern "C" int iq3xxs_routed_int8_slab_register_weighted_quantized(const void* x, void* a, float* sa,
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, const float* weights, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || taskcount > 65535 || (tile_m != 16 && tile_m != 32))
+    return cudaErrorInvalidValue;
+  if (tile_m == 16)
+    iq2xxs_tiled<16,IQ3XXS_REGISTER_N,true,true,true,false,true,true,false,true,false,true><<<dim3((n+IQ3XXS_REGISTER_N-1)/IQ3XXS_REGISTER_N,taskcount), (16/16)*(IQ3XXS_REGISTER_N/32)*32, 0, stream>>>(
+        static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+        static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts,
+        static_cast<const __half*>(bases), weights);
+  else if (tile_m == 32)
+    iq2xxs_tiled<32,IQ3XXS_REGISTER_N,true,true,true,false,true,true,false,true,false,true><<<dim3((n+IQ3XXS_REGISTER_N-1)/IQ3XXS_REGISTER_N,taskcount), (32/16)*(IQ3XXS_REGISTER_N/32)*32, 0, stream>>>(
+        static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+        static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts,
+        static_cast<const __half*>(bases), weights);
+  return cudaGetLastError();
+}
+
+#endif
