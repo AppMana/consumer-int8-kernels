@@ -22,7 +22,17 @@ def repack(packed):
 
 
 class Int8MoE:
-    def __init__(self, native, packed, library, max_tokens, topk, tile):
+    def __init__(
+        self,
+        native,
+        packed,
+        library,
+        max_tokens,
+        topk,
+        tile,
+        activation_block=32,
+        down_activation_block=None,
+    ):
         if (native.first_format, native.second_format) != ("IQ2_XXS", "IQ2_XXS"):
             raise ValueError("Complete INT8 candidate only supports IQ2_XXS pairs")
         self.native = native
@@ -41,8 +51,16 @@ class Int8MoE:
             )
         )
         self.lib = ctypes.CDLL(str(library.resolve()))
-        self.fc1 = self.lib.iq2xxs_routed_int8_slab
-        self.fc2 = self.lib.iq2xxs_routed_int8_slab_weighted
+        if down_activation_block is None:
+            down_activation_block = activation_block
+        if activation_block not in (32, 256) or down_activation_block not in (32, 256):
+            raise ValueError("activation_block must be 32 or 256")
+        suffix = "_fold256" if activation_block == 256 else ""
+        self.fc1 = getattr(self.lib, "iq2xxs_routed_int8_slab" + suffix)
+        down_suffix = "_fold256" if down_activation_block == 256 else ""
+        self.fc2 = getattr(
+            self.lib, "iq2xxs_routed_int8_slab" + down_suffix + "_weighted"
+        )
         for fn, pointers in ((self.fc1, 8), (self.fc2, 9)):
             fn.argtypes = (
                 [ctypes.c_void_p] * pointers + [ctypes.c_int] * 7 + [ctypes.c_void_p]

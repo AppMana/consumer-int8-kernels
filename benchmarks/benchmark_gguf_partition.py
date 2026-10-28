@@ -151,6 +151,8 @@ def main(args):
             if args.int8_library
             else None
         ),
+        int8_activation_block=args.int8_activation_block,
+        int8_down_activation_block=args.int8_down_activation_block,
         int8_library_sha256=(
             hashlib.sha256(args.int8_library.read_bytes()).hexdigest()
             if args.int8_library
@@ -204,7 +206,14 @@ def main(args):
                 if args.int8_library:
                     for tile in (16, 32):
                         int8 = Int8MoE(
-                            native, int8_packed, args.int8_library, count, 6, tile
+                            native,
+                            int8_packed,
+                            args.int8_library,
+                            count,
+                            6,
+                            tile,
+                            activation_block=args.int8_activation_block,
+                            down_activation_block=args.int8_down_activation_block,
                         )
                         output = torch.empty_like(x)
                         calls[f"int8{tile}"] = (
@@ -366,6 +375,10 @@ if __name__ == "__main__":
         help="Isolate native kernels for sanitizer runs; exclude b12x",
     )
     parser.add_argument("--int8-library", type=Path)
+    parser.add_argument(
+        "--int8-activation-block", type=int, choices=(32, 256), default=32
+    )
+    parser.add_argument("--int8-down-activation-block", type=int, choices=(32, 256))
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(

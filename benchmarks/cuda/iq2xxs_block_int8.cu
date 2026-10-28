@@ -1,20 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // Experimental IQ2_XXS compressed weights -> shared INT8 -> INT8 MMA.
-// Original codebook values and per32 scales; only activations are quantized.
+// Exact original weights; default per32 or experimental folded per256 INT8.
+// Only activations are quantized; folded weights use two signed INT8 components.
 // Reuse the block32 activation quantizer and fragment mapping control.
 #include "q8_block_int8.cu"
 #include "../../csrc/gguf_iq_tables.cuh"
 namespace {
+// Eight values per lane; repeat scales to retain existing benchmark scratch ABI.
+__global__ void quantize256(const __nv_bfloat16* x, int8_t* q, float* scales, int blocks) {
+  int lane = threadIdx.x & 31;
+  int block = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  if (block >= blocks) return;
+  float v[8], a = 0;
+  #pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    v[j] = __bfloat162float(x[int64_t(block) * 256 + j * 32 + lane]);
+    a = fmaxf(a, fabsf(v[j]));
+  }
+  for (int delta = 16; delta; delta /= 2)
+    a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, delta));
+  float scale = fmaxf(a / 127.f, 1.e-20f);
+  #pragma unroll
+  for (int j = 0; j < 8; ++j)
+    q[int64_t(block) * 256 + j * 32 + lane] = static_cast<int8_t>(__float2int_rn(v[j] / scale));
+  if (lane < 8) scales[int64_t(block) * 8 + lane] = scale;
+}
 __device__ __forceinline__ uint32_t signed_bytes(uint32_t v, uint32_t signs) {
   uint32_t mask = (signs & 1) * 0xffu | ((signs >> 1) & 1) * 0xff00u |
                   ((signs >> 2) & 1) * 0xff0000u | ((signs >> 3) & 1) * 0xff000000u;
   return __vsub4(v ^ mask, mask);
 }
-template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false>
+template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false, bool Fold256=false>
 __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
     const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr) {
   constexpr int Rows = BM + BN, Threads = (BM / 16) * (BN / 32) * 32;
   __shared__ int8_t tile[Rows][144];
+  __shared__ int8_t high_tile[Fold256 ? BN : 1][144];
   __shared__ float scales[Rows][4];
   const int lane = threadIdx.x & 31, group = lane >> 2, tid = lane & 3;
   const int warp = threadIdx.x >> 5;
@@ -34,6 +55,7 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
     __syncthreads();
   }
   float sum[4][4] = {};
+  int low_acc[4][4] = {}, high_acc[4][4] = {};
   for (int base = 0; base < k; base += 128) {
     for (int index = threadIdx.x; index < BM * 8; index += Threads) {
       int row = index / 8, col = (index % 8) * 16;
@@ -60,7 +82,7 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
     }
     for (int index = threadIdx.x; index < BN * 4; index += Threads) {
       int row = index / 4, block = index % 4;
-      uint64_t values[4] = {};
+      uint64_t values[4] = {}, high_values[4] = {};
       float scale = 0;
       if (cb + row < n) {
         const uint8_t* sub = nullptr;
@@ -85,14 +107,25 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
           }
           base_scale = __half2float(*reinterpret_cast<const __half*>(raw));
         }
-        scale = base_scale * (0.5f + float(metadata >> 28)) * 0.25f;
+        scale = Fold256 ? base_scale * 0.125f : base_scale * (0.5f + float(metadata >> 28)) * 0.25f;
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
           uint32_t signs = (metadata >> (j * 7)) & 127;
           signs |= (__popc(signs) & 1) << 7;
           uint32_t code = (HalfLoads || Slab) ? (indices >> (j * 8)) & 255 : sub[j];
           uint64_t grid = SharedLUT ? lut[code] : iq2xxs_grid[code];
-          if constexpr (Packed) {
+          if constexpr (Fold256) {
+            // Fold the odd IQ scale exactly: signed v = lo + 64*hi.
+            // Max magnitude 43*31=1333; both components fit signed INT8.
+            #pragma unroll
+            for (int t = 0; t < 8; ++t) {
+              int v = int((grid >> (t * 8)) & 255) * (2 * int(metadata >> 28) + 1);
+              int lo = v & 63, hi = v >> 6;
+              if (signs & (1 << t)) { lo = -lo; hi = -hi; }
+              values[j] |= uint64_t(uint8_t(lo)) << (t * 8);
+              high_values[j] |= uint64_t(uint8_t(hi)) << (t * 8);
+            }
+          } else if constexpr (Packed) {
             values[j] = uint64_t(signed_bytes(uint32_t(grid), signs)) |
                         (uint64_t(signed_bytes(uint32_t(grid >> 32), signs >> 4)) << 32);
           } else {
@@ -107,8 +140,11 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
       }
       scales[BM + row][block] = scale;
       #pragma unroll
-      for (int j = 0; j < 4; ++j)
+      for (int j = 0; j < 4; ++j) {
         *reinterpret_cast<uint64_t*>(&tile[BM + row][block * 32 + j * 8]) = values[j];
+        if constexpr (Fold256)
+          *reinterpret_cast<uint64_t*>(&high_tile[row][block * 32 + j * 8]) = high_values[j];
+      }
     }
     __syncthreads();
     #pragma unroll
@@ -124,14 +160,40 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
         for (int r = 0; r < 2; ++r)
           bv[r] = *reinterpret_cast<const uint32_t*>(&tile[BM + wc + j * 8 + group][block * 32 + tid * 4 + r * 16]);
         int acc[4] = {};
+        if constexpr (Fold256) {
+          #pragma unroll
+          for (int r = 0; r < 4; ++r) acc[r] = low_acc[j][r];
+        }
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
             : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
             : "r"(av[0]), "r"(av[1]), "r"(av[2]), "r"(av[3]), "r"(bv[0]), "r"(bv[1]));
-        #pragma unroll
-        for (int r = 0; r < 4; ++r)
-          sum[j][r] += float(acc[r]) * (scales[wr + group + (r >> 1) * 8][block] *
-                                      scales[BM + wc + j * 8 + tid * 2 + (r & 1)][block]);
+        if constexpr (Fold256) {
+          #pragma unroll
+          for (int r = 0; r < 4; ++r) low_acc[j][r] = acc[r];
+          #pragma unroll
+          for (int r = 0; r < 2; ++r)
+            bv[r] = *reinterpret_cast<const uint32_t*>(&high_tile[wc + j * 8 + group][block * 32 + tid * 4 + r * 16]);
+          asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+              : "+r"(high_acc[j][0]), "+r"(high_acc[j][1]), "+r"(high_acc[j][2]), "+r"(high_acc[j][3])
+              : "r"(av[0]), "r"(av[1]), "r"(av[2]), "r"(av[3]), "r"(bv[0]), "r"(bv[1]));
+          if (base % 256 == 128 && block == 3) {
+            #pragma unroll
+            for (int r = 0; r < 4; ++r) {
+              // Bound 127*1333*256 < 2^31; multiply avoids shifting negatives.
+              sum[j][r] += float(low_acc[j][r] + 64 * high_acc[j][r]) *
+                  (scales[wr + group + (r >> 1) * 8][block] *
+                   scales[BM + wc + j * 8 + tid * 2 + (r & 1)][block]);
+              low_acc[j][r] = high_acc[j][r] = 0;
+            }
+          }
+        } else {
+          #pragma unroll
+          for (int r = 0; r < 4; ++r)
+            sum[j][r] += float(acc[r]) * (scales[wr + group + (r >> 1) * 8][block] *
+                                        scales[BM + wc + j * 8 + tid * 2 + (r & 1)][block]);
+        }
       }
     }
     __syncthreads();
@@ -291,6 +353,47 @@ extern "C" int iq2xxs_routed_int8_slab_weighted(const void* x, void* a, float* s
       static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 32));
 #define ROUTED_LAUNCH(M,N) \
   iq2xxs_tiled<M,N,true,true,true,false,true,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
+      static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases), weights)
+  if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
+  else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
+  else { ROUTED_LAUNCH(64,64); }
+#undef ROUTED_LAUNCH
+  return cudaGetLastError();
+}
+
+// Experimental per256 activations and exact two-component folded IQ weights.
+extern "C" int iq2xxs_routed_int8_slab_fold256(const void* x, void* a, float* sa,
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || (tile_m != 16 && tile_m != 32 && tile_m != 64))
+    return cudaErrorInvalidValue;
+  quantize256<<<(xrows * (k / 256) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 256));
+#define ROUTED_LAUNCH(M,N) \
+  iq2xxs_tiled<M,N,true,true,true,false,true,false,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
+      static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases))
+  if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
+  else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
+  else { ROUTED_LAUNCH(64,64); }
+#undef ROUTED_LAUNCH
+  return cudaGetLastError();
+}
+
+extern "C" int iq2xxs_routed_int8_slab_fold256_weighted(const void* x, void* a, float* sa,
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, const float* weights, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || (tile_m != 16 && tile_m != 32 && tile_m != 64))
+    return cudaErrorInvalidValue;
+  quantize256<<<(xrows * (k / 256) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 256));
+#define ROUTED_LAUNCH(M,N) \
+  iq2xxs_tiled<M,N,true,true,true,false,true,true,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
       static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases), weights)
   if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
