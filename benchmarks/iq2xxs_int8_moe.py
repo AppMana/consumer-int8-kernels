@@ -46,6 +46,7 @@ class Int8MoE:
         iq3_adaptive=False,
         external_scratch=False,
         first_tile16=False,
+        b12x_packed=False,
     ):
         if (down_register_decode is not None or down_library is not None) and not (
             tile in (16, 32, 64)
@@ -57,6 +58,39 @@ class Int8MoE:
             raise ValueError("Independent down decoder requires ordinary per32 tiles")
         if down_register_decode is None:
             down_register_decode = register_decode
+        if b12x_packed:
+            if not (
+                register_decode
+                and down_register_decode
+                and tile in (16, 32)
+                and activation_block == 32
+                and down_activation_block in (None, 32)
+                and not (first_tile16 or hybrid1632 or accumulate256 or iq3_adaptive)
+            ):
+                raise ValueError("b12x storage requires ordinary per32 register M16/32")
+            for pair, n, k, fmt in zip(
+                packed,
+                (2 * native.intermediate_size, native.hidden_size),
+                (native.hidden_size, native.intermediate_size),
+                (native.first_format, native.second_format),
+                strict=True,
+            ):
+                if n % 64 or k % 256 or len(pair) != 2:
+                    raise ValueError("Invalid b12x tiled geometry")
+                values, metadata = pair
+                blocks = len(native.expert_ids) * n * (k // 256)
+                width = 32 if fmt == "IQ2_XXS" else 64
+                if (
+                    values.dtype != torch.int32
+                    or metadata.dtype != torch.uint8
+                    or values.numel() * 4 != blocks * width
+                    or metadata.numel() != blocks * 34
+                    or any(
+                        t.device != native.device or not t.is_contiguous() for t in pair
+                    )
+                ):
+                    raise ValueError("Invalid b12x tiled descriptors/metadata storage")
+        storage_suffix = "_routed_int8_b12x" if b12x_packed else "_routed_int8_slab"
         if first_tile16 and not (
             tile == 32
             and native.first_format == "IQ2_XXS"
@@ -187,7 +221,7 @@ class Int8MoE:
             if activation_block == 256
             else ""
         )
-        self.fc1 = getattr(self.lib, first_prefix + "_routed_int8_slab" + suffix)
+        self.fc1 = getattr(self.lib, first_prefix + storage_suffix + suffix)
         down_suffix = (
             "_register"
             if down_register_decode
@@ -218,7 +252,7 @@ class Int8MoE:
         self.fc2 = getattr(
             self.down_lib,
             down_prefix
-            + "_routed_int8_slab"
+            + storage_suffix
             + down_suffix
             + "_weighted"
             + ("_quantized" if fused_swiglu else ""),
