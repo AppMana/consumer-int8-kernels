@@ -15,6 +15,12 @@
 #ifndef IQ2XXS_REGISTER_N
 #define IQ2XXS_REGISTER_N 64
 #endif
+// Increase staging depth independently of the per32 quantization/MMA groups.
+// K256 loses paired complete-MoE timings; keep K128 as the default.
+#ifndef IQ2XXS_REGISTER_K
+#define IQ2XXS_REGISTER_K 128
+#endif
+static_assert(IQ2XXS_REGISTER_K == 128 || IQ2XXS_REGISTER_K == 256);
 // Rejected benchmark variant: lower resource use, slower complete MoE on both
 // SM86 and SM121. Retain the shared per32 scale tile by default.
 #ifndef IQ2XXS_SHUFFLE_SCALE
@@ -80,10 +86,12 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
     const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr) {
   static_assert(!RegisterDecode || (Slab && SharedLUT && !Fold256));
   constexpr int Rows = BM + BN, Threads = (BM / 16) * (BN / 32) * 32;
-  __shared__ int8_t tile[RegisterDecode ? BM : Rows][144];
-  __shared__ uint2 descriptors[RegisterDecode ? BN * 4 : 1];
+  constexpr int BK = RegisterDecode ? IQ2XXS_REGISTER_K : 128;
+  constexpr int Blocks = BK / 32;
+  __shared__ int8_t tile[RegisterDecode ? BM : Rows][BK + 16];
+  __shared__ uint2 descriptors[RegisterDecode ? BN * Blocks : 1];
   __shared__ int8_t high_tile[Fold256 ? BN : 1][144];
-  __shared__ float scales[RegisterDecode && IQ2XXS_SHUFFLE_SCALE ? BM : Rows][4];
+  __shared__ float scales[RegisterDecode && IQ2XXS_SHUFFLE_SCALE ? BM : Rows][Blocks];
   __shared__ float weight_bases[RegisterDecode && IQ2XXS_SHUFFLE_SCALE ? BN : 1];
   const int lane = threadIdx.x & 31, group = lane >> 2, tid = lane & 3;
   const int warp = threadIdx.x >> 5;
@@ -104,9 +112,9 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
   }
   float sum[4][4] = {};
   int low_acc[4][4] = {}, high_acc[4][4] = {};
-  for (int base = 0; base < k; base += 128) {
-    for (int index = threadIdx.x; index < BM * 8; index += Threads) {
-      int row = index / 8, col = (index % 8) * 16;
+  for (int base = 0; base < k; base += BK) {
+    for (int index = threadIdx.x; index < BM * (BK / 16); index += Threads) {
+      int row = index / (BK / 16), col = (index % (BK / 16)) * 16;
       int4 value = {};
       int input = rb + row;
       bool valid = input < m;
@@ -118,8 +126,8 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
         value = *reinterpret_cast<const int4*>(a + int64_t(input) * k + base + col);
       *reinterpret_cast<int4*>(&tile[row][col]) = value;
     }
-    for (int index = threadIdx.x; index < BM * 4; index += Threads) {
-      int row = index / 4, block = index % 4;
+    for (int index = threadIdx.x; index < BM * Blocks; index += Threads) {
+      int row = index / Blocks, block = index % Blocks;
       int input = rb + row;
       bool valid = input < m;
       if constexpr (Routed) {
@@ -128,8 +136,8 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
       }
       scales[row][block] = valid ? sa[int64_t(input) * (k / 32) + base / 32 + block] : 0;
     }
-    for (int index = threadIdx.x; index < BN * 4; index += Threads) {
-      int row = index / 4, block = index % 4;
+    for (int index = threadIdx.x; index < BN * Blocks; index += Threads) {
+      int row = index / Blocks, block = index % Blocks;
       uint64_t values[4] = {}, high_values[4] = {};
       float scale = 0;
       if (cb + row < n) {
@@ -138,10 +146,10 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
         float base_scale;
         if constexpr (Slab) {
           uint2 descriptor = reinterpret_cast<const uint2*>(w)[
-              (int64_t(base / 128) * n + cb + row) * 4 + block];
+              (int64_t(base / 128 + block / 4) * n + cb + row) * 4 + block % 4];
           indices = descriptor.x;
           metadata = descriptor.y;
-          if constexpr (RegisterDecode) descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + row : row * 4 + block] = descriptor;
+          if constexpr (RegisterDecode) descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + row : row * Blocks + block] = descriptor;
           base_scale = __half2float(wb[int64_t(base / 256) * n + cb + row]);
           if constexpr (RegisterDecode && IQ2XXS_SHUFFLE_SCALE)
             if (block == 0) weight_bases[row] = base_scale;
@@ -192,7 +200,7 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
         }
       }
       if constexpr (RegisterDecode) {
-        if (cb + row >= n) descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + row : row * 4 + block] = make_uint2(0, 0);
+        if (cb + row >= n) descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + row : row * Blocks + block] = make_uint2(0, 0);
         if constexpr (IQ2XXS_SHUFFLE_SCALE)
           if (cb + row >= n && block == 0) weight_bases[row] = 0;
       }
@@ -209,7 +217,7 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
     }
     __syncthreads();
     #pragma unroll
-    for (int block = 0; block < 4; ++block) {
+    for (int block = 0; block < Blocks; ++block) {
       uint32_t av[4];
       #pragma unroll
       for (int r = 0; r < 4; ++r)
@@ -219,7 +227,7 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
         uint32_t bv[2];
         float weight_scale = 0;
         if constexpr (RegisterDecode) {
-          const uint2 descriptor = descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + wc + j * 8 + group : (wc + j * 8 + group) * 4 + block];
+          const uint2 descriptor = descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + wc + j * 8 + group : (wc + j * 8 + group) * Blocks + block];
           if constexpr (IQ2XXS_SHUFFLE_SCALE)
             weight_scale = weight_bases[wc + j * 8 + group] *
                            (0.5f + float(descriptor.y >> 28)) * 0.25f;
