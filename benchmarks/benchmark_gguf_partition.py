@@ -169,6 +169,7 @@ def main(args):
         int8_hybrid1632=args.int8_hybrid1632,
         int8_split_decoder=args.int8_split_decoder,
         int8_cross_library=args.int8_cross_library,
+        int8_iq3_adaptive=args.int8_iq3_adaptive,
         int8_activation_block=args.int8_activation_block,
         int8_down_activation_block=args.int8_down_activation_block,
         int8_library_sha256=(
@@ -315,6 +316,24 @@ def main(args):
                                 fused_out,
                             )
                             owners.append(fused)
+                if args.int8_iq3_adaptive:
+                    adaptive = Int8MoE(
+                        native,
+                        int8_packed,
+                        args.int8_library,
+                        count,
+                        6,
+                        32,
+                        fused_swiglu=True,
+                        masked_swiglu=True,
+                        iq3_adaptive=True,
+                    )
+                    adaptive_out = torch.empty_like(x)
+                    calls["int832-adaptive"] = (
+                        partial(adaptive.run, x, ids, weights, adaptive_out),
+                        adaptive_out,
+                    )
+                    owners.append(adaptive)
                 if args.int8_cross_library:
                     for label, first_lib, down_lib in (
                         (
@@ -512,6 +531,10 @@ def main(args):
                                         references[f"int8{tile}-shared-fused"],
                                         references[f"int8{tile}-shared-control"],
                                     )
+                        if args.int8_iq3_adaptive:
+                            assert torch.equal(
+                                references["int832-adaptive"], references["int832"]
+                            )
                         if args.int8_cross_library:
                             for label in ("candidate-control", "control-candidate"):
                                 assert torch.equal(
@@ -624,6 +647,7 @@ if __name__ == "__main__":
     parser.add_argument("--int8-hybrid1632", action="store_true")
     parser.add_argument("--int8-split-decoder", action="store_true")
     parser.add_argument("--int8-cross-library", action="store_true")
+    parser.add_argument("--int8-iq3-adaptive", action="store_true")
     parser.add_argument(
         "--int8-activation-block", type=int, choices=(32, 256), default=32
     )
@@ -713,4 +737,12 @@ if __name__ == "__main__":
             "Cross-library comparison requires shared fused per32 "
             "candidates and control"
         )
+    if args.int8_iq3_adaptive and not (
+        args.int8_library
+        and args.int8_shared_fused
+        and not args.int8_register_decode
+        and args.int8_activation_block == 32
+        and args.int8_down_activation_block in (None, 32)
+    ):
+        parser.error("Adaptive IQ3 requires shared fused per32 candidates")
     main(args)

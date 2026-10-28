@@ -148,9 +148,9 @@ __device__ __forceinline__ void iq_async_copy(void* dst, const void* src, bool v
   asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;" ::
       "r"(shared), "l"(src), "n"(Bytes), "r"(valid ? Bytes : 0) : "memory");
 }
-template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false, bool Fold256=false, bool RegisterDecode=false, bool Acc256=false, bool IQ3=false>
+template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false, bool Fold256=false, bool RegisterDecode=false, bool Acc256=false, bool IQ3=false, int IQ3MinBlocks=IQ3XXS_MIN_BLOCKS>
 __global__ __launch_bounds__(((BM + 15) / 16) * (BN / 32) * 32,
-    (Routed && Slab && !Fold256 && !RegisterDecode && BM == 32 && BN == 64) ? (IQ3 ? IQ3XXS_MIN_BLOCKS : IQ2XXS_SHARED_MIN_BLOCKS) : 1)
+    (Routed && Slab && !Fold256 && !RegisterDecode && BM == 32 && BN == 64) ? (IQ3 ? IQ3MinBlocks : IQ2XXS_SHARED_MIN_BLOCKS) : 1)
 void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
     const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr) {
   static_assert(!IQ3 || (Slab && SharedLUT && Routed && !RegisterDecode && !Fold256));
@@ -1063,5 +1063,36 @@ extern "C" int iq3xxs_routed_int8_slab_weighted_quantized(const void* x, void* a
         static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
         static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts,
         static_cast<const __half*>(bases), weights);
+  return cudaGetLastError();
+}
+
+// Native32 tasks: partial (<32 valid rows) first, full32 second. Every slot
+// is overwritten on replay; route planner guarantees valid-prefix tiles.
+extern "C" int iq3xxs_classify_full32(const int32_t* input, const int32_t* tokens,
+    int32_t* output, int count, int rows, cudaStream_t stream) {
+  if (count <= 0 || count > 32767 || rows <= 0) return cudaErrorInvalidValue;
+  iq_classify_rows<31><<<(count + 255) / 256, 256, 0, stream>>>(input, tokens, output, count, rows);
+  return cudaGetLastError();
+}
+
+// Quantize once, then select FC1 register allocation without host readback.
+extern "C" int iq3xxs_routed_int8_slab_adaptive(const void* x, void* a, float* sa,
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || taskcount % 2 || taskcount > 65534 || tile_m != 32)
+    return cudaErrorInvalidValue;
+  quantize<<<(xrows * (k / 32) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 32));
+  taskcount /= 2;
+#define IQ3_ADAPTIVE_LAUNCH(BOUND) \
+  iq2xxs_tiled<32,64,true,true,true,false,true,false,false,false,false,true,BOUND><<<dim3((n+63)/64,taskcount),128,0,stream>>>( \
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
+      static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases))
+  IQ3_ADAPTIVE_LAUNCH(IQ3XXS_MIN_BLOCKS);
+  tasks += taskcount * 2;
+  IQ3_ADAPTIVE_LAUNCH(1);
+#undef IQ3_ADAPTIVE_LAUNCH
   return cudaGetLastError();
 }

@@ -43,6 +43,7 @@ class Int8MoE:
         hybrid1632=False,
         down_register_decode=None,
         down_library=None,
+        iq3_adaptive=False,
     ):
         if (down_register_decode is not None or down_library is not None) and not (
             tile in (16, 32, 64)
@@ -80,6 +81,21 @@ class Int8MoE:
             and down_activation_block in (None, 32)
         ):
             raise ValueError("Hybrid16/32 requires masked fused per32 path and tile32")
+        if iq3_adaptive and not (
+            native.first_format == "IQ3_XXS"
+            and tile == 32
+            and activation_block == 32
+            and down_activation_block in (None, 32)
+            and not register_decode
+            and not down_register_decode
+            and fused_swiglu
+            and masked_swiglu
+            and not hybrid1632
+            and not accumulate256
+            and down_library is None
+        ):
+            raise ValueError("Adaptive IQ3 FC1 requires shared fused per32 tile32")
+        self.iq3_adaptive = iq3_adaptive
         self.native = native
         self.packed = packed
         # Benchmark C ABI uses tile=0 for disjoint sparse8/dense16 task arrays.
@@ -108,7 +124,7 @@ class Int8MoE:
             else self.lib
         )
         self.small_tasks = None
-        if tile in (0, 8) or hybrid1632:
+        if tile in (0, 8) or hybrid1632 or iq3_adaptive:
             tasks = self.scratch[4]
             if tasks.shape[0] > 32767:
                 raise ValueError("Retiled task capacity exceeds CUDA grid")
@@ -116,7 +132,9 @@ class Int8MoE:
                 tasks.shape[0] * 2, 2, device=native.device, dtype=torch.int32
             )
             self.retile = (
-                self.lib.iq2xxs_classify1632
+                self.lib.iq3xxs_classify_full32
+                if iq3_adaptive
+                else self.lib.iq2xxs_classify1632
                 if hybrid1632
                 else self.lib.iq2xxs_retile_mixed
                 if tile == 0
@@ -190,6 +208,8 @@ class Int8MoE:
         if hybrid1632:
             self.fc1 = self.lib.iq2xxs_routed_int8_slab_hybrid1632
             self.fc2 = self.lib.iq2xxs_routed_int8_slab_hybrid1632_weighted_quantized
+        if iq3_adaptive:
+            self.fc1 = self.lib.iq3xxs_routed_int8_slab_adaptive
         for fn, pointers in ((self.fc1, 8), (self.fc2, 9)):
             fn.argtypes = (
                 [ctypes.c_void_p] * pointers + [ctypes.c_int] * 7 + [ctypes.c_void_p]
@@ -274,6 +294,9 @@ class Int8MoE:
                 )
                 == 0
             )
+        if self.iq3_adaptive:
+            tasks = self.scratch[4]
+            tail = (tail[0], tasks.shape[0], tail[2], tail[3])
         assert (
             self.fc2(
                 *[
