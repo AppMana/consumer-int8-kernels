@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Race native CUDA and prepared b12x on actual, distinct local GGUF experts.
 
-Streams the verified checkpoint; no replicated expert payloads. Synthetic routing,
+Streams the verified checkpoint without replicated expert payloads. Routing,
 no collectives, and sampled independent oracles make this a component benchmark.
 """
 
@@ -49,6 +49,30 @@ def make_routes(count, first, pattern):
     if first not in ids[0]:
         ids[0, 0] = first
     return ids.astype(np.int32)
+
+
+def load_fixture(path, layer, count, rank):
+    fixture = torch.load(path, map_location="cpu", weights_only=True)
+    if (fixture["layer"], fixture["tokens"], fixture["rank"]) != (layer, count, rank):
+        raise ValueError("Serving fixture layer/token/rank mismatch")
+    if fixture["revision"] != "60ad3651641b5c97679c807e064ab1d7a3ca1455":
+        raise ValueError("Serving fixture checkpoint revision mismatch")
+    x, ids, weights = (fixture[k] for k in ("x", "ids", "weights"))
+    if (x.shape, ids.shape, weights.shape) != ((count, 5120), (count, 6), (count, 6)):
+        raise ValueError("Serving fixture shapes mismatch")
+    if (x.dtype, ids.dtype, weights.dtype) != (
+        torch.bfloat16,
+        torch.int32,
+        torch.float32,
+    ):
+        raise ValueError("Serving fixture dtypes mismatch")
+    if not torch.isfinite(x).all() or not torch.isfinite(weights).all():
+        raise ValueError("Serving fixture contains nonfinite inputs")
+    if not ((ids >= 0) & (ids < 384)).all():
+        raise ValueError("Serving fixture expert IDs outside checkpoint")
+    if (ids.sort(dim=1).values.diff(dim=1) == 0).any():
+        raise ValueError("Serving fixture contains duplicate top-k IDs")
+    return x, ids, weights
 
 
 def reference(sources, x, ids, weights, owned):
@@ -182,7 +206,12 @@ def main(args):
         device=str(torch.cuda.get_device_properties(device)),
         rank=args.rank,
         local_experts=args.experts,
-        scope="Distinct resident checkpoint experts; synthetic routing; no collectives",
+        scope="Distinct resident checkpoint experts; no collectives",
+        fixture_sha256=(
+            hashlib.sha256(args.fixture.read_bytes()).hexdigest()
+            if args.fixture
+            else None
+        ),
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x") as report:
@@ -446,7 +475,13 @@ def main(args):
                         calls[f"b12x-capacity{capacity}"] = (extra.run, extra.output)
                         owners.append(extra)
                 for pattern in args.patterns:
-                    host_ids = make_routes(count, first, pattern)
+                    if pattern == "recorded":
+                        fx, fi, fw = load_fixture(args.fixture, layer, count, args.rank)
+                        x.copy_(fx)
+                        weights.copy_(fw)
+                        host_ids = fi.numpy()
+                    else:
+                        host_ids = make_routes(count, first, pattern)
                     ids.copy_(torch.from_numpy(host_ids))
                     local = (
                         host_ids[
@@ -464,8 +499,9 @@ def main(args):
                             with torch.cuda.graph(graph):
                                 run()
                             graphs[label] = graph
-                        x.mul_(0.75)
-                        weights.mul_(0.8)
+                        if pattern != "recorded":
+                            x.mul_(0.75)
+                            weights.mul_(0.8)
                         samples = torch.tensor(
                             sorted({0, count // 2, count - 1}), device=device
                         )
@@ -627,6 +663,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--fixture", type=Path)
     parser.add_argument(
         "--native-only",
         action="store_true",
@@ -667,7 +704,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--patterns",
-        choices=["balanced", "legacy-balanced", "random"],
+        choices=["balanced", "legacy-balanced", "random", "recorded"],
         nargs="+",
         default=["balanced", "random"],
     )
@@ -676,6 +713,14 @@ if __name__ == "__main__":
     parser.add_argument("--trials", type=int, default=10)
     parser.add_argument("--device", type=int, default=0)
     args = parser.parse_args()
+    if args.fixture or "recorded" in args.patterns:
+        if not (
+            args.fixture
+            and args.patterns == ["recorded"]
+            and len(args.layers) == len(args.tokens) == 1
+        ):
+            parser.error("Fixture requires one layer/count and --patterns recorded")
+        load_fixture(args.fixture, args.layers[0], args.tokens[0], args.rank)
     if not 1 <= args.experts <= 192 or min(*args.tokens, args.trials) < 1:
         parser.error("Invalid expert count, token count or trials")
     if any(capacity < max(args.tokens) for capacity in args.b12x_capacities):
