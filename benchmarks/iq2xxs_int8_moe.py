@@ -40,11 +40,12 @@ class Int8MoE:
             raise ValueError("Complete INT8 candidate only supports IQ2_XXS pairs")
         self.native = native
         self.packed = packed
-        if tile == 8 and not (register_decode and fused_swiglu and masked_swiglu):
-            raise ValueError("Eight-row experiment requires masked fused register path")
+        # Benchmark C ABI uses tile=0 for disjoint sparse8/dense16 task arrays.
+        if tile in (0, 8) and not (register_decode and fused_swiglu and masked_swiglu):
+            raise ValueError("Small-row experiment requires masked fused register path")
         self.tile = tile
         self.plan = ExecutionPlan(
-            native, max_tokens, topk, tile_rows=16 if tile == 8 else tile
+            native, max_tokens, topk, tile_rows=16 if tile in (0, 8) else tile
         )
         self.scratch = self.plan.allocate_scratch()
         r = self.plan.route_capacity
@@ -60,14 +61,16 @@ class Int8MoE:
         )
         self.lib = ctypes.CDLL(str(library.resolve()))
         self.small_tasks = None
-        if tile == 8:
+        if tile in (0, 8):
             tasks = self.scratch[4]
             if tasks.shape[0] > 32767:
                 raise ValueError("Retiled task capacity exceeds CUDA grid")
             self.small_tasks = torch.empty(
                 tasks.shape[0] * 2, 2, device=native.device, dtype=torch.int32
             )
-            self.retile = self.lib.iq2xxs_retile8
+            self.retile = (
+                self.lib.iq2xxs_retile_mixed if tile == 0 else self.lib.iq2xxs_retile8
+            )
             self.retile.argtypes = (
                 [ctypes.c_void_p] * 3 + [ctypes.c_int] * 2 + [ctypes.c_void_p]
             )

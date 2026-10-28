@@ -162,6 +162,7 @@ def main(args):
         int8_control_fused_swiglu=args.int8_control_fused_swiglu,
         int8_control_masked_swiglu=args.int8_control_masked_swiglu,
         int8_eight_row=args.int8_eight_row,
+        int8_mixed_row=args.int8_mixed_row,
         int8_activation_block=args.int8_activation_block,
         int8_down_activation_block=args.int8_down_activation_block,
         int8_library_sha256=(
@@ -219,9 +220,9 @@ def main(args):
                         (False, True) if args.int8_register_decode else (False,)
                     ):
                         for tile in (
-                            (8, 16, 32)
-                            if register_decode and args.int8_eight_row
-                            else (16, 32)
+                            ((0,) if register_decode and args.int8_mixed_row else ())
+                            + ((8,) if register_decode and args.int8_eight_row else ())
+                            + (16, 32)
                         ):
                             int8 = Int8MoE(
                                 native,
@@ -361,6 +362,10 @@ def main(args):
                             assert torch.equal(
                                 references["int88"], references["int816-shared"]
                             )
+                        if args.int8_mixed_row:
+                            assert torch.equal(
+                                references["int80"], references["int816-shared"]
+                            )
                         flush = torch.empty(64 << 20, device=device, dtype=torch.uint8)
                         timings = {label: [] for label in graphs}
                         for trial in range(args.trials):
@@ -448,6 +453,7 @@ if __name__ == "__main__":
     parser.add_argument("--int8-control-fused-swiglu", action="store_true")
     parser.add_argument("--int8-control-masked-swiglu", action="store_true")
     parser.add_argument("--int8-eight-row", action="store_true")
+    parser.add_argument("--int8-mixed-row", action="store_true")
     parser.add_argument(
         "--int8-activation-block", type=int, choices=(32, 256), default=32
     )
@@ -494,6 +500,6 @@ if __name__ == "__main__":
         parser.error("Fused control requires a control library")
     if args.int8_control_masked_swiglu and not args.int8_control_fused_swiglu:
         parser.error("Masked control requires fused control SwiGLU")
-    if args.int8_eight_row and not args.int8_masked_swiglu:
+    if (args.int8_eight_row or args.int8_mixed_row) and not args.int8_masked_swiglu:
         parser.error("Eight-row comparison requires masked SwiGLU")
     main(args)
