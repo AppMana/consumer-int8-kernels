@@ -10,9 +10,9 @@ __device__ __forceinline__ uint32_t signed_bytes(uint32_t v, uint32_t signs) {
                   ((signs >> 2) & 1) * 0xff0000u | ((signs >> 3) & 1) * 0xff000000u;
   return __vsub4(v ^ mask, mask);
 }
-template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false>
+template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false>
 __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
-    const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1) {
+    const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr) {
   constexpr int Rows = BM + BN, Threads = (BM / 16) * (BN / 32) * 32;
   __shared__ int8_t tile[Rows][144];
   __shared__ float scales[Rows][4];
@@ -23,7 +23,8 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
     const int expert = tasks[blockIdx.y * 2];
     rb = tasks[blockIdx.y * 2 + 1];
     if (expert < 0 || expert >= experts || rb < 0 || rb >= m) return;
-    w += int64_t(expert) * n * (k / 256) * 66;
+    w += int64_t(expert) * n * (k / 256) * (Slab ? 64 : 66);
+    if constexpr (Slab) wb += int64_t(expert) * n * (k / 256);
   }
   const int cb = blockIdx.x * BN;
   const int wr = (warp / (BN / 32)) * 16, wc = (warp % (BN / 32)) * 32;
@@ -62,24 +63,34 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
       uint64_t values[4] = {};
       float scale = 0;
       if (cb + row < n) {
-        const uint8_t* raw = w + (int64_t(cb + row) * (k / 256) + base / 256) * 66;
-        const uint8_t* sub = raw + 2 + ((base % 256) / 32 + block) * 8;
+        const uint8_t* sub = nullptr;
         uint32_t metadata, indices = 0;
-        if constexpr (HalfLoads) {
-          const uint16_t* words = reinterpret_cast<const uint16_t*>(sub);
-          indices = uint32_t(words[0]) | (uint32_t(words[1]) << 16);
-          metadata = uint32_t(words[2]) | (uint32_t(words[3]) << 16);
+        float base_scale;
+        if constexpr (Slab) {
+          uint2 descriptor = reinterpret_cast<const uint2*>(w)[
+              (int64_t(base / 128) * n + cb + row) * 4 + block];
+          indices = descriptor.x;
+          metadata = descriptor.y;
+          base_scale = __half2float(wb[int64_t(base / 256) * n + cb + row]);
         } else {
-          metadata = uint32_t(sub[4]) | (uint32_t(sub[5]) << 8) |
-                     (uint32_t(sub[6]) << 16) | (uint32_t(sub[7]) << 24);
+          const uint8_t* raw = w + (int64_t(cb + row) * (k / 256) + base / 256) * 66;
+          sub = raw + 2 + ((base % 256) / 32 + block) * 8;
+          if constexpr (HalfLoads) {
+            const uint16_t* words = reinterpret_cast<const uint16_t*>(sub);
+            indices = uint32_t(words[0]) | (uint32_t(words[1]) << 16);
+            metadata = uint32_t(words[2]) | (uint32_t(words[3]) << 16);
+          } else {
+            metadata = uint32_t(sub[4]) | (uint32_t(sub[5]) << 8) |
+                       (uint32_t(sub[6]) << 16) | (uint32_t(sub[7]) << 24);
+          }
+          base_scale = __half2float(*reinterpret_cast<const __half*>(raw));
         }
-        scale = __half2float(*reinterpret_cast<const __half*>(raw)) *
-                (0.5f + float(metadata >> 28)) * 0.25f;
+        scale = base_scale * (0.5f + float(metadata >> 28)) * 0.25f;
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
           uint32_t signs = (metadata >> (j * 7)) & 127;
           signs |= (__popc(signs) & 1) << 7;
-          uint32_t code = HalfLoads ? (indices >> (j * 8)) & 255 : sub[j];
+          uint32_t code = (HalfLoads || Slab) ? (indices >> (j * 8)) & 255 : sub[j];
           uint64_t grid = SharedLUT ? lut[code] : iq2xxs_grid[code];
           if constexpr (Packed) {
             values[j] = uint64_t(signed_bytes(uint32_t(grid), signs)) |
@@ -237,6 +248,27 @@ extern "C" int iq2xxs_routed_int8_half(const void* x, void* a, float* sa,
   iq2xxs_tiled<M,N,true,true,true,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
       static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts)
+  if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
+  else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
+  else { ROUTED_LAUNCH(64,64); }
+#undef ROUTED_LAUNCH
+  return cudaGetLastError();
+}
+
+// Lossless descriptors[E,K/128,N,4,8] and bases[E,K/256,N].
+extern "C" int iq2xxs_routed_int8_slab(const void* x, void* a, float* sa,
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || (tile_m != 16 && tile_m != 32 && tile_m != 64))
+    return cudaErrorInvalidValue;
+  quantize<<<(xrows * (k / 32) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 32));
+#define ROUTED_LAUNCH(M,N) \
+  iq2xxs_tiled<M,N,true,true,true,false,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
+      static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases))
   if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
   else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
   else { ROUTED_LAUNCH(64,64); }

@@ -74,6 +74,31 @@ def main(args):
     experts, n, blocks, _ = raw_np.shape
     k = blocks * 256
     raw = torch.from_numpy(raw_np).cuda()
+    if args.slab_layout:
+        descriptors = (
+            raw[..., 2:]
+            .reshape(experts, n, blocks * 2, 4, 8)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
+        slab_bases = (
+            raw[..., :2]
+            .contiguous()
+            .view(torch.float16)
+            .squeeze(-1)
+            .transpose(1, 2)
+            .contiguous()
+        )
+        assert descriptors.numel() + slab_bases.numel() * 2 == raw.numel()
+        restored = descriptors.permute(0, 2, 1, 3, 4).reshape(experts, n, blocks, 64)
+        assert torch.equal(restored, raw[..., 2:])
+        assert torch.equal(
+            slab_bases.transpose(1, 2)
+            .contiguous()
+            .view(torch.uint8)
+            .reshape(experts, n, blocks, 2),
+            raw[..., :2],
+        )
     if args.native_library:
         torch.ops.load_library(str(args.native_library.resolve()))
         bases = raw[..., :2].contiguous().view(torch.float16).squeeze(-1)
@@ -90,172 +115,208 @@ def main(args):
         half_call = lib.iq2xxs_routed_int8_half
         half_call.argtypes = call.argtypes
         half_call.restype = ctypes.c_int
+    if args.slab_layout:
+        slab_call = lib.iq2xxs_routed_int8_slab
+        slab_call.argtypes = (
+            [ctypes.c_void_p] * 8 + [ctypes.c_int] * 7 + [ctypes.c_void_p]
+        )
+        slab_call.restype = ctypes.c_int
     flush = torch.empty(64 << 20, device="cuda", dtype=torch.uint8)
     with args.output.open("x") as report:
         for count in args.tokens:
-            x = torch.randn(count, k, device="cuda", dtype=torch.bfloat16) * 0.1
-            x[:, :32] = 0
-            a = torch.empty_like(x, dtype=torch.int8)
-            sa = torch.empty(count, k // 32, device="cuda")
-            # Balanced global top6 routes: local partition ownership is explicit.
-            universe = 384 if args.checkpoint else experts
-            ids = (np.arange(count)[:, None] * 6 + np.arange(6)[None]) % universe
-            first = args.first_expert if args.checkpoint else 0
-            slots = [np.where(ids == first + e)[0] for e in range(experts)]
-            graphs, owners, errors, capacities = {}, [], {}, {}
-            variants = [("int8", t) for t in (16, 32, 64)]
-            if args.aligned_loads:
-                variants += [("half", t) for t in (16, 32, 64)]
-            if args.native_library:
-                variants += [("bf16", t) for t in (16, 32)]
-            for backend, tile in variants:
-                name = f"{backend}_{tile}"
-                tokens, tasks, offsets = [], [], []
-                for e, rows in enumerate(slots):
-                    start = len(tokens)
-                    padded = (len(rows) + tile - 1) // tile * tile
-                    offsets.append((start, len(rows), padded))
-                    tokens.extend(rows.tolist() + [-1] * (padded - len(rows)))
-                    tasks.extend((e, start + i) for i in range(0, padded, tile))
-                token = torch.tensor(tokens, device="cuda", dtype=torch.int32)
-                task = torch.tensor(tasks[::-1], device="cuda", dtype=torch.int32)
-                out = torch.empty(len(tokens), n, device="cuda", dtype=torch.bfloat16)
-                capacities[name] = dict(
-                    rows=len(tokens), tasks=len(tasks), live=sum(map(len, slots))
-                )
-
-                selected_call = half_call if backend == "half" else call
-                weights = torch.ones(len(tokens), device="cuda")
-
-                def run(
-                    token=token,
-                    task=task,
-                    out=out,
-                    tile=tile,
-                    x=x,
-                    a=a,
-                    sa=sa,
-                    count=count,
-                    backend=backend,
-                    weights=weights,
-                    selected_call=selected_call,
-                ):
-                    if backend == "bf16":
-                        torch.ops.consumer_int8.gguf_iq_xxs_routed_mm(
-                            x,
-                            codes,
-                            bases,
-                            metadata,
-                            token,
-                            task,
-                            weights,
-                            out,
-                            2,
-                            tile,
-                            False,
-                        )
-                        return
-                    assert (
-                        selected_call(
-                            *[v.data_ptr() for v in (x, a, sa, raw, token, task, out)],
-                            count,
-                            out.shape[0],
-                            n,
-                            k,
-                            experts,
-                            task.shape[0],
-                            tile,
-                            torch.cuda.current_stream().cuda_stream,
-                        )
-                        == 0
+            for pattern in args.patterns:
+                x = torch.randn(count, k, device="cuda", dtype=torch.bfloat16) * 0.1
+                x[:, :32] = 0
+                a = torch.empty_like(x, dtype=torch.int8)
+                sa = torch.empty(count, k // 32, device="cuda")
+                # Balanced global top6 routes: local partition ownership is explicit.
+                universe = 384 if args.checkpoint else experts
+                ids = (np.arange(count)[:, None] * 6 + np.arange(6)[None]) % universe
+                if pattern == "random":
+                    rng = np.random.default_rng(928 + count)
+                    ids = np.stack(
+                        [
+                            rng.choice(universe, 6, replace=universe < 6)
+                            for _ in range(count)
+                        ]
+                    )
+                first = args.first_expert if args.checkpoint else 0
+                slots = [np.where(ids == first + e)[0] for e in range(experts)]
+                graphs, owners, errors, capacities = {}, [], {}, {}
+                variants = [("int8", t) for t in (16, 32, 64)]
+                if args.slab_layout:
+                    variants += [("slab", t) for t in (16, 32, 64)]
+                if args.aligned_loads:
+                    variants += [("half", t) for t in (16, 32, 64)]
+                if args.native_library:
+                    variants += [("bf16", t) for t in (16, 32)]
+                for backend, tile in variants:
+                    name = f"{backend}_{tile}"
+                    tokens, tasks, offsets = [], [], []
+                    for e, rows in enumerate(slots):
+                        start = len(tokens)
+                        padded = (len(rows) + tile - 1) // tile * tile
+                        offsets.append((start, len(rows), padded))
+                        tokens.extend(rows.tolist() + [-1] * (padded - len(rows)))
+                        tasks.extend((e, start + i) for i in range(0, padded, tile))
+                    token = torch.tensor(tokens, device="cuda", dtype=torch.int32)
+                    task = torch.tensor(tasks[::-1], device="cuda", dtype=torch.int32)
+                    out = torch.empty(
+                        len(tokens), n, device="cuda", dtype=torch.bfloat16
+                    )
+                    capacities[name] = dict(
+                        rows=len(tokens), tasks=len(tasks), live=sum(map(len, slots))
                     )
 
-                for _ in range(3):
-                    run()
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    run()
-                owners.append((token, task, out, graph, weights))
-                graphs[name] = graph
-                tested = (
-                    range(experts) if experts <= 4 else (0, experts // 2, experts - 1)
-                )
-                references = {
-                    e: torch.from_numpy(
-                        gguf.dequantize(
-                            raw_np[e].reshape(n, -1), gguf.GGMLQuantizationType.IQ2_XXS
+                    selected_call = (
+                        slab_call
+                        if backend == "slab"
+                        else half_call
+                        if backend == "half"
+                        else call
+                    )
+                    weights = torch.ones(len(tokens), device="cuda")
+
+                    def run(
+                        token=token,
+                        task=task,
+                        out=out,
+                        tile=tile,
+                        x=x,
+                        a=a,
+                        sa=sa,
+                        count=count,
+                        backend=backend,
+                        weights=weights,
+                        selected_call=selected_call,
+                    ):
+                        if backend == "bf16":
+                            torch.ops.consumer_int8.gguf_iq_xxs_routed_mm(
+                                x,
+                                codes,
+                                bases,
+                                metadata,
+                                token,
+                                task,
+                                weights,
+                                out,
+                                2,
+                                tile,
+                                False,
+                            )
+                            return
+                        pointers = (
+                            (x, a, sa, descriptors, slab_bases, token, task, out)
+                            if backend == "slab"
+                            else (x, a, sa, raw, token, task, out)
                         )
-                    ).cuda()
-                    for e in tested
-                }
-                errors[name] = []
-                for _ in range(2):
-                    x.neg_()
-                    token.copy_(torch.where(token >= 0, count - 1 - token, token))
-                    out.fill_(float("nan"))
-                    graph.replay()
-                    assert torch.isfinite(out).all()
-                    assert (out[token < 0] == 0).all()
-                    if backend != "bf16":
-                        xb = x.float().reshape(count, k // 32, 32)
-                        expected = (xb.abs().amax(-1) / 127).clamp_min(1e-20)
-                        torch.testing.assert_close(sa, expected, rtol=1e-6, atol=0)
                         assert (
-                            a.reshape_as(xb).float() - xb / expected[..., None]
-                        ).abs().max() <= 0.50002
-                    for e in tested:
-                        start, live, _ = offsets[e]
-                        if not live:
-                            continue
-                        selected = token[start : start + live].long()
-                        expected_y = x[selected].float() @ references[e].T
-                        actual = out[start : start + live].float()
-                        relative = (
-                            (actual - expected_y).norm() / expected_y.norm()
-                        ).item()
-                        assert relative < 0.015, (e, tile, relative)
-                        errors[name].append(relative)
-                del references
-            times = {tile: [] for tile in graphs}
-            for trial in range(20):
-                for tile in list(graphs)[:: 1 if trial % 2 else -1]:
-                    flush.zero_()
-                    start, end = [
-                        torch.cuda.Event(enable_timing=True) for _ in range(2)
-                    ]
-                    start.record()
-                    graphs[tile].replay()
-                    end.record()
-                    end.synchronize()
-                    times[tile].append(start.elapsed_time(end))
-            record = dict(
-                tokens=count,
-                experts=experts,
-                n=n,
-                k=k,
-                identity=identity,
-                source="verified distinct experts"
-                if args.checkpoint
-                else "synthetic grouping of distinct tensor slices",
-                medians_ms={t: statistics.median(v) for t, v in times.items()},
-                milliseconds=times,
-                capacities=capacities,
-                relative_l2=errors,
-                library_sha256=hashlib.sha256(args.library.read_bytes()).hexdigest(),
-                native_library_sha256=(
-                    hashlib.sha256(args.native_library.read_bytes()).hexdigest()
-                    if args.native_library
-                    else None
-                ),
-                benchmark_sha256=hashlib.sha256(
-                    Path(__file__).read_bytes()
-                ).hexdigest(),
-                device=str(torch.cuda.get_device_properties(args.device)),
-                scope="quantization plus routed projection; excludes CPU routing",
-            )
-            report.write(json.dumps(record) + "\n")
-            report.flush()
-            print(json.dumps(record), flush=True)
+                            selected_call(
+                                *[v.data_ptr() for v in pointers],
+                                count,
+                                out.shape[0],
+                                n,
+                                k,
+                                experts,
+                                task.shape[0],
+                                tile,
+                                torch.cuda.current_stream().cuda_stream,
+                            )
+                            == 0
+                        )
+
+                    for _ in range(3):
+                        run()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        run()
+                    owners.append((token, task, out, graph, weights))
+                    graphs[name] = graph
+                    tested = (
+                        range(experts)
+                        if experts <= 4
+                        else (0, experts // 2, experts - 1)
+                    )
+                    references = {
+                        e: torch.from_numpy(
+                            gguf.dequantize(
+                                raw_np[e].reshape(n, -1),
+                                gguf.GGMLQuantizationType.IQ2_XXS,
+                            )
+                        ).cuda()
+                        for e in tested
+                    }
+                    errors[name] = []
+                    for _ in range(2):
+                        x.neg_()
+                        token.copy_(torch.where(token >= 0, count - 1 - token, token))
+                        out.fill_(float("nan"))
+                        graph.replay()
+                        assert torch.isfinite(out).all()
+                        assert (out[token < 0] == 0).all()
+                        if backend != "bf16":
+                            xb = x.float().reshape(count, k // 32, 32)
+                            expected = (xb.abs().amax(-1) / 127).clamp_min(1e-20)
+                            torch.testing.assert_close(sa, expected, rtol=1e-6, atol=0)
+                            assert (
+                                a.reshape_as(xb).float() - xb / expected[..., None]
+                            ).abs().max() <= 0.50002
+                        for e in tested:
+                            start, live, _ = offsets[e]
+                            if not live:
+                                continue
+                            selected = token[start : start + live].long()
+                            expected_y = x[selected].float() @ references[e].T
+                            actual = out[start : start + live].float()
+                            relative = (
+                                (actual - expected_y).norm() / expected_y.norm()
+                            ).item()
+                            assert relative < 0.015, (e, tile, relative)
+                            errors[name].append(relative)
+                    del references
+                times = {tile: [] for tile in graphs}
+                for trial in range(20):
+                    for tile in list(graphs)[:: 1 if trial % 2 else -1]:
+                        flush.zero_()
+                        start, end = [
+                            torch.cuda.Event(enable_timing=True) for _ in range(2)
+                        ]
+                        start.record()
+                        graphs[tile].replay()
+                        end.record()
+                        end.synchronize()
+                        times[tile].append(start.elapsed_time(end))
+                record = dict(
+                    pattern=pattern,
+                    tokens=count,
+                    experts=experts,
+                    n=n,
+                    k=k,
+                    identity=identity,
+                    source="verified distinct experts"
+                    if args.checkpoint
+                    else "synthetic grouping of distinct tensor slices",
+                    medians_ms={t: statistics.median(v) for t, v in times.items()},
+                    milliseconds=times,
+                    capacities=capacities,
+                    relative_l2=errors,
+                    library_sha256=hashlib.sha256(
+                        args.library.read_bytes()
+                    ).hexdigest(),
+                    native_library_sha256=(
+                        hashlib.sha256(args.native_library.read_bytes()).hexdigest()
+                        if args.native_library
+                        else None
+                    ),
+                    benchmark_sha256=hashlib.sha256(
+                        Path(__file__).read_bytes()
+                    ).hexdigest(),
+                    device=str(torch.cuda.get_device_properties(args.device)),
+                    scope="quantization plus routed projection; excludes CPU routing",
+                )
+                report.write(json.dumps(record) + "\n")
+                report.flush()
+                print(json.dumps(record), flush=True)
 
 
 if __name__ == "__main__":
@@ -264,6 +325,7 @@ if __name__ == "__main__":
     source.add_argument("--checkpoint", type=Path)
     source.add_argument("--manifest", type=Path)
     p.add_argument("--library", type=Path, required=True)
+    p.add_argument("--slab-layout", action="store_true")
     p.add_argument("--aligned-loads", action="store_true")
     p.add_argument("--native-library", type=Path)
     p.add_argument("--output", type=Path, required=True)
@@ -272,5 +334,8 @@ if __name__ == "__main__":
     p.add_argument("--first-expert", type=int, default=0)
     p.add_argument("--limit-n", type=int)
     p.add_argument("--tokens", type=int, nargs="+", default=[128, 512])
+    p.add_argument(
+        "--patterns", nargs="+", choices=["balanced", "random"], default=["balanced"]
+    )
     p.add_argument("--device", type=int, default=1)
     main(p.parse_args())
