@@ -856,13 +856,14 @@ extern "C" int iq2xxs_swiglu_quantize32_masked(const void* x, void* q, float* sc
 }
 
 namespace {
-__global__ void iq_retile8(const int32_t* input, const int32_t* tokens,
+template<int HalfRows>
+__global__ void iq_retile_half(const int32_t* input, const int32_t* tokens,
                            int32_t* output, int count, int rows) {
   int index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index >= count * 2) return;
   int expert = input[(index / 2) * 2];
   int start = input[(index / 2) * 2 + 1];
-  int row = start + (index % 2) * 8;
+  int row = start + (index % 2) * HalfRows;
   // The native planner produces a contiguous valid-token prefix per expert.
   bool valid = expert >= 0 && start >= 0 && row < rows && tokens[row] >= 0;
   output[index * 2] = valid ? expert : -1;
@@ -872,7 +873,15 @@ __global__ void iq_retile8(const int32_t* input, const int32_t* tokens,
 extern "C" int iq2xxs_retile8(const int32_t* input, const int32_t* tokens,
                              int32_t* output, int count, int rows, cudaStream_t stream) {
   if (count <= 0 || count > 32767 || rows <= 0) return cudaErrorInvalidValue;
-  iq_retile8<<<(count * 2 + 255) / 256, 256, 0, stream>>>(input, tokens, output, count, rows);
+  iq_retile_half<8><<<(count * 2 + 255) / 256, 256, 0, stream>>>(input, tokens, output, count, rows);
+  return cudaGetLastError();
+}
+
+// Split native32 tasks for FC1 only; FC2 retains the original padded32 layout.
+extern "C" int iq2xxs_retile16(const int32_t* input, const int32_t* tokens,
+                              int32_t* output, int count, int rows, cudaStream_t stream) {
+  if (count <= 0 || count > 32767 || rows <= 0) return cudaErrorInvalidValue;
+  iq_retile_half<16><<<(count * 2 + 255) / 256, 256, 0, stream>>>(input, tokens, output, count, rows);
   return cudaGetLastError();
 }
 

@@ -216,6 +216,7 @@ def main(args):
         int8_split_decoder=args.int8_split_decoder,
         int8_cross_library=args.int8_cross_library,
         int8_iq3_adaptive=args.int8_iq3_adaptive,
+        int8_first16_down32=args.int8_first16_down32,
         int8_activation_block=args.int8_activation_block,
         int8_down_activation_block=args.int8_down_activation_block,
         int8_library_sha256=(
@@ -416,6 +417,26 @@ def main(args):
                             cross_out,
                         )
                         owners.append(cross)
+                if args.int8_first16_down32:
+                    split = Int8MoE(
+                        native,
+                        int8_packed,
+                        args.int8_library,
+                        count,
+                        6,
+                        32,
+                        register_decode=True,
+                        down_register_decode=False,
+                        fused_swiglu=True,
+                        masked_swiglu=True,
+                        first_tile16=True,
+                    )
+                    split_out = torch.empty_like(x)
+                    calls["int8-first16-down32"] = (
+                        partial(split.run, x, ids, weights, split_out),
+                        split_out,
+                    )
+                    owners.append(split)
                 if args.int8_split_decoder:
                     for tile in (16, 32):
                         for first_register, down_register in (
@@ -600,6 +621,10 @@ def main(args):
                                     references[f"int832-{label}"],
                                     references["int832"],
                                 )
+                        if args.int8_first16_down32:
+                            assert torch.equal(
+                                references["int8-first16-down32"], references["int832"]
+                            )
                         if args.int8_split_decoder:
                             for tile in (16, 32):
                                 for label in ("register-shared", "shared-register"):
@@ -718,6 +743,7 @@ if __name__ == "__main__":
     parser.add_argument("--int8-shared-fused", action="store_true")
     parser.add_argument("--int8-hybrid1632", action="store_true")
     parser.add_argument("--int8-split-decoder", action="store_true")
+    parser.add_argument("--int8-first16-down32", action="store_true")
     parser.add_argument("--int8-cross-library", action="store_true")
     parser.add_argument("--int8-iq3-adaptive", action="store_true")
     parser.add_argument(
@@ -817,6 +843,13 @@ if __name__ == "__main__":
             "Cross-library comparison requires shared fused per32 "
             "candidates and control"
         )
+    if args.int8_first16_down32 and not (
+        args.int8_library
+        and not args.int8_register_decode
+        and args.int8_activation_block == 32
+        and args.int8_down_activation_block in (None, 32)
+    ):
+        parser.error("FC1 tile16 comparison requires shared per32 controls")
     if args.int8_iq3_adaptive and not (
         args.int8_library
         and args.int8_shared_fused

@@ -45,6 +45,7 @@ class Int8MoE:
         down_library=None,
         iq3_adaptive=False,
         external_scratch=False,
+        first_tile16=False,
     ):
         if (down_register_decode is not None or down_library is not None) and not (
             tile in (16, 32, 64)
@@ -56,6 +57,19 @@ class Int8MoE:
             raise ValueError("Independent down decoder requires ordinary per32 tiles")
         if down_register_decode is None:
             down_register_decode = register_decode
+        if first_tile16 and not (
+            tile == 32
+            and native.first_format == "IQ2_XXS"
+            and register_decode
+            and not down_register_decode
+            and fused_swiglu
+            and masked_swiglu
+            and activation_block == 32
+            and down_activation_block in (None, 32)
+            and not (hybrid1632 or accumulate256 or iq3_adaptive)
+        ):
+            raise ValueError("FC1 tile16 requires register/shared fused per32 tile32")
+        self.first_tile16 = first_tile16
         if any(
             f not in ("IQ2_XXS", "IQ3_XXS")
             for f in (native.first_format, native.second_format)
@@ -120,13 +134,15 @@ class Int8MoE:
             else self.lib
         )
         self.retile = None
-        if tile in (0, 8) or hybrid1632 or iq3_adaptive:
+        if tile in (0, 8) or hybrid1632 or iq3_adaptive or first_tile16:
             task_count = self.plan.scratch_specs()[4][0][0]
             if task_count > 32767:
                 raise ValueError("Retiled task capacity exceeds CUDA grid")
             self._scratch_specs += (((task_count * 2, 2), torch.int32),)
             self.retile = (
-                self.lib.iq3xxs_classify_full32
+                self.lib.iq2xxs_retile16
+                if first_tile16
+                else self.lib.iq3xxs_classify_full32
                 if iq3_adaptive
                 else self.lib.iq2xxs_classify1632
                 if hybrid1632
@@ -280,7 +296,7 @@ class Int8MoE:
         tail = (
             len(self.native.expert_ids),
             tasks.shape[0],
-            self.tile,
+            16 if self.first_tile16 else self.tile,
             torch.cuda.current_stream().cuda_stream,
         )
         assert (
@@ -313,9 +329,9 @@ class Int8MoE:
                 )
                 == 0
             )
-        if self.iq3_adaptive:
+        if self.iq3_adaptive or self.first_tile16:
             tasks = scratch[4]
-            tail = (tail[0], tasks.shape[0], tail[2], tail[3])
+            tail = (tail[0], tasks.shape[0], self.tile, tail[3])
         assert (
             self.fc2(
                 *[
