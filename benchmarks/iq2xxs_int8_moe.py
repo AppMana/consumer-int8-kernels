@@ -42,8 +42,9 @@ class Int8MoE:
         accumulate256=False,
         hybrid1632=False,
         down_register_decode=None,
+        down_library=None,
     ):
-        if down_register_decode is not None and not (
+        if (down_register_decode is not None or down_library is not None) and not (
             tile in (16, 32, 64)
             and not hybrid1632
             and not accumulate256
@@ -101,6 +102,11 @@ class Int8MoE:
             )
         )
         self.lib = ctypes.CDLL(str(library.resolve()))
+        self.down_lib = (
+            ctypes.CDLL(str(down_library.resolve()))
+            if down_library is not None
+            else self.lib
+        )
         self.small_tasks = None
         if tile in (0, 8) or hybrid1632:
             tasks = self.scratch[4]
@@ -174,7 +180,7 @@ class Int8MoE:
             )
             self.fused_quant.restype = ctypes.c_int
         self.fc2 = getattr(
-            self.lib,
+            self.down_lib,
             down_prefix
             + "_routed_int8_slab"
             + down_suffix
