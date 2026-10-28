@@ -5,6 +5,7 @@
 // Reuse the block32 activation quantizer and fragment mapping control.
 #include "q8_block_int8.cu"
 #include "../../csrc/gguf_iq_tables.cuh"
+#include <type_traits>
 // Column-major shared descriptors win the paired GB10 routed benchmark.
 // SM86 counters do not confirm fewer shared-load bank conflicts.
 // Compile with -DIQ2XXS_TRANSPOSE_DESC=0 to reproduce the row-major control.
@@ -35,6 +36,9 @@ static_assert(IQ2XXS_REGISTER_K == 128 || IQ2XXS_REGISTER_K == 256);
 #endif
 #ifndef IQ2XXS_PIPELINE_STAGES
 #define IQ2XXS_PIPELINE_STAGES 2
+#endif
+#ifndef IQ2XXS_COMPACT_LUT
+#define IQ2XXS_COMPACT_LUT 0
 #endif
 static_assert(IQ2XXS_PIPELINE_STAGES == 2 || IQ2XXS_PIPELINE_STAGES == 3);
 static_assert(IQ2XXS_REGISTER_N == 64 || IQ2XXS_REGISTER_N == 128);
@@ -131,9 +135,22 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
   }
   const int cb = blockIdx.x * BN;
   const int wr = (warp / (BN / 32)) * 16, wc = (warp % (BN / 32)) * 32;
-  __shared__ uint64_t lut[SharedLUT ? 256 : 1];
+  constexpr bool CompactLUT = RegisterDecode && IQ2XXS_COMPACT_LUT;
+  using LUTWord = typename std::conditional<CompactLUT, uint32_t, uint64_t>::type;
+  __shared__ LUTWord lut[SharedLUT ? 256 : 1];
   if constexpr (SharedLUT) {
-    for (int i = threadIdx.x; i < 256; i += Threads) lut[i] = iq2xxs_grid[i];
+    for (int i = threadIdx.x; i < 256; i += Threads) {
+      uint64_t grid = iq2xxs_grid[i];
+      if constexpr (CompactLUT) {
+        uint32_t selectors = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          uint32_t value = (grid >> (j * 8)) & 255;
+          selectors |= (value == 8 ? 0u : value == 25 ? 1u : 2u) << (j * 4);
+        }
+        lut[i] = selectors;
+      } else lut[i] = grid;
+    }
     __syncthreads();
   }
   float sum[4][4] = {};
@@ -321,8 +338,15 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
             uint32_t code = (descriptor.x >> (part * 8)) & 255;
             uint32_t signs = (descriptor.y >> (part * 7)) & 127;
             signs |= (__popc(signs) & 1) << 7;
-            uint64_t grid = lut[code];
-            bv[r] = signed_bytes(uint32_t(grid >> ((tid & 1) * 32)), signs >> ((tid & 1) * 4));
+            uint32_t values;
+            if constexpr (CompactLUT) {
+              uint32_t selectors = lut[code] >> ((tid & 1) * 16);
+              values = __byte_perm(0x002b1908u, 0, selectors);
+            } else {
+              uint64_t grid = lut[code];
+              values = uint32_t(grid >> ((tid & 1) * 32));
+            }
+            bv[r] = signed_bytes(values, signs >> ((tid & 1) * 4));
           }
         } else {
           #pragma unroll
