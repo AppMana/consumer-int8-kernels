@@ -531,6 +531,26 @@ def main(args):
                                 candidate_out,
                             )
                             owners.append(candidate)
+                        if args.int8_fused_fc1:
+                            candidate = Int8MoE(
+                                native,
+                                borrowed,
+                                args.int8_library,
+                                count,
+                                6,
+                                16,
+                                register_decode=True,
+                                fused_swiglu=True,
+                                masked_swiglu=True,
+                                b12x_packed=True,
+                                fused_fc1=True,
+                            )
+                            candidate_out = torch.empty_like(x)
+                            calls["int8-fused-fc1"] = (
+                                partial(candidate.run, x, ids, weights, candidate_out),
+                                candidate_out,
+                            )
+                            owners.append(candidate)
                     for capacity in args.b12x_capacities:
                         if capacity == count:
                             continue
@@ -611,6 +631,10 @@ def main(args):
                                     references[f"int8{tile}-b12x-storage"],
                                     references[f"int8{tile}"],
                                 )
+                        if args.int8_fused_fc1:
+                            assert torch.equal(
+                                references["int8-fused-fc1"], references["int816"]
+                            )
                         # A per32 library is a speed/accuracy comparison for
                         # per256 FC1, not a bitwise arithmetic oracle.
                         if args.int8_control_library and not args.int8_accumulate256:
@@ -762,6 +786,7 @@ if __name__ == "__main__":
     parser.add_argument("--fixture", type=Path)
     parser.add_argument("--b12x-repeat-roundoff", action="store_true")
     parser.add_argument("--int8-b12x-packed", action="store_true")
+    parser.add_argument("--int8-fused-fc1", action="store_true")
     parser.add_argument(
         "--native-only",
         action="store_true",
@@ -824,6 +849,8 @@ if __name__ == "__main__":
         parser.error("Invalid expert count, token count or trials")
     if any(capacity < max(args.tokens) for capacity in args.b12x_capacities):
         parser.error("Every additional capacity must cover all live token counts")
+    if args.int8_fused_fc1 and not args.int8_b12x_packed:
+        parser.error("Fused FC1 requires --int8-b12x-packed")
     if args.int8_b12x_packed and (
         args.native_only
         or not args.int8_library

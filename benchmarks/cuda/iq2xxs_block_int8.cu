@@ -170,18 +170,19 @@ __device__ __forceinline__ void iq_async_copy(void* dst, const void* src, bool v
   asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;" ::
       "r"(shared), "l"(src), "n"(Bytes), "r"(valid ? Bytes : 0) : "memory");
 }
-template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false, bool Fold256=false, bool RegisterDecode=false, bool Acc256=false, bool IQ3=false, int IQ3MinBlocks=IQ3XXS_MIN_BLOCKS, bool B12xPacked=false>
+template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false, bool Fold256=false, bool RegisterDecode=false, bool Acc256=false, bool IQ3=false, int IQ3MinBlocks=IQ3XXS_MIN_BLOCKS, bool B12xPacked=false, bool FusedGateUp=false>
 __global__ __launch_bounds__(((BM + 15) / 16) * (BN / 32) * 32,
     (Routed && Slab && RegisterDecode && !Fold256 && !Acc256 && BM == 16 && BN == 128)
         ? IQ2XXS_REGISTER_MIN_BLOCKS
         : (Routed && Slab && !Fold256 && !RegisterDecode && BM == 32 && BN == 64)
             ? (IQ3 ? IQ3MinBlocks : IQ2XXS_SHARED_MIN_BLOCKS) : 1)
 void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
-    const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr) {
+    const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr, float* fused_scales=nullptr, float limit=10.f) {
   static_assert(!IQ3 || (Slab && SharedLUT && Routed && !Fold256 && !Acc256));
   static_assert(!(IQ3 && RegisterDecode) ||
       (!IQ3XXS_COOPERATIVE_DECODE && !IQ3XXS_STREAM_STORE &&
        !IQ2XXS_PIPELINE && !IQ2XXS_SHUFFLE_SCALE && IQ2XXS_REGISTER_K == 128));
+  static_assert(!FusedGateUp || (B12xPacked && !Weighted && BM == 16 && BN == 128));
   static_assert(!B12xPacked || (Routed && Slab && RegisterDecode && SharedLUT &&
       !Fold256 && !Acc256 && !IQ2XXS_PIPELINE && !IQ2XXS_SHUFFLE_SCALE &&
       !IQ3XXS_COOPERATIVE_DECODE && !IQ3XXS_STREAM_STORE && IQ2XXS_REGISTER_K == 128));
@@ -191,7 +192,7 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
   static_assert(BM != 8 || RegisterDecode);
   static_assert(!Acc256 || (RegisterDecode && !Weighted));
   constexpr bool Shuffle = RegisterDecode && IQ2XXS_SHUFFLE_SCALE && !Acc256;
-  constexpr int Lookahead = B12xPacked ? IQ_B12X_PREFETCH_L2 : RegisterDecode ? IQ2XXS_PREFETCH_L2 :
+  constexpr int Lookahead = FusedGateUp ? 0 : B12xPacked ? IQ_B12X_PREFETCH_L2 : RegisterDecode ? IQ2XXS_PREFETCH_L2 :
       (Slab && !Fold256 ? IQ2XXS_SHARED_PREFETCH_L2 : 0);
   constexpr int Outputs = BM == 8 ? 2 : 4;
   constexpr int Rows = BM + BN, Threads = ((BM + 15) / 16) * (BN / 32) * 32;
@@ -238,7 +239,10 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
     if constexpr (B12xPacked) b12x_metadata += int64_t(expert) * n * (k / 256) * 8;
     if constexpr (Slab) wb += int64_t(expert) * n * (k / 256);
   }
-  const int cb = column * BN;
+  const int cb = column * (FusedGateUp ? BN / 2 : BN);
+  auto weight_column = [&](int row) {
+    return FusedGateUp ? cb + row % (BN / 2) + (row / (BN / 2)) * (n / 2) : cb + row;
+  };
   const int wr = (warp / (BN / 32)) * 16, wc = (warp % (BN / 32)) * 32;
   constexpr bool CompactLUT = !IQ3 && ((RegisterDecode && IQ2XXS_COMPACT_LUT) ||
       (!RegisterDecode && Slab && !Fold256 && IQ2XXS_SHARED_COMPACT_LUT));
@@ -388,7 +392,7 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
           const int64_t descriptor_index =
               (int64_t(base / 128 + block / 4) * n + cb + row) * 4 + block % 4;
           if constexpr (B12xPacked) {
-            const int col = cb + row;
+            const int col = weight_column(row);
             const int sw = (col % 64 / 16) * 16 + (col % 8) * 2 + col % 16 / 8;
             const int part = base % 256 / 32 + block;
             const int64_t qi = ((int64_t(col / 64) * (k / 128) + base / 128) * 8 +
@@ -415,7 +419,7 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
             descriptors[slot] = descriptor;
             if constexpr (IQ3) descriptor_high_storage[slot] = indices_high;
           }
-          const int col = cb + row;
+          const int col = weight_column(row);
           const int base_col = B12xPacked ? (col / 16) * 16 + (col % 8) * 2 + col % 16 / 8 : col;
           base_scale = __half2float(wb[int64_t(base / 256) * n + base_col]);
           if constexpr (Shuffle)
@@ -613,16 +617,52 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
     if constexpr (!Pipeline) __syncthreads();
   }
   if constexpr (Pipeline) asm volatile("cp.async.wait_group 0;" ::: "memory");
-  #pragma unroll
-  for (int j = 0; j < 4; ++j) {
+  if constexpr (FusedGateUp) {
+    // All descriptor readers have rendezvoused at the final K-loop barrier.
+    // Reuse their storage for the exact BF16 FC1 rounding, without global IO.
+    static_assert(sizeof(descriptor_storage) >= BM * BN * sizeof(__nv_bfloat16));
+    auto* rounded = reinterpret_cast<__nv_bfloat16*>(descriptor_storage);
     #pragma unroll
-    for (int r = 0; r < Outputs; ++r) {
-      int row = rb + wr + group + (r >> 1) * 8;
-      int col = cb + wc + j * 8 + tid * 2 + (r & 1);
-      if (row < m && col < n) {
-        float value = sum[j][r];
-        if constexpr (Weighted) value *= route_weights[row];
-        y[row * n + col] = __float2bfloat16(value);
+    for (int j = 0; j < 4; ++j) {
+      #pragma unroll
+      for (int r = 0; r < 4; ++r) {
+        const int row = wr + group + (r >> 1) * 8;
+        const int col = wc + j * 8 + tid * 2 + (r & 1);
+        rounded[row * BN + col] = __float2bfloat16(sum[j][r]);
+      }
+    }
+    __syncthreads();
+    for (int block = warp; block < BM * (BN / 2) / 32; block += Threads / 32) {
+      const int row = block / ((BN / 2) / 32);
+      const int col = (block % ((BN / 2) / 32)) * 32 + lane;
+      float value = 0;
+      if (rb + row < m && tokens[rb + row] >= 0) {
+        const float gate = fminf(__bfloat162float(rounded[row * BN + col]), limit);
+        const float up = fminf(fmaxf(__bfloat162float(rounded[row * BN + col + BN / 2]), -limit), limit);
+        value = __bfloat162float(__float2bfloat16_rn((gate / (1.f + expf(-gate))) * up));
+      }
+      float maximum = fabsf(value);
+      for (int delta = 16; delta; delta /= 2)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, delta));
+      const float scale = fmaxf(maximum / 127.f, 1.e-20f);
+      if (rb + row < m) {
+        const int64_t index = int64_t(rb + row) * (n / 2) + cb + col;
+        reinterpret_cast<int8_t*>(y)[index] = static_cast<int8_t>(__float2int_rn(value / scale));
+        if (!lane) fused_scales[index / 32] = scale;
+      }
+    }
+  } else {
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      #pragma unroll
+      for (int r = 0; r < Outputs; ++r) {
+        int row = rb + wr + group + (r >> 1) * 8;
+        int col = cb + wc + j * 8 + tid * 2 + (r & 1);
+        if (row < m && col < n) {
+          float value = sum[j][r];
+          if constexpr (Weighted) value *= route_weights[row];
+          y[row * n + col] = __float2bfloat16(value);
+        }
       }
     }
   }
@@ -1388,4 +1428,35 @@ extern "C" int iq3xxs_routed_int8_b12x_register_weighted_quantized(const void* x
   return cudaGetLastError();
 }
 
+#endif
+
+#if defined(IQ_FUSED_FC1) && IQ_FUSED_FC1
+template<bool IQ3>
+int launch_iq_fused_fc1(const void* x, void* a, float* sa, const void* raw,
+    const void* bases, const int32_t* tokens, const int32_t* tasks, void* q,
+    float* scales, int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, float limit, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || n % 128 || k <= 0 || k % 256 ||
+      experts <= 0 || taskcount <= 0 || taskcount > 65535 || tile_m != 16 ||
+      !isfinite(limit) || !(limit > 0.f)) return cudaErrorInvalidValue;
+  quantize<<<(xrows * (k / 32) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 32));
+  iq2xxs_tiled<16,128,true,true,true,false,true,false,false,true,false,IQ3,IQ3XXS_MIN_BLOCKS,true,true>
+      <<<dim3(n / 128, taskcount),128,0,stream>>>(
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
+      static_cast<__nv_bfloat16*>(q), rows, n, k, tokens, tasks, xrows, experts,
+      static_cast<const __half*>(bases), nullptr, scales, limit);
+  return cudaGetLastError();
+}
+#define IQ_FUSED_FC1_ABI(BITS,IS_IQ3) \
+extern "C" int iq##BITS##xxs_routed_int8_b12x_register_swiglu(const void* x, void* a, float* sa, \
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, void* q, \
+    float* scales, int xrows, int rows, int n, int k, int experts, int taskcount, \
+    int tile_m, float limit, cudaStream_t stream) { \
+  return launch_iq_fused_fc1<IS_IQ3>(x,a,sa,raw,bases,tokens,tasks,q,scales, \
+      xrows,rows,n,k,experts,taskcount,tile_m,limit,stream); \
+}
+IQ_FUSED_FC1_ABI(2,false)
+IQ_FUSED_FC1_ABI(3,true)
+#undef IQ_FUSED_FC1_ABI
 #endif

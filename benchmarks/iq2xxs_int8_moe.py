@@ -47,6 +47,7 @@ class Int8MoE:
         external_scratch=False,
         first_tile16=False,
         b12x_packed=False,
+        fused_fc1=False,
     ):
         if (down_register_decode is not None or down_library is not None) and not (
             tile in (16, 32, 64)
@@ -91,6 +92,11 @@ class Int8MoE:
                 ):
                     raise ValueError("Invalid b12x tiled descriptors/metadata storage")
         storage_suffix = "_routed_int8_b12x" if b12x_packed else "_routed_int8_slab"
+        if fused_fc1 and not (
+            b12x_packed and tile == 16 and fused_swiglu and masked_swiglu
+        ):
+            raise ValueError("Fused FC1 requires borrowed M16 masked fused path")
+        self.fused_fc1 = fused_fc1
         if first_tile16 and not (
             tile == 32
             and native.first_format == "IQ2_XXS"
@@ -221,7 +227,10 @@ class Int8MoE:
             if activation_block == 256
             else ""
         )
-        self.fc1 = getattr(self.lib, first_prefix + storage_suffix + suffix)
+        self.fc1 = getattr(
+            self.lib,
+            first_prefix + storage_suffix + suffix + ("_swiglu" if fused_fc1 else ""),
+        )
         down_suffix = (
             "_register"
             if down_register_decode
@@ -267,6 +276,12 @@ class Int8MoE:
                 [ctypes.c_void_p] * pointers + [ctypes.c_int] * 7 + [ctypes.c_void_p]
             )
             fn.restype = ctypes.c_int
+        if fused_fc1:
+            self.fc1.argtypes = (
+                [ctypes.c_void_p] * 9
+                + [ctypes.c_int] * 7
+                + [ctypes.c_float, ctypes.c_void_p]
+            )
 
     def scratch_specs(self):
         """Simultaneous disjoint views, suitable for a shared worker arena."""
@@ -344,17 +359,30 @@ class Int8MoE:
             self.fc1(
                 *[
                     t.data_ptr()
-                    for t in (x, q1, s1, *self.packed[0], tokens, tasks, projected)
+                    for t in (
+                        x,
+                        q1,
+                        s1,
+                        *self.packed[0],
+                        tokens,
+                        tasks,
+                        q2 if self.fused_fc1 else projected,
+                        *([s2] if self.fused_fc1 else []),
+                    )
                 ],
                 m,
                 r,
                 2 * i,
                 h,
-                *tail,
+                *tail[:-1],
+                *([self.plan.swiglu_limit] if self.fused_fc1 else []),
+                tail[-1],
             )
             == 0
         )
-        if self.fused_quant is None:
+        if self.fused_fc1:
+            pass  # FC1 already produced q2/s2, with both BF16 rounding boundaries.
+        elif self.fused_quant is None:
             gguf.swiglu(projected, hidden, self.plan.swiglu_limit)
         else:
             assert (
