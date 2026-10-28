@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Explicit serving experiment: M512 IQ2_XXS layers, b12x for other shapes.
+"""Explicit serving experiment: selected prefill shapes use integer IQ MMA.
 
 Install before model loading. Requires the qualified prebuilt register-N128
 C ABI library and the benchmark helper on PYTHONPATH. Not a production backend.
@@ -13,8 +13,8 @@ from pathlib import Path
 import torch
 
 
-def install(library, *, enabled=True):
-    """Use enabled=False for a control with identical resident experimental weights."""
+def install(library, *, enabled=True, borrow_b12x=False):
+    """Use enabled=False for a matched control; borrow_b12x avoids weight copies."""
     from iq2xxs_int8_moe import Int8MoE, repack
     from vllm.model_executor.layers.quantization.b12x_iq import B12xIQMoEMethod
     from vllm.v1.worker.workspace import (
@@ -22,7 +22,7 @@ def install(library, *, enabled=True):
         is_workspace_manager_initialized,
     )
 
-    from consumer_int8.gguf_moe import prepare_experts
+    from consumer_int8.gguf_moe import PreparedExperts, prepare_experts
 
     library = Path(library).resolve(strict=True)
     original_load = B12xIQMoEMethod.process_weights_after_loading
@@ -42,10 +42,15 @@ def install(library, *, enabled=True):
         original_load(self, layer)
         match = re.match(r"blk\.(\d+)\.", self.sources[0].name)
         number = int(match[1]) if match else -1
-        if number not in (2, 3, 4):
+        selected = (*range(2, 15), *range(30, 40)) if borrow_b12x else (2, 3, 4)
+        if number not in selected:
             return
         if (
-            any(s.quant_type != "IQ2_XXS" for s in self.sources)
+            any(
+                s.quant_type
+                not in (("IQ2_XXS", "IQ3_XXS") if borrow_b12x else ("IQ2_XXS",))
+                for s in self.sources
+            )
             or self.moe.swiglu_limit != 10.0
             or self.moe.swiglu_alpha not in (None, 1.0)
             or self.moe.swiglu_beta not in (None, 0.0)
@@ -67,40 +72,71 @@ def install(library, *, enabled=True):
             ):
                 raise ValueError("Expert map must cover each local slot once")
             ids = tuple(global_id for _, global_id in ordered)
-        native = prepare_experts(
-            *self.sources, ids, device=layer._b12x_iq_device.device
-        )
+        if borrow_b12x:
+            gate, up, down = self.sources
+            if gate.quant_type != up.quant_type:
+                raise ValueError("Gate/up formats must match")
+            device = layer._b12x_iq_device.device
+            if mapping is None:
+                mapping = torch.arange(
+                    self.moe.num_experts, device=device, dtype=torch.int32
+                )
+            native = PreparedExperts(
+                gate_up=(),
+                down=(),
+                expert_map=mapping,
+                first_format=gate.quant_type,
+                second_format=down.quant_type,
+                hidden_size=gate.columns,
+                intermediate_size=gate.rows,
+                expert_ids=ids,
+            )
+            impl = self.experts._impl
+            packed = (
+                (impl.w1_fp4.view(torch.int32), impl.w1_blockscale.view(torch.uint8)),
+                (impl.w2_fp4.view(torch.int32), impl.w2_blockscale.view(torch.uint8)),
+            )
+        else:
+            native = prepare_experts(
+                *self.sources, ids, device=layer._b12x_iq_device.device
+            )
+            packed = (repack(native.gate_up), repack(native.down))
+            native = replace(native, gate_up=(), down=())
         if (native.hidden_size, native.intermediate_size) != (5120, 2304):
             raise ValueError("Unqualified integer expert dimensions")
-        packed = (repack(native.gate_up), repack(native.down))
-        # INT8 uses repacked descriptors; retain only geometry and the expert map.
-        native = replace(native, gate_up=(), down=())
+        count = 128 if borrow_b12x and number >= 30 else 512
         plan = Int8MoE(
             native,
             packed,
             library,
-            512,
+            count,
             6,
             16,
             register_decode=True,
             fused_swiglu=True,
             masked_swiglu=True,
             external_scratch=True,
+            b12x_packed=borrow_b12x,
         )
         device = native.device
-        x = torch.zeros((512, 5120), dtype=torch.bfloat16, device=device)
-        routes = torch.full((512, 6), ids[0], dtype=torch.int32, device=device)
-        weights = torch.full((512, 6), 1 / 6, dtype=torch.float32, device=device)
-        plan.run(x, routes, weights, self._output[:512], scratch(plan))
+        x = torch.zeros((count, 5120), dtype=torch.bfloat16, device=device)
+        routes = torch.full((count, 6), ids[0], dtype=torch.int32, device=device)
+        weights = torch.full((count, 6), 1 / 6, dtype=torch.float32, device=device)
+        plan.run(x, routes, weights, self._output[:count], scratch(plan))
         self._integer_prefill_plan = plan
-        print(f"Integer IQ2 prefill prepared layer={number} M=512 N128", flush=True)
+        self._integer_prefill_count = count
+        print(
+            f"Integer prefill prepared layer={number} M={count} "
+            f"N128 borrowed={borrow_b12x}",
+            flush=True,
+        )
 
     @functools.wraps(original_apply)
     def apply(
         self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
     ):
         plan = getattr(self, "_integer_prefill_plan", None)
-        if not enabled or plan is None or x.shape[0] != 512:
+        if not enabled or plan is None or x.shape[0] != self._integer_prefill_count:
             return original_apply(
                 self,
                 layer,
@@ -112,7 +148,7 @@ def install(library, *, enabled=True):
             )
         if topk_ids.dtype != torch.int32 or topk_weights.dtype != torch.float32:
             raise ValueError("Integer IQ2 requires int32 IDs and float32 weights")
-        output = self._output[:512]
+        output = self._output[: x.shape[0]]
         plan.run(x, topk_ids, topk_weights, output, scratch(plan))
         return output
 
