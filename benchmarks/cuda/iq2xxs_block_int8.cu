@@ -74,6 +74,10 @@ static_assert(!IQ3XXS_COOPERATIVE_DECODE || IQ3XXS_STREAM_STORE);
 #define IQ2XXS_SHARED_MIN_BLOCKS 1
 #endif
 static_assert(IQ2XXS_SHARED_MIN_BLOCKS >= 1 && IQ2XXS_SHARED_MIN_BLOCKS <= 8);
+#ifndef IQ3XXS_MIN_BLOCKS
+#define IQ3XXS_MIN_BLOCKS 1
+#endif
+static_assert(IQ3XXS_MIN_BLOCKS >= 1 && IQ3XXS_MIN_BLOCKS <= 6);
 #ifndef IQ2XXS_SHARED_PREFETCH_L2
 #define IQ2XXS_SHARED_PREFETCH_L2 0
 #endif
@@ -146,7 +150,7 @@ __device__ __forceinline__ void iq_async_copy(void* dst, const void* src, bool v
 }
 template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false, bool Fold256=false, bool RegisterDecode=false, bool Acc256=false, bool IQ3=false>
 __global__ __launch_bounds__(((BM + 15) / 16) * (BN / 32) * 32,
-    (Routed && Slab && !Fold256 && !RegisterDecode && BM == 32 && BN == 64) ? IQ2XXS_SHARED_MIN_BLOCKS : 1)
+    (Routed && Slab && !Fold256 && !RegisterDecode && BM == 32 && BN == 64) ? (IQ3 ? IQ3XXS_MIN_BLOCKS : IQ2XXS_SHARED_MIN_BLOCKS) : 1)
 void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
     const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr) {
   static_assert(!IQ3 || (Slab && SharedLUT && Routed && !RegisterDecode && !Fold256));
