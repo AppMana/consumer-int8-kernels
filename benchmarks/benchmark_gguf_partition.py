@@ -151,6 +151,11 @@ def main(args):
             if args.int8_library
             else None
         ),
+        int8_control_library_sha256=(
+            hashlib.sha256(args.int8_control_library.read_bytes()).hexdigest()
+            if args.int8_control_library
+            else None
+        ),
         int8_register_decode=args.int8_register_decode,
         int8_activation_block=args.int8_activation_block,
         int8_down_activation_block=args.int8_down_activation_block,
@@ -233,6 +238,23 @@ def main(args):
                                 output,
                             )
                             owners.append(int8)
+                    if args.int8_control_library:
+                        for tile in (16, 32):
+                            control = Int8MoE(
+                                native,
+                                int8_packed,
+                                args.int8_control_library,
+                                count,
+                                6,
+                                tile,
+                                register_decode=True,
+                            )
+                            control_output = torch.empty_like(x)
+                            calls[f"int8{tile}-register-control"] = (
+                                partial(control.run, x, ids, weights, control_output),
+                                control_output,
+                            )
+                            owners.append(control)
                 b12x = None
                 if not args.native_only:
                     b12x = prepare_b12x(
@@ -315,6 +337,12 @@ def main(args):
                                     references[f"int8{tile}"],
                                     references[f"int8{tile}-shared"],
                                 )
+                        if args.int8_control_library:
+                            for tile in (16, 32):
+                                assert torch.equal(
+                                    references[f"int8{tile}"],
+                                    references[f"int8{tile}-register-control"],
+                                )
                         flush = torch.empty(64 << 20, device=device, dtype=torch.uint8)
                         timings = {label: [] for label in graphs}
                         for trial in range(args.trials):
@@ -379,6 +407,8 @@ def main(args):
                 torch.cuda.empty_cache()
             if args.int8_library:
                 del int8_packed, int8, output
+                if args.int8_control_library:
+                    del control, control_output
             del native
             gc.collect()
             torch.cuda.empty_cache()
@@ -393,6 +423,7 @@ if __name__ == "__main__":
         help="Isolate native kernels for sanitizer runs; exclude b12x",
     )
     parser.add_argument("--int8-library", type=Path)
+    parser.add_argument("--int8-control-library", type=Path)
     parser.add_argument("--int8-register-decode", action="store_true")
     parser.add_argument(
         "--int8-activation-block", type=int, choices=(32, 256), default=32
@@ -428,4 +459,8 @@ if __name__ == "__main__":
         parser.error("Every additional capacity must cover all live token counts")
     if args.native_only and args.b12x_capacities:
         parser.error("Additional b12x capacities require the b12x comparison")
+    if args.int8_control_library and not (
+        args.int8_library and args.int8_register_decode
+    ):
+        parser.error("INT8 control library requires the register decoder comparison")
     main(args)

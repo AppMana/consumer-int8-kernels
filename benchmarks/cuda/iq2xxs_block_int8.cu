@@ -5,6 +5,12 @@
 // Reuse the block32 activation quantizer and fragment mapping control.
 #include "q8_block_int8.cu"
 #include "../../csrc/gguf_iq_tables.cuh"
+// Column-major shared descriptors win the paired GB10 routed benchmark.
+// SM86 counters do not confirm fewer shared-load bank conflicts.
+// Compile with -DIQ2XXS_TRANSPOSE_DESC=0 to reproduce the row-major control.
+#ifndef IQ2XXS_TRANSPOSE_DESC
+#define IQ2XXS_TRANSPOSE_DESC 1
+#endif
 namespace {
 // Eight values per lane; repeat scales to retain existing benchmark scratch ABI.
 __global__ void quantize256(const __nv_bfloat16* x, int8_t* q, float* scales, int blocks) {
@@ -36,7 +42,7 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
   static_assert(!RegisterDecode || (Slab && SharedLUT && !Fold256));
   constexpr int Rows = BM + BN, Threads = (BM / 16) * (BN / 32) * 32;
   __shared__ int8_t tile[RegisterDecode ? BM : Rows][144];
-  __shared__ uint2 descriptors[RegisterDecode ? BN : 1][4];
+  __shared__ uint2 descriptors[RegisterDecode ? BN * 4 : 1];
   __shared__ int8_t high_tile[Fold256 ? BN : 1][144];
   __shared__ float scales[Rows][4];
   const int lane = threadIdx.x & 31, group = lane >> 2, tid = lane & 3;
@@ -95,7 +101,7 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
               (int64_t(base / 128) * n + cb + row) * 4 + block];
           indices = descriptor.x;
           metadata = descriptor.y;
-          if constexpr (RegisterDecode) descriptors[row][block] = descriptor;
+          if constexpr (RegisterDecode) descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + row : row * 4 + block] = descriptor;
           base_scale = __half2float(wb[int64_t(base / 256) * n + cb + row]);
         } else {
           const uint8_t* raw = w + (int64_t(cb + row) * (k / 256) + base / 256) * 66;
@@ -144,7 +150,7 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
         }
       }
       if constexpr (RegisterDecode) {
-        if (cb + row >= n) descriptors[row][block] = make_uint2(0, 0);
+        if (cb + row >= n) descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + row : row * 4 + block] = make_uint2(0, 0);
       }
       scales[BM + row][block] = scale;
       if constexpr (!RegisterDecode) {
@@ -167,7 +173,7 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
       for (int j = 0; j < 4; ++j) {
         uint32_t bv[2];
         if constexpr (RegisterDecode) {
-          const uint2 descriptor = descriptors[wc + j * 8 + group][block];
+          const uint2 descriptor = descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + wc + j * 8 + group : (wc + j * 8 + group) * 4 + block];
           #pragma unroll
           for (int r = 0; r < 2; ++r) {
             int part = tid / 2 + r * 2;
