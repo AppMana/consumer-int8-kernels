@@ -98,7 +98,9 @@ template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed
 __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
     const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr) {
   static_assert(!RegisterDecode || (Slab && SharedLUT && !Fold256));
-  constexpr int Rows = BM + BN, Threads = (BM / 16) * (BN / 32) * 32;
+  static_assert(BM != 8 || RegisterDecode);
+  constexpr int Outputs = BM == 8 ? 2 : 4;
+  constexpr int Rows = BM + BN, Threads = ((BM + 15) / 16) * (BN / 32) * 32;
   constexpr int BK = RegisterDecode ? IQ2XXS_REGISTER_K : 128;
   constexpr int Blocks = BK / 32;
   constexpr bool Pipeline = RegisterDecode && IQ2XXS_PIPELINE;
@@ -292,7 +294,8 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
       uint32_t av[4];
       #pragma unroll
       for (int r = 0; r < 4; ++r)
-        av[r] = *reinterpret_cast<const uint32_t*>(&tile[wr + group + (r & 1) * 8][block * 32 + tid * 4 + (r >> 1) * 16]);
+        av[r] = BM == 8 && (r & 1) ? 0 :
+            *reinterpret_cast<const uint32_t*>(&tile[wr + group + (r & 1) * 8][block * 32 + tid * 4 + (r >> 1) * 16]);
       #pragma unroll
       for (int j = 0; j < 4; ++j) {
         uint32_t bv[2];
@@ -353,12 +356,12 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
           for (int r = 0; r < 2; ++r)
             output_scales[r] = __shfl_sync(0xffffffff, weight_scale, (tid * 2 + r) * 4);
           #pragma unroll
-          for (int r = 0; r < 4; ++r)
+          for (int r = 0; r < Outputs; ++r)
             sum[j][r] += float(acc[r]) *
                 (scales[wr + group + (r >> 1) * 8][block] * output_scales[r & 1]);
         } else {
           #pragma unroll
-          for (int r = 0; r < 4; ++r)
+          for (int r = 0; r < Outputs; ++r)
             sum[j][r] += float(acc[r]) * (scales[wr + group + (r >> 1) * 8][block] *
                                         scales[BM + wc + j * 8 + tid * 2 + (r & 1)][block]);
         }
@@ -372,7 +375,7 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
   #pragma unroll
   for (int j = 0; j < 4; ++j) {
     #pragma unroll
-    for (int r = 0; r < 4; ++r) {
+    for (int r = 0; r < Outputs; ++r) {
       int row = rb + wr + group + (r >> 1) * 8;
       int col = cb + wc + j * 8 + tid * 2 + (r & 1);
       if (row < m && col < n) {
@@ -580,15 +583,16 @@ extern "C" int iq2xxs_routed_int8_slab_register(const void* x, void* a, float* s
     int xrows, int rows, int n, int k, int experts, int taskcount,
     int tile_m, cudaStream_t stream) {
   if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
-      taskcount <= 0 || (tile_m != 16 && tile_m != 32 && tile_m != 64))
+      taskcount <= 0 || (tile_m != 8 && tile_m != 16 && tile_m != 32 && tile_m != 64))
     return cudaErrorInvalidValue;
   quantize<<<(xrows * (k / 32) + 7) / 8, 256, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 32));
 #define ROUTED_LAUNCH(M,N) \
-  iq2xxs_tiled<M,N,true,true,true,false,true,false,false,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
+  iq2xxs_tiled<M,N,true,true,true,false,true,false,false,true><<<dim3((n+N-1)/N,taskcount), ((M+15)/16)*(N/32)*32, 0, stream>>>( \
       static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases))
-  if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N); }
+  if (tile_m == 8) { ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N); }
+  else if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N); }
   else if (tile_m == 32) { ROUTED_LAUNCH(32,IQ2XXS_REGISTER_N); }
   else { ROUTED_LAUNCH(64,IQ2XXS_REGISTER_N); }
 #undef ROUTED_LAUNCH
@@ -600,15 +604,16 @@ extern "C" int iq2xxs_routed_int8_slab_register_weighted(const void* x, void* a,
     int xrows, int rows, int n, int k, int experts, int taskcount,
     int tile_m, cudaStream_t stream) {
   if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
-      taskcount <= 0 || (tile_m != 16 && tile_m != 32 && tile_m != 64))
+      taskcount <= 0 || (tile_m != 8 && tile_m != 16 && tile_m != 32 && tile_m != 64))
     return cudaErrorInvalidValue;
   quantize<<<(xrows * (k / 32) + 7) / 8, 256, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 32));
 #define ROUTED_LAUNCH(M,N) \
-  iq2xxs_tiled<M,N,true,true,true,false,true,true,false,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
+  iq2xxs_tiled<M,N,true,true,true,false,true,true,false,true><<<dim3((n+N-1)/N,taskcount), ((M+15)/16)*(N/32)*32, 0, stream>>>( \
       static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases), weights)
-  if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N); }
+  if (tile_m == 8) { ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N); }
+  else if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N); }
   else if (tile_m == 32) { ROUTED_LAUNCH(32,IQ2XXS_REGISTER_N); }
   else { ROUTED_LAUNCH(64,IQ2XXS_REGISTER_N); }
 #undef ROUTED_LAUNCH
@@ -634,14 +639,15 @@ extern "C" int iq2xxs_routed_int8_slab_register_weighted_quantized(const void* x
     int xrows, int rows, int n, int k, int experts, int taskcount,
     int tile_m, cudaStream_t stream) {
   if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
-      taskcount <= 0 || (tile_m != 16 && tile_m != 32 && tile_m != 64))
+      taskcount <= 0 || (tile_m != 8 && tile_m != 16 && tile_m != 32 && tile_m != 64))
     return cudaErrorInvalidValue;
   // x is unused: a/sa already contain the fused quantizer output.
 #define ROUTED_LAUNCH(M,N) \
-  iq2xxs_tiled<M,N,true,true,true,false,true,true,false,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
+  iq2xxs_tiled<M,N,true,true,true,false,true,true,false,true><<<dim3((n+N-1)/N,taskcount), ((M+15)/16)*(N/32)*32, 0, stream>>>( \
       static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases), weights)
-  if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N); }
+  if (tile_m == 8) { ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N); }
+  else if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N); }
   else if (tile_m == 32) { ROUTED_LAUNCH(32,IQ2XXS_REGISTER_N); }
   else { ROUTED_LAUNCH(64,IQ2XXS_REGISTER_N); }
 #undef ROUTED_LAUNCH
@@ -658,5 +664,26 @@ extern "C" int iq2xxs_swiglu_quantize32_masked(const void* x, void* q, float* sc
   const int blocks = rows * (width / 32);
   swiglu_quantize32<true><<<(int64_t(blocks) + 7) / 8, 256, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(q), scales, blocks, width, limit, tokens);
+  return cudaGetLastError();
+}
+
+namespace {
+__global__ void iq_retile8(const int32_t* input, const int32_t* tokens,
+                           int32_t* output, int count, int rows) {
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= count * 2) return;
+  int expert = input[(index / 2) * 2];
+  int start = input[(index / 2) * 2 + 1];
+  int row = start + (index % 2) * 8;
+  // The native planner produces a contiguous valid-token prefix per expert.
+  bool valid = expert >= 0 && start >= 0 && row < rows && tokens[row] >= 0;
+  output[index * 2] = valid ? expert : -1;
+  output[index * 2 + 1] = valid ? row : -1;
+}
+}
+extern "C" int iq2xxs_retile8(const int32_t* input, const int32_t* tokens,
+                             int32_t* output, int count, int rows, cudaStream_t stream) {
+  if (count <= 0 || count > 32767 || rows <= 0) return cudaErrorInvalidValue;
+  iq_retile8<<<(count * 2 + 255) / 256, 256, 0, stream>>>(input, tokens, output, count, rows);
   return cudaGetLastError();
 }

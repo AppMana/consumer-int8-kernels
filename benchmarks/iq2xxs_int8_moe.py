@@ -40,7 +40,12 @@ class Int8MoE:
             raise ValueError("Complete INT8 candidate only supports IQ2_XXS pairs")
         self.native = native
         self.packed = packed
-        self.plan = ExecutionPlan(native, max_tokens, topk, tile_rows=tile)
+        if tile == 8 and not (register_decode and fused_swiglu and masked_swiglu):
+            raise ValueError("Eight-row experiment requires masked fused register path")
+        self.tile = tile
+        self.plan = ExecutionPlan(
+            native, max_tokens, topk, tile_rows=16 if tile == 8 else tile
+        )
         self.scratch = self.plan.allocate_scratch()
         r = self.plan.route_capacity
         self.quant = tuple(
@@ -54,6 +59,19 @@ class Int8MoE:
             )
         )
         self.lib = ctypes.CDLL(str(library.resolve()))
+        self.small_tasks = None
+        if tile == 8:
+            tasks = self.scratch[4]
+            if tasks.shape[0] > 32767:
+                raise ValueError("Retiled task capacity exceeds CUDA grid")
+            self.small_tasks = torch.empty(
+                tasks.shape[0] * 2, 2, device=native.device, dtype=torch.int32
+            )
+            self.retile = self.lib.iq2xxs_retile8
+            self.retile.argtypes = (
+                [ctypes.c_void_p] * 3 + [ctypes.c_int] * 2 + [ctypes.c_void_p]
+            )
+            self.retile.restype = ctypes.c_int
         if down_activation_block is None:
             down_activation_block = activation_block
         if activation_block not in (32, 256) or down_activation_block not in (32, 256):
@@ -136,11 +154,24 @@ class Int8MoE:
         )
         q1, s1 = self.quant[0]
         q2, s2 = self.quant[1]
+        if self.small_tasks is not None:
+            assert (
+                self.retile(
+                    tasks.data_ptr(),
+                    tokens.data_ptr(),
+                    self.small_tasks.data_ptr(),
+                    tasks.shape[0],
+                    r,
+                    torch.cuda.current_stream().cuda_stream,
+                )
+                == 0
+            )
+            tasks = self.small_tasks
         h, i = self.native.hidden_size, self.native.intermediate_size
         tail = (
             len(self.native.expert_ids),
             tasks.shape[0],
-            self.plan.tile_rows,
+            self.tile,
             torch.cuda.current_stream().cuda_stream,
         )
         assert (
