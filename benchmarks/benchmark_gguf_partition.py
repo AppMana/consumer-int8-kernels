@@ -160,6 +160,7 @@ def main(args):
         int8_fused_swiglu=args.int8_fused_swiglu,
         int8_masked_swiglu=args.int8_masked_swiglu,
         int8_control_fused_swiglu=args.int8_control_fused_swiglu,
+        int8_control_masked_swiglu=args.int8_control_masked_swiglu,
         int8_activation_block=args.int8_activation_block,
         int8_down_activation_block=args.int8_down_activation_block,
         int8_library_sha256=(
@@ -255,6 +256,7 @@ def main(args):
                                 tile,
                                 register_decode=True,
                                 fused_swiglu=args.int8_control_fused_swiglu,
+                                masked_swiglu=args.int8_control_masked_swiglu,
                             )
                             control_output = torch.empty_like(x)
                             calls[f"int8{tile}-register-control"] = (
@@ -435,6 +437,7 @@ if __name__ == "__main__":
     parser.add_argument("--int8-fused-swiglu", action="store_true")
     parser.add_argument("--int8-masked-swiglu", action="store_true")
     parser.add_argument("--int8-control-fused-swiglu", action="store_true")
+    parser.add_argument("--int8-control-masked-swiglu", action="store_true")
     parser.add_argument(
         "--int8-activation-block", type=int, choices=(32, 256), default=32
     )
@@ -479,4 +482,6 @@ if __name__ == "__main__":
         parser.error("Masked SwiGLU requires fused SwiGLU")
     if args.int8_control_fused_swiglu and not args.int8_control_library:
         parser.error("Fused control requires a control library")
+    if args.int8_control_masked_swiglu and not args.int8_control_fused_swiglu:
+        parser.error("Masked control requires fused control SwiGLU")
     main(args)
