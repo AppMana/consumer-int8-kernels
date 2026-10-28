@@ -40,6 +40,10 @@ static_assert(IQ2XXS_REGISTER_K == 128 || IQ2XXS_REGISTER_K == 256);
 #ifndef IQ2XXS_COMPACT_LUT
 #define IQ2XXS_COMPACT_LUT 0
 #endif
+#ifndef IQ2XXS_SHARED_PREFETCH_L2
+#define IQ2XXS_SHARED_PREFETCH_L2 0
+#endif
+static_assert(IQ2XXS_SHARED_PREFETCH_L2 >= 0 && IQ2XXS_SHARED_PREFETCH_L2 <= 8);
 #ifndef IQ2XXS_PREFETCH_L2
 #define IQ2XXS_PREFETCH_L2 0
 #endif
@@ -113,6 +117,8 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
   static_assert(BM != 8 || RegisterDecode);
   static_assert(!Acc256 || (RegisterDecode && !Weighted));
   constexpr bool Shuffle = RegisterDecode && IQ2XXS_SHUFFLE_SCALE && !Acc256;
+  constexpr int Lookahead = RegisterDecode ? IQ2XXS_PREFETCH_L2 :
+      (Slab && !Fold256 ? IQ2XXS_SHARED_PREFETCH_L2 : 0);
   constexpr int Outputs = BM == 8 ? 2 : 4;
   constexpr int Rows = BM + BN, Threads = ((BM + 15) / 16) * (BN / 32) * 32;
   constexpr int BK = RegisterDecode ? IQ2XXS_REGISTER_K : 128;
@@ -198,9 +204,9 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
   if constexpr (Pipeline)
     for (int stage = 0; stage < Stages - 1; ++stage) prefetch(stage * BK, stage);
   for (int base = 0; base < k; base += BK) {
-    if constexpr (RegisterDecode && IQ2XXS_PREFETCH_L2 > 0 && !Pipeline) {
+    if constexpr (Slab && Lookahead > 0 && !Pipeline) {
       // Cache-only hint: retain all normal loads and the original arithmetic.
-      const int future = base + IQ2XXS_PREFETCH_L2 * BK;
+      const int future = base + Lookahead * BK;
       if (future < k) {
         for (int row = threadIdx.x; row < BN; row += Threads) {
           if (cb + row < n) {
@@ -819,6 +825,25 @@ extern "C" int iq2xxs_routed_int8_slab_register_acc256(const void* x, void* a, f
   else if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N); }
   else if (tile_m == 32) { ROUTED_LAUNCH(32,IQ2XXS_REGISTER_N); }
   else { ROUTED_LAUNCH(64,IQ2XXS_REGISTER_N); }
+#undef ROUTED_LAUNCH
+  return cudaGetLastError();
+}
+
+extern "C" int iq2xxs_routed_int8_slab_weighted_quantized(const void* x, void* a, float* sa,
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, const float* weights, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || (tile_m != 16 && tile_m != 32 && tile_m != 64))
+    return cudaErrorInvalidValue;
+  // x is unused; the fused SwiGLU quantizer already populated a/sa.
+#define ROUTED_LAUNCH(M,N) \
+  iq2xxs_tiled<M,N,true,true,true,false,true,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
+      static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases), weights)
+  if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
+  else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
+  else { ROUTED_LAUNCH(64,64); }
 #undef ROUTED_LAUNCH
   return cudaGetLastError();
 }

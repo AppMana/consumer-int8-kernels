@@ -165,6 +165,7 @@ def main(args):
         int8_mixed_row=args.int8_mixed_row,
         int8_control_mixed_row=args.int8_control_mixed_row,
         int8_accumulate256=args.int8_accumulate256,
+        int8_shared_fused=args.int8_shared_fused,
         int8_activation_block=args.int8_activation_block,
         int8_down_activation_block=args.int8_down_activation_block,
         int8_library_sha256=(
@@ -276,6 +277,30 @@ def main(args):
                                 control_output,
                             )
                             owners.append(control)
+                if args.int8_shared_fused:
+                    for tile in (16, 32):
+                        for label, library in (
+                            ("shared-fused", args.int8_library),
+                            ("shared-control", args.int8_control_library),
+                        ):
+                            if library is None:
+                                continue
+                            fused = Int8MoE(
+                                native,
+                                int8_packed,
+                                library,
+                                count,
+                                6,
+                                tile,
+                                fused_swiglu=True,
+                                masked_swiglu=True,
+                            )
+                            fused_out = torch.empty_like(x)
+                            calls[f"int8{tile}-{label}"] = (
+                                partial(fused.run, x, ids, weights, fused_out),
+                                fused_out,
+                            )
+                            owners.append(fused)
                 b12x = None
                 if not args.native_only:
                     b12x = prepare_b12x(
@@ -376,6 +401,17 @@ def main(args):
                             assert torch.equal(
                                 references["int80"], references["int816-shared"]
                             )
+                        if args.int8_shared_fused:
+                            for tile in (16, 32):
+                                assert torch.equal(
+                                    references[f"int8{tile}-shared-fused"],
+                                    references[f"int8{tile}-shared"],
+                                )
+                                if args.int8_control_library:
+                                    assert torch.equal(
+                                        references[f"int8{tile}-shared-fused"],
+                                        references[f"int8{tile}-shared-control"],
+                                    )
                         flush = torch.empty(64 << 20, device=device, dtype=torch.uint8)
                         timings = {label: [] for label in graphs}
                         for trial in range(args.trials):
@@ -466,6 +502,7 @@ if __name__ == "__main__":
     parser.add_argument("--int8-mixed-row", action="store_true")
     parser.add_argument("--int8-control-mixed-row", action="store_true")
     parser.add_argument("--int8-accumulate256", action="store_true")
+    parser.add_argument("--int8-shared-fused", action="store_true")
     parser.add_argument(
         "--int8-activation-block", type=int, choices=(32, 256), default=32
     )
@@ -526,5 +563,14 @@ if __name__ == "__main__":
         parser.error(
             "Accumulator scaling requires FC1 per256/FC2 per32; "
             "shared folded path is its exact control"
+        )
+    if args.int8_shared_fused and not (
+        args.int8_library
+        and args.int8_register_decode
+        and args.int8_activation_block == 32
+        and args.int8_down_activation_block in (None, 32)
+    ):
+        parser.error(
+            "Shared fused comparison requires per32 register/shared candidates"
         )
     main(args)

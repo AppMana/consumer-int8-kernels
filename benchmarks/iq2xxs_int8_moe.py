@@ -109,8 +109,8 @@ class Int8MoE:
             if down_activation_block == 256
             else ""
         )
-        if fused_swiglu and not register_decode:
-            raise ValueError("fused SwiGLU requires the per32 register decoder")
+        if fused_swiglu and down_activation_block != 32:
+            raise ValueError("fused SwiGLU requires per32 down quantization")
         if masked_swiglu and not fused_swiglu:
             raise ValueError("masked SwiGLU requires fused SwiGLU")
         self.masked_swiglu = masked_swiglu
