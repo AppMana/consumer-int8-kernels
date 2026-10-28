@@ -12,6 +12,11 @@
 #ifndef IQ2XXS_TRANSPOSE_DESC
 #define IQ2XXS_TRANSPOSE_DESC 1
 #endif
+// Cache-only experiment for b12x's separate descriptor/metadata panels.
+#ifndef IQ_B12X_PREFETCH_L2
+#define IQ_B12X_PREFETCH_L2 0
+#endif
+static_assert(IQ_B12X_PREFETCH_L2 >= 0 && IQ_B12X_PREFETCH_L2 <= 4);
 // Benchmark wider output tiling without changing the C ABI or arithmetic.
 #ifndef IQ2XXS_REGISTER_N
 #define IQ2XXS_REGISTER_N 64
@@ -186,7 +191,7 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
   static_assert(BM != 8 || RegisterDecode);
   static_assert(!Acc256 || (RegisterDecode && !Weighted));
   constexpr bool Shuffle = RegisterDecode && IQ2XXS_SHUFFLE_SCALE && !Acc256;
-  constexpr int Lookahead = B12xPacked ? 0 : RegisterDecode ? IQ2XXS_PREFETCH_L2 :
+  constexpr int Lookahead = B12xPacked ? IQ_B12X_PREFETCH_L2 : RegisterDecode ? IQ2XXS_PREFETCH_L2 :
       (Slab && !Fold256 ? IQ2XXS_SHARED_PREFETCH_L2 : 0);
   constexpr int Outputs = BM == 8 ? 2 : 4;
   constexpr int Rows = BM + BN, Threads = ((BM + 15) / 16) * (BN / 32) * 32;
@@ -299,7 +304,27 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
       // Cache-only hint: retain all normal loads and the original arithmetic.
       const int future = base + Lookahead * BK;
       if (future < k) {
-        for (int row = threadIdx.x; row < BN; row += Threads) {
+        if constexpr (B12xPacked) {
+          constexpr int DescriptorBytes = 64 * 8 * (IQ3 ? 4 : 2);
+          constexpr int DescriptorLines = DescriptorBytes / 128;
+          // Separate uniform descriptor and metadata streams. Avoid a mixed
+          // panel loop whose address live ranges inflate the register budget.
+          const int tid = threadIdx.x;
+          const int descriptor_col = cb + (tid / DescriptorLines) * 64;
+          if (tid < (BN / 64) * DescriptorLines && descriptor_col < n) {
+            const uint8_t* next = w +
+                (int64_t(descriptor_col / 64) * (k / 128) + future / 128) *
+                DescriptorBytes + (tid % DescriptorLines) * 128;
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(next));
+          }
+          const int metadata_col = cb + (tid / 8) * 64;
+          if (tid < (BN / 64) * 8 && metadata_col < n) {
+            const uint8_t* next = reinterpret_cast<const uint8_t*>(b12x_metadata) +
+                (int64_t(metadata_col / 64) * (k / 128) + future / 128) * 1024 +
+                (tid % 8) * 128;
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(next));
+          }
+        } else for (int row = threadIdx.x; row < BN; row += Threads) {
           if (cb + row < n) {
             const uint8_t* next = w +
                 (int64_t(future / 128) * n + cb + row) * 4 * (IQ3 ? 12 : 8);
