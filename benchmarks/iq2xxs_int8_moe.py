@@ -35,6 +35,7 @@ class Int8MoE:
         register_decode=False,
         fused_swiglu=False,
         masked_swiglu=False,
+        accumulate256=False,
     ):
         if (native.first_format, native.second_format) != ("IQ2_XXS", "IQ2_XXS"):
             raise ValueError("Complete INT8 candidate only supports IQ2_XXS pairs")
@@ -79,10 +80,22 @@ class Int8MoE:
             down_activation_block = activation_block
         if activation_block not in (32, 256) or down_activation_block not in (32, 256):
             raise ValueError("activation_block must be 32 or 256")
-        if register_decode and (activation_block != 32 or down_activation_block != 32):
+        if accumulate256 and not (
+            register_decode and activation_block == 256 and down_activation_block == 32
+        ):
+            raise ValueError(
+                "Integer scale accumulation requires register FC1 per256 and FC2 per32"
+            )
+        if (
+            register_decode
+            and not accumulate256
+            and (activation_block != 32 or down_activation_block != 32)
+        ):
             raise ValueError("register decoder requires per32 activation quantization")
         suffix = (
-            "_register"
+            "_register_acc256"
+            if accumulate256
+            else "_register"
             if register_decode
             else "_fold256"
             if activation_block == 256

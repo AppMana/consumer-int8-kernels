@@ -98,24 +98,27 @@ __device__ __forceinline__ void iq_async_copy(void* dst, const void* src, bool v
   asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;" ::
       "r"(shared), "l"(src), "n"(Bytes), "r"(valid ? Bytes : 0) : "memory");
 }
-template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false, bool Fold256=false, bool RegisterDecode=false>
+template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false, bool Fold256=false, bool RegisterDecode=false, bool Acc256=false>
 __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
     const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr) {
   static_assert(!RegisterDecode || (Slab && SharedLUT && !Fold256));
   static_assert(BM != 8 || RegisterDecode);
+  static_assert(!Acc256 || (RegisterDecode && !Weighted));
+  constexpr bool Shuffle = RegisterDecode && IQ2XXS_SHUFFLE_SCALE && !Acc256;
   constexpr int Outputs = BM == 8 ? 2 : 4;
   constexpr int Rows = BM + BN, Threads = ((BM + 15) / 16) * (BN / 32) * 32;
   constexpr int BK = RegisterDecode ? IQ2XXS_REGISTER_K : 128;
   constexpr int Blocks = BK / 32;
-  constexpr bool Pipeline = RegisterDecode && IQ2XXS_PIPELINE;
+  constexpr bool Pipeline = RegisterDecode && IQ2XXS_PIPELINE && !Acc256;
   constexpr int Stages = Pipeline ? IQ2XXS_PIPELINE_STAGES : 1;
   static_assert(!Pipeline || (BK == 128 && !IQ2XXS_SHUFFLE_SCALE));
   __shared__ int8_t tile_storage[Stages][RegisterDecode ? BM : Rows][BK + 16];
   __shared__ uint2 descriptor_storage[Stages][RegisterDecode ? BN * Blocks : 1];
   __shared__ int8_t high_tile[Fold256 ? BN : 1][144];
-  __shared__ float scale_storage[Stages][RegisterDecode && IQ2XXS_SHUFFLE_SCALE ? BM : Rows][Blocks];
+  __shared__ float scale_storage[Stages][Shuffle ? BM : Rows][Blocks];
+  __shared__ int subscales[Acc256 ? BN : 1][Blocks];
   __shared__ float pipeline_bases[Stages][Pipeline ? BN : 1];
-  __shared__ float weight_bases[RegisterDecode && IQ2XXS_SHUFFLE_SCALE ? BN : 1];
+  __shared__ float weight_bases[Shuffle ? BN : 1];
   const int lane = threadIdx.x & 31, group = lane >> 2, tid = lane & 3;
   const int warp = threadIdx.x >> 5;
   int rb = blockIdx.y * BM;
@@ -227,7 +230,7 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
           metadata = descriptor.y;
           if constexpr (RegisterDecode) descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + row : row * Blocks + block] = descriptor;
           base_scale = __half2float(wb[int64_t(base / 256) * n + cb + row]);
-          if constexpr (RegisterDecode && IQ2XXS_SHUFFLE_SCALE)
+          if constexpr (Shuffle)
             if (block == 0) weight_bases[row] = base_scale;
         } else {
           const uint8_t* raw = w + (int64_t(cb + row) * (k / 256) + base / 256) * 66;
@@ -242,7 +245,8 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
           }
           base_scale = __half2float(*reinterpret_cast<const __half*>(raw));
         }
-        scale = Fold256 ? base_scale * 0.125f : base_scale * (0.5f + float(metadata >> 28)) * 0.25f;
+        if constexpr (Acc256) subscales[row][block] = 2 * int(metadata >> 28) + 1;
+        scale = (Fold256 || Acc256) ? base_scale * 0.125f : base_scale * (0.5f + float(metadata >> 28)) * 0.25f;
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
           uint32_t signs = (metadata >> (j * 7)) & 127;
@@ -275,12 +279,14 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
           }
         }
       }
+      if constexpr (Acc256)
+        if (cb + row >= n) subscales[row][block] = 0;
       if constexpr (RegisterDecode) {
         if (cb + row >= n) descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + row : row * Blocks + block] = make_uint2(0, 0);
-        if constexpr (IQ2XXS_SHUFFLE_SCALE)
+        if constexpr (Shuffle)
           if (cb + row >= n && block == 0) weight_bases[row] = 0;
       }
-      if constexpr (!(RegisterDecode && IQ2XXS_SHUFFLE_SCALE))
+      if constexpr (!Shuffle)
         scales[BM + row][block] = scale;
       if constexpr (!RegisterDecode) {
       #pragma unroll
@@ -306,7 +312,7 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
         float weight_scale = 0;
         if constexpr (RegisterDecode) {
           const uint2 descriptor = descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + wc + j * 8 + group : (wc + j * 8 + group) * Blocks + block];
-          if constexpr (IQ2XXS_SHUFFLE_SCALE)
+          if constexpr (Shuffle)
             weight_scale = weight_bases[wc + j * 8 + group] *
                            (0.5f + float(descriptor.y >> 28)) * 0.25f;
           #pragma unroll
@@ -352,7 +358,19 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
               low_acc[j][r] = high_acc[j][r] = 0;
             }
           }
-        } else if constexpr (RegisterDecode && IQ2XXS_SHUFFLE_SCALE) {
+        } else if constexpr (Acc256) {
+          #pragma unroll
+          for (int r = 0; r < Outputs; ++r) {
+            // Bound 127*43*31*256=43338496 fits int32. One MMA per K32.
+            low_acc[j][r] += acc[r] * subscales[wc + j * 8 + tid * 2 + (r & 1)][block];
+            if ((base / 32 + block) % 8 == 7) {
+              sum[j][r] += float(low_acc[j][r]) *
+                  (scales[wr + group + (r >> 1) * 8][block] *
+                   scales[BM + wc + j * 8 + tid * 2 + (r & 1)][block]);
+              low_acc[j][r] = 0;
+            }
+          }
+        } else if constexpr (Shuffle) {
           // Four lanes decode one B row. Output columns select two of the
           // eight row groups; preserve the original per32 FP32 operation order.
           float output_scales[2];
@@ -732,5 +750,34 @@ extern "C" int iq2xxs_retile_mixed(const int32_t* input, const int32_t* tokens,
                                   int32_t* output, int count, int rows, cudaStream_t stream) {
   if (count <= 0 || count > 32767 || rows <= 0) return cudaErrorInvalidValue;
   iq_classify_rows<<<(count + 255) / 256, 256, 0, stream>>>(input, tokens, output, count, rows);
+  return cudaGetLastError();
+}
+
+// FC1-only per256 activations; scale integer MMA accumulators, not weights.
+extern "C" int iq2xxs_routed_int8_slab_register_acc256(const void* x, void* a, float* sa,
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || (tile_m == 0 && (taskcount % 2 || taskcount > 65534)) || (tile_m != 0 && tile_m != 8 && tile_m != 16 && tile_m != 32 && tile_m != 64))
+    return cudaErrorInvalidValue;
+  quantize256<<<(xrows * (k / 256) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 256));
+#define ROUTED_LAUNCH(M,N) \
+  iq2xxs_tiled<M,N,true,true,true,false,true,false,false,true,true><<<dim3((n+N-1)/N,taskcount), ((M+15)/16)*(N/32)*32, 0, stream>>>( \
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
+      static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases))
+  // tile_m=0: two equal disjoint task arrays, sparse8 followed by dense16.
+  if (tile_m == 0) {
+    taskcount /= 2;
+    ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N8);
+    tasks += taskcount * 2;
+    ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N);
+  }
+  else if (tile_m == 8) { ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N8); }
+  else if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N); }
+  else if (tile_m == 32) { ROUTED_LAUNCH(32,IQ2XXS_REGISTER_N); }
+  else { ROUTED_LAUNCH(64,IQ2XXS_REGISTER_N); }
+#undef ROUTED_LAUNCH
   return cudaGetLastError();
 }

@@ -164,6 +164,7 @@ def main(args):
         int8_eight_row=args.int8_eight_row,
         int8_mixed_row=args.int8_mixed_row,
         int8_control_mixed_row=args.int8_control_mixed_row,
+        int8_accumulate256=args.int8_accumulate256,
         int8_activation_block=args.int8_activation_block,
         int8_down_activation_block=args.int8_down_activation_block,
         int8_library_sha256=(
@@ -235,6 +236,8 @@ def main(args):
                                 activation_block=args.int8_activation_block,
                                 down_activation_block=args.int8_down_activation_block,
                                 register_decode=register_decode,
+                                accumulate256=args.int8_accumulate256
+                                and register_decode,
                                 fused_swiglu=args.int8_fused_swiglu and register_decode,
                                 masked_swiglu=args.int8_masked_swiglu
                                 and register_decode,
@@ -355,7 +358,9 @@ def main(args):
                                     references[f"int8{tile}"],
                                     references[f"int8{tile}-shared"],
                                 )
-                        if args.int8_control_library:
+                        # A per32 library is a speed/accuracy comparison for
+                        # per256 FC1, not a bitwise arithmetic oracle.
+                        if args.int8_control_library and not args.int8_accumulate256:
                             for tile in (
                                 (0, 16, 32) if args.int8_control_mixed_row else (16, 32)
                             ):
@@ -460,6 +465,7 @@ if __name__ == "__main__":
     parser.add_argument("--int8-eight-row", action="store_true")
     parser.add_argument("--int8-mixed-row", action="store_true")
     parser.add_argument("--int8-control-mixed-row", action="store_true")
+    parser.add_argument("--int8-accumulate256", action="store_true")
     parser.add_argument(
         "--int8-activation-block", type=int, choices=(32, 256), default=32
     )
@@ -512,4 +518,13 @@ if __name__ == "__main__":
         args.int8_control_masked_swiglu and args.int8_mixed_row
     ):
         parser.error("Mixed control requires masked control and mixed candidate")
+    if args.int8_accumulate256 and not (
+        args.int8_register_decode
+        and args.int8_activation_block == 256
+        and args.int8_down_activation_block == 32
+    ):
+        parser.error(
+            "Accumulator scaling requires FC1 per256/FC2 per32; "
+            "shared folded path is its exact control"
+        )
     main(args)
