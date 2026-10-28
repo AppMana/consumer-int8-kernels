@@ -163,6 +163,7 @@ def main(args):
         int8_control_masked_swiglu=args.int8_control_masked_swiglu,
         int8_eight_row=args.int8_eight_row,
         int8_mixed_row=args.int8_mixed_row,
+        int8_control_mixed_row=args.int8_control_mixed_row,
         int8_activation_block=args.int8_activation_block,
         int8_down_activation_block=args.int8_down_activation_block,
         int8_library_sha256=(
@@ -252,7 +253,9 @@ def main(args):
                             )
                             owners.append(int8)
                     if args.int8_control_library:
-                        for tile in (16, 32):
+                        for tile in (
+                            (0, 16, 32) if args.int8_control_mixed_row else (16, 32)
+                        ):
                             control = Int8MoE(
                                 native,
                                 int8_packed,
@@ -353,7 +356,9 @@ def main(args):
                                     references[f"int8{tile}-shared"],
                                 )
                         if args.int8_control_library:
-                            for tile in (16, 32):
+                            for tile in (
+                                (0, 16, 32) if args.int8_control_mixed_row else (16, 32)
+                            ):
                                 assert torch.equal(
                                     references[f"int8{tile}"],
                                     references[f"int8{tile}-register-control"],
@@ -454,6 +459,7 @@ if __name__ == "__main__":
     parser.add_argument("--int8-control-masked-swiglu", action="store_true")
     parser.add_argument("--int8-eight-row", action="store_true")
     parser.add_argument("--int8-mixed-row", action="store_true")
+    parser.add_argument("--int8-control-mixed-row", action="store_true")
     parser.add_argument(
         "--int8-activation-block", type=int, choices=(32, 256), default=32
     )
@@ -502,4 +508,8 @@ if __name__ == "__main__":
         parser.error("Masked control requires fused control SwiGLU")
     if (args.int8_eight_row or args.int8_mixed_row) and not args.int8_masked_swiglu:
         parser.error("Eight-row comparison requires masked SwiGLU")
+    if args.int8_control_mixed_row and not (
+        args.int8_control_masked_swiglu and args.int8_mixed_row
+    ):
+        parser.error("Mixed control requires masked control and mixed candidate")
     main(args)

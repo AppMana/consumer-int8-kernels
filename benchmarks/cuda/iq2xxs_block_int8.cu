@@ -15,6 +15,10 @@
 #ifndef IQ2XXS_REGISTER_N
 #define IQ2XXS_REGISTER_N 64
 #endif
+#ifndef IQ2XXS_REGISTER_N8
+#define IQ2XXS_REGISTER_N8 IQ2XXS_REGISTER_N
+#endif
+static_assert(IQ2XXS_REGISTER_N8 == 64 || IQ2XXS_REGISTER_N8 == 128);
 // Increase staging depth independently of the per32 quantization/MMA groups.
 // K256 loses paired complete-MoE timings; keep K128 as the default.
 #ifndef IQ2XXS_REGISTER_K
@@ -594,11 +598,11 @@ extern "C" int iq2xxs_routed_int8_slab_register(const void* x, void* a, float* s
   // tile_m=0: two equal disjoint task arrays, sparse8 followed by dense16.
   if (tile_m == 0) {
     taskcount /= 2;
-    ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N);
+    ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N8);
     tasks += taskcount * 2;
     ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N);
   }
-  else if (tile_m == 8) { ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N); }
+  else if (tile_m == 8) { ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N8); }
   else if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N); }
   else if (tile_m == 32) { ROUTED_LAUNCH(32,IQ2XXS_REGISTER_N); }
   else { ROUTED_LAUNCH(64,IQ2XXS_REGISTER_N); }
@@ -622,11 +626,11 @@ extern "C" int iq2xxs_routed_int8_slab_register_weighted(const void* x, void* a,
   // tile_m=0: two equal disjoint task arrays, sparse8 followed by dense16.
   if (tile_m == 0) {
     taskcount /= 2;
-    ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N);
+    ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N8);
     tasks += taskcount * 2;
     ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N);
   }
-  else if (tile_m == 8) { ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N); }
+  else if (tile_m == 8) { ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N8); }
   else if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N); }
   else if (tile_m == 32) { ROUTED_LAUNCH(32,IQ2XXS_REGISTER_N); }
   else { ROUTED_LAUNCH(64,IQ2XXS_REGISTER_N); }
@@ -663,11 +667,11 @@ extern "C" int iq2xxs_routed_int8_slab_register_weighted_quantized(const void* x
   // tile_m=0: two equal disjoint task arrays, sparse8 followed by dense16.
   if (tile_m == 0) {
     taskcount /= 2;
-    ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N);
+    ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N8);
     tasks += taskcount * 2;
     ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N);
   }
-  else if (tile_m == 8) { ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N); }
+  else if (tile_m == 8) { ROUTED_LAUNCH(8,IQ2XXS_REGISTER_N8); }
   else if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N); }
   else if (tile_m == 32) { ROUTED_LAUNCH(32,IQ2XXS_REGISTER_N); }
   else { ROUTED_LAUNCH(64,IQ2XXS_REGISTER_N); }
