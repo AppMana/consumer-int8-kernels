@@ -375,10 +375,44 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
       }
       scales[row][block] = valid ? sa[int64_t(input) * (k / 32) + base / 32 + block] : 0;
     }
-    for (int index = threadIdx.x; index < BN * Blocks * (Cooperative ? 4 : 1); index += Threads) {
+    if constexpr (B12xPacked) {
+      for (int row = threadIdx.x; row < BN; row += Threads) {
+        const int col = weight_column(row);
+        const bool valid_col = col < n;
+        const int sw = (col % 64 / 16) * 16 + (col % 8) * 2 + col % 16 / 8;
+        const int base_col = (col / 16) * 16 + (col % 8) * 2 + col % 16 / 8;
+        const float base_scale = valid_col ? __half2float(wb[int64_t(base / 256) * n + base_col]) : 0.f;
+        const int64_t qi_base = (int64_t(col / 64) * (k / 128) + base / 128) * 512 + sw;
+        const int64_t si_base = ((int64_t(col / 64) * (k / 256) + base / 256) * 8 + (base % 256 / 32)) * 64 + sw;
+        #pragma unroll
+        for (int block = 0; block < Blocks; ++block) {
+          uint2 descriptor = make_uint2(0, 0);
+          uint32_t indices_high = 0;
+          float scale = 0.f;
+          if (valid_col) {
+            const int64_t qi = qi_base + block * 128;
+            const int64_t si = si_base + block * 64;
+            const uint32_t meta = b12x_metadata[si];
+            if constexpr (IQ3) {
+              const auto* words = reinterpret_cast<const uint32_t*>(w);
+              descriptor = make_uint2(words[qi], meta);
+              indices_high = words[qi + 64];
+            } else {
+              const auto* words = reinterpret_cast<const uint16_t*>(w);
+              descriptor = make_uint2(uint32_t(words[qi]) | (uint32_t(words[qi + 64]) << 16), meta);
+            }
+            scale = base_scale * (0.5f + float(meta >> 28)) * (IQ3 ? 0.5f : 0.25f);
+          }
+          const int slot = IQ2XXS_TRANSPOSE_DESC ? block * BN + row : row * Blocks + block;
+          descriptors[slot] = descriptor;
+          if constexpr (IQ3) descriptor_high_storage[slot] = indices_high;
+          scales[BM + row][block] = scale;
+        }
+      }
+    } else for (int index = threadIdx.x; index < BN * Blocks * (Cooperative ? 4 : 1); index += Threads) {
       const int descriptor_index_in_tile = index / (Cooperative ? 4 : 1);
-      int row = B12xPacked ? descriptor_index_in_tile % BN : descriptor_index_in_tile / Blocks;
-      int block = B12xPacked ? descriptor_index_in_tile / BN : descriptor_index_in_tile % Blocks;
+      int row = descriptor_index_in_tile / Blocks;
+      int block = descriptor_index_in_tile % Blocks;
       const int first_part = Cooperative ? index % 4 : 0;
       const int end_part = Cooperative ? first_part + 1 : 4;
       uint64_t values[4] = {}, high_values[4] = {};
@@ -391,23 +425,7 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
           uint2 descriptor;
           const int64_t descriptor_index =
               (int64_t(base / 128 + block / 4) * n + cb + row) * 4 + block % 4;
-          if constexpr (B12xPacked) {
-            const int col = weight_column(row);
-            const int sw = (col % 64 / 16) * 16 + (col % 8) * 2 + col % 16 / 8;
-            const int part = base % 256 / 32 + block;
-            const int64_t qi = ((int64_t(col / 64) * (k / 128) + base / 128) * 8 +
-                (part % 4) * 2) * 64 + sw;
-            const int64_t si = ((int64_t(col / 64) * (k / 256) + base / 256) * 8 + part) * 64 + sw;
-            if constexpr (IQ3) {
-              const auto* words = reinterpret_cast<const uint32_t*>(w);
-              descriptor = make_uint2(words[qi], b12x_metadata[si]);
-              indices_high = words[qi + 64];
-            } else {
-              const auto* words = reinterpret_cast<const uint16_t*>(w);
-              descriptor = make_uint2(uint32_t(words[qi]) | (uint32_t(words[qi + 64]) << 16),
-                  b12x_metadata[si]);
-            }
-          } else if constexpr (IQ3) {
+          if constexpr (IQ3) {
             const uint32_t* words = reinterpret_cast<const uint32_t*>(w) + descriptor_index * 3;
             descriptor = make_uint2(words[0], words[2]);
             indices_high = words[1];
@@ -420,8 +438,7 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
             if constexpr (IQ3) descriptor_high_storage[slot] = indices_high;
           }
           const int col = weight_column(row);
-          const int base_col = B12xPacked ? (col / 16) * 16 + (col % 8) * 2 + col % 16 / 8 : col;
-          base_scale = __half2float(wb[int64_t(base / 256) * n + base_col]);
+          base_scale = __half2float(wb[int64_t(base / 256) * n + col]);
           if constexpr (Shuffle)
             if (block == 0) weight_bases[row] = base_scale;
         } else {
