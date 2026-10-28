@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Benchmark-only complete IQ2_XXS chain using prebuilt INT8 C ABI kernels."""
+"""Benchmark-only complete IQ2_XXS/IQ3_XXS chain using prebuilt INT8 C ABI kernels."""
 
 import ctypes
 
@@ -9,15 +9,19 @@ from consumer_int8 import gguf
 from consumer_int8.gguf_moe import ExecutionPlan
 
 
-def repack(packed):
+def repack(packed, bits=2):
+    if bits not in (2, 3):
+        raise ValueError("XXS repack requires bits2/3")
     codes, bases, metadata = packed
     e, n, code_bytes = codes.shape
-    k = code_bytes * 8
-    chunks = codes.reshape(e, n, k // 128, 4, 4)
-    words = metadata.contiguous().view(torch.uint8).reshape_as(chunks)
+    k = code_bytes * (8 if bits == 2 else 4)
+    chunks = codes.reshape(e, n, k // 128, 4, 4 if bits == 2 else 8)
+    words = metadata.contiguous().view(torch.uint8).reshape(e, n, k // 128, 4, 4)
     descriptors = torch.cat((chunks, words), -1).permute(0, 2, 1, 3, 4).contiguous()
     scales = bases[..., : k // 256].transpose(1, 2).contiguous()
-    assert descriptors.numel() + scales.numel() * 2 == e * n * (k // 256) * 66
+    assert descriptors.numel() + scales.numel() * 2 == e * n * (k // 256) * (
+        66 if bits == 2 else 98
+    )
     return descriptors, scales
 
 
@@ -49,8 +53,22 @@ class Int8MoE:
             raise ValueError("Independent down decoder requires ordinary per32 tiles")
         if down_register_decode is None:
             down_register_decode = register_decode
-        if (native.first_format, native.second_format) != ("IQ2_XXS", "IQ2_XXS"):
-            raise ValueError("Complete INT8 candidate only supports IQ2_XXS pairs")
+        if any(
+            f not in ("IQ2_XXS", "IQ3_XXS")
+            for f in (native.first_format, native.second_format)
+        ):
+            raise ValueError("INT8 candidate requires IQ2_XXS/IQ3_XXS projections")
+        if "IQ3_XXS" in (native.first_format, native.second_format) and (
+            hybrid1632
+            or accumulate256
+            or activation_block != 32
+            or down_activation_block not in (None, 32)
+            or (native.first_format == "IQ3_XXS" and register_decode)
+            or (native.second_format == "IQ3_XXS" and down_register_decode)
+        ):
+            raise ValueError("IQ3_XXS requires shared decoding and per32 quantization")
+        first_prefix = "iq3xxs" if native.first_format == "IQ3_XXS" else "iq2xxs"
+        down_prefix = "iq3xxs" if native.second_format == "IQ3_XXS" else "iq2xxs"
         if hybrid1632 and not (
             tile == 32
             and register_decode
@@ -127,7 +145,7 @@ class Int8MoE:
             if activation_block == 256
             else ""
         )
-        self.fc1 = getattr(self.lib, "iq2xxs_routed_int8_slab" + suffix)
+        self.fc1 = getattr(self.lib, first_prefix + "_routed_int8_slab" + suffix)
         down_suffix = (
             "_register"
             if down_register_decode
@@ -157,7 +175,8 @@ class Int8MoE:
             self.fused_quant.restype = ctypes.c_int
         self.fc2 = getattr(
             self.lib,
-            "iq2xxs_routed_int8_slab"
+            down_prefix
+            + "_routed_int8_slab"
             + down_suffix
             + "_weighted"
             + ("_quantized" if fused_swiglu else ""),

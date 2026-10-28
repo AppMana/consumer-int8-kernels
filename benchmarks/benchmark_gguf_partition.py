@@ -199,9 +199,16 @@ def main(args):
             if args.int8_library:
                 from iq2xxs_int8_moe import Int8MoE, repack
 
-                if (gate.quant_type, down.quant_type) != ("IQ2_XXS", "IQ2_XXS"):
-                    raise ValueError("INT8 benchmark requires IQ2_XXS gate/up and down")
-                int8_packed = (repack(native.gate_up), repack(native.down))
+                if any(
+                    part.quant_type not in ("IQ2_XXS", "IQ3_XXS") for part in sources
+                ):
+                    raise ValueError(
+                        "INT8 benchmark requires IQ2_XXS/IQ3_XXS projections"
+                    )
+                int8_packed = (
+                    repack(native.gate_up, 3 if gate.quant_type == "IQ3_XXS" else 2),
+                    repack(native.down, 3 if down.quant_type == "IQ3_XXS" else 2),
+                )
             for count in args.tokens:
                 torch.manual_seed(182 + count)
                 x = torch.randn(
@@ -455,7 +462,11 @@ def main(args):
                             for tile in (16, 32):
                                 assert torch.equal(
                                     references[f"int8{tile}-shared-fused"],
-                                    references[f"int8{tile}-shared"],
+                                    references[
+                                        f"int8{tile}-shared"
+                                        if args.int8_register_decode
+                                        else f"int8{tile}"
+                                    ],
                                 )
                                 if args.int8_control_library:
                                     assert torch.equal(
@@ -632,7 +643,14 @@ if __name__ == "__main__":
         args.int8_shared_fused or args.int8_hybrid1632 or args.int8_split_decoder
     ) and not (
         args.int8_library
-        and args.int8_register_decode
+        and (
+            args.int8_register_decode
+            or (
+                args.int8_shared_fused
+                and not args.int8_hybrid1632
+                and not args.int8_split_decoder
+            )
+        )
         and args.int8_activation_block == 32
         and args.int8_down_activation_block in (None, 32)
     ):
