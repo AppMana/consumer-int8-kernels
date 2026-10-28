@@ -19,12 +19,22 @@ static_assert(IQ2XXS_REGISTER_N == 64 || IQ2XXS_REGISTER_N == 128);
 namespace {
 // Match gguf_swiglu's clipping, expf/division and BF16 product rounding before
 // the existing block32 quantizer. Each warp owns exactly one quantization block.
+template<bool Masked=false>
 __global__ void swiglu_quantize32(const __nv_bfloat16* x, int8_t* q,
-                                float* scales, int blocks, int width, float limit) {
+                                float* scales, int blocks, int width, float limit, const int32_t* tokens=nullptr) {
   const int lane = threadIdx.x & 31;
   const int block = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
   if (block >= blocks) return;
   const int64_t index = int64_t(block) * 32 + lane;
+  if constexpr (Masked) {
+    // Routing initializes the entire capacity to -1 on each replay.
+    // Padded projected rows are mathematically zero; unused rows are not read.
+    if (tokens[index / width] < 0) {
+      q[index] = 0;
+      if (!lane) scales[block] = 1.e-20f;
+      return;
+    }
+  }
   const int64_t source = (index / width) * (2 * int64_t(width)) + index % width;
   const float gate = fminf(__bfloat162float(x[source]), limit);
   const float up = fminf(fmaxf(__bfloat162float(x[source + width]), -limit), limit);
@@ -506,7 +516,7 @@ extern "C" int iq2xxs_swiglu_quantize32(const void* x, void* q, float* scales,
     return cudaErrorInvalidValue;
   if (!rows) return cudaSuccess;
   const int blocks = rows * (width / 32);
-  swiglu_quantize32<<<(int64_t(blocks) + 7) / 8, 256, 0, stream>>>(
+  swiglu_quantize32<><<<(int64_t(blocks) + 7) / 8, 256, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(q), scales, blocks, width, limit);
   return cudaGetLastError();
 }
@@ -527,5 +537,18 @@ extern "C" int iq2xxs_routed_int8_slab_register_weighted_quantized(const void* x
   else if (tile_m == 32) { ROUTED_LAUNCH(32,IQ2XXS_REGISTER_N); }
   else { ROUTED_LAUNCH(64,IQ2XXS_REGISTER_N); }
 #undef ROUTED_LAUNCH
+  return cudaGetLastError();
+}
+
+extern "C" int iq2xxs_swiglu_quantize32_masked(const void* x, void* q, float* scales, const int32_t* tokens,
+                                      int rows, int width, float limit, cudaStream_t stream) {
+  if (rows < 0 || width <= 0 || width % 32 || !(limit > 0.f) ||
+      // Keep the flattened uint32 CUDA thread index within its range.
+      !isfinite(limit) || int64_t(rows) * (width / 32) > 134217728)
+    return cudaErrorInvalidValue;
+  if (!rows) return cudaSuccess;
+  const int blocks = rows * (width / 32);
+  swiglu_quantize32<true><<<(int64_t(blocks) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(q), scales, blocks, width, limit, tokens);
   return cudaGetLastError();
 }
