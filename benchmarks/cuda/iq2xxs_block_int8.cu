@@ -11,6 +11,11 @@
 #ifndef IQ2XXS_TRANSPOSE_DESC
 #define IQ2XXS_TRANSPOSE_DESC 1
 #endif
+// Benchmark wider output tiling without changing the C ABI or arithmetic.
+#ifndef IQ2XXS_REGISTER_N
+#define IQ2XXS_REGISTER_N 64
+#endif
+static_assert(IQ2XXS_REGISTER_N == 64 || IQ2XXS_REGISTER_N == 128);
 namespace {
 // Eight values per lane; repeat scales to retain existing benchmark scratch ABI.
 __global__ void quantize256(const __nv_bfloat16* x, int8_t* q, float* scales, int blocks) {
@@ -446,9 +451,9 @@ extern "C" int iq2xxs_routed_int8_slab_register(const void* x, void* a, float* s
   iq2xxs_tiled<M,N,true,true,true,false,true,false,false,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
       static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases))
-  if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
-  else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
-  else { ROUTED_LAUNCH(64,64); }
+  if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N); }
+  else if (tile_m == 32) { ROUTED_LAUNCH(32,IQ2XXS_REGISTER_N); }
+  else { ROUTED_LAUNCH(64,IQ2XXS_REGISTER_N); }
 #undef ROUTED_LAUNCH
   return cudaGetLastError();
 }
@@ -466,9 +471,9 @@ extern "C" int iq2xxs_routed_int8_slab_register_weighted(const void* x, void* a,
   iq2xxs_tiled<M,N,true,true,true,false,true,true,false,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
       static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases), weights)
-  if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
-  else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
-  else { ROUTED_LAUNCH(64,64); }
+  if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N); }
+  else if (tile_m == 32) { ROUTED_LAUNCH(32,IQ2XXS_REGISTER_N); }
+  else { ROUTED_LAUNCH(64,IQ2XXS_REGISTER_N); }
 #undef ROUTED_LAUNCH
   return cudaGetLastError();
 }
