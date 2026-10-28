@@ -5,6 +5,7 @@ Install before model loading. Requires the qualified prebuilt register-N128
 C ABI library and the benchmark helper on PYTHONPATH. Not a production backend.
 """
 
+import ctypes
 import functools
 import re
 from dataclasses import replace
@@ -29,6 +30,9 @@ def install(library, *, enabled=True, borrow_b12x=False, prefill_tokens=512):
     ):
         raise ValueError("Larger prefill windows require borrowed weights")
     library = Path(library).resolve(strict=True)
+    cdll = ctypes.CDLL(str(library))
+    has_hybrid_fused = hasattr(cdll, "iq2xxs_routed_int8_b12x_hybrid1632_swiglu")
+    has_register_fused = hasattr(cdll, "iq2xxs_routed_int8_b12x_register_swiglu")
     original_load = B12xIQMoEMethod.process_weights_after_loading
     original_apply = B12xIQMoEMethod.apply
     if getattr(original_load, "_integer_prefill_experiment", False):
@@ -109,18 +113,25 @@ def install(library, *, enabled=True, borrow_b12x=False, prefill_tokens=512):
         if (native.hidden_size, native.intermediate_size) != (5120, 2304):
             raise ValueError("Unqualified integer expert dimensions")
         count = 128 if borrow_b12x and number >= 30 else prefill_tokens
+        use_hybrid = bool(borrow_b12x and has_hybrid_fused and count >= 512)
+        use_fused_fc1 = bool(
+            borrow_b12x and (use_hybrid or has_register_fused)
+        )
+        tile_m = 32 if use_hybrid else 16
         plan = Int8MoE(
             native,
             packed,
             library,
             count,
             6,
-            16,
+            tile_m,
             register_decode=True,
             fused_swiglu=True,
             masked_swiglu=True,
+            hybrid1632=use_hybrid,
             external_scratch=True,
             b12x_packed=borrow_b12x,
+            fused_fc1=use_fused_fc1,
         )
         device = native.device
         x = torch.zeros((count, 5120), dtype=torch.bfloat16, device=device)

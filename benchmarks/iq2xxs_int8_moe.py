@@ -61,14 +61,13 @@ class Int8MoE:
             down_register_decode = register_decode
         if b12x_packed:
             if not (
-                register_decode
-                and down_register_decode
+                register_decode == down_register_decode
                 and tile in (16, 32)
                 and activation_block == 32
                 and down_activation_block in (None, 32)
-                and not (first_tile16 or hybrid1632 or accumulate256 or iq3_adaptive)
+                and not (first_tile16 or accumulate256 or iq3_adaptive)
             ):
-                raise ValueError("b12x storage requires ordinary per32 register M16/32")
+                raise ValueError("b12x storage requires ordinary per32 M16/32 or hybrid1632")
             for pair, n, k, fmt in zip(
                 packed,
                 (2 * native.intermediate_size, native.hidden_size),
@@ -93,9 +92,15 @@ class Int8MoE:
                     raise ValueError("Invalid b12x tiled descriptors/metadata storage")
         storage_suffix = "_routed_int8_b12x" if b12x_packed else "_routed_int8_slab"
         if fused_fc1 and not (
-            b12x_packed and tile == 16 and fused_swiglu and masked_swiglu
+            b12x_packed
+            and fused_swiglu
+            and masked_swiglu
+            and (
+                (tile == 16 and register_decode and not hybrid1632)
+                or (tile == 32 and hybrid1632)
+            )
         ):
-            raise ValueError("Fused FC1 requires borrowed M16 masked fused path")
+            raise ValueError("Fused FC1 requires borrowed M16 or hybrid1632 masked fused path")
         self.fused_fc1 = fused_fc1
         if first_tile16 and not (
             tile == 32
@@ -116,7 +121,7 @@ class Int8MoE:
         ):
             raise ValueError("INT8 candidate requires IQ2_XXS/IQ3_XXS projections")
         if "IQ3_XXS" in (native.first_format, native.second_format) and (
-            hybrid1632
+            (hybrid1632 and not b12x_packed)
             or accumulate256
             or activation_block != 32
             or down_activation_block not in (None, 32)
@@ -227,10 +232,6 @@ class Int8MoE:
             if activation_block == 256
             else ""
         )
-        self.fc1 = getattr(
-            self.lib,
-            first_prefix + storage_suffix + suffix + ("_swiglu" if fused_fc1 else ""),
-        )
         down_suffix = (
             "_register"
             if down_register_decode
@@ -258,17 +259,35 @@ class Int8MoE:
                 + [ctypes.c_float, ctypes.c_void_p]
             )
             self.fused_quant.restype = ctypes.c_int
-        self.fc2 = getattr(
-            self.down_lib,
-            down_prefix
-            + storage_suffix
-            + down_suffix
-            + "_weighted"
-            + ("_quantized" if fused_swiglu else ""),
-        )
         if hybrid1632:
-            self.fc1 = self.lib.iq2xxs_routed_int8_slab_hybrid1632
-            self.fc2 = self.lib.iq2xxs_routed_int8_slab_hybrid1632_weighted_quantized
+            self.fc1 = getattr(
+                self.lib,
+                first_prefix
+                + storage_suffix
+                + "_hybrid1632"
+                + ("_swiglu" if fused_fc1 else ""),
+            )
+            self.fc2 = getattr(
+                self.down_lib,
+                down_prefix + storage_suffix + "_hybrid1632_weighted_quantized",
+            )
+        else:
+            self.fc1 = getattr(
+                self.lib,
+                first_prefix + storage_suffix + suffix + ("_swiglu" if fused_fc1 else ""),
+            )
+            self.fc2 = getattr(
+                self.down_lib,
+                down_prefix
+                + storage_suffix
+                + down_suffix
+                + "_weighted"
+                + ("_quantized" if fused_swiglu else ""),
+            )
+        self.pass_tokens_to_fc2 = (
+            self.masked_swiglu
+            and getattr(self.down_lib, "iq_fc2_uses_route_tokens", None) is not None
+        )
         if iq3_adaptive:
             self.fc1 = self.lib.iq3xxs_routed_int8_slab_adaptive
         for fn, pointers in ((self.fc1, 8), (self.fc2, 9)):
@@ -321,7 +340,8 @@ class Int8MoE:
         ) = scratch[:9]
         m = x.shape[0]
         r = self.plan.route_capacity
-        torch.arange(r, device=x.device, dtype=torch.int32, out=identity)
+        if not self.pass_tokens_to_fc2:
+            torch.arange(r, device=x.device, dtype=torch.int32, out=identity)
         gguf.plan_routes(
             ids,
             top_weights,
@@ -401,6 +421,7 @@ class Int8MoE:
         if self.iq3_adaptive or self.first_tile16:
             tasks = scratch[4]
             tail = (tail[0], tasks.shape[0], self.tile, tail[3])
+        fc2_tokens = tokens if self.pass_tokens_to_fc2 else identity
         assert (
             self.fc2(
                 *[
@@ -410,7 +431,7 @@ class Int8MoE:
                         q2,
                         s2,
                         *self.packed[1],
-                        identity,
+                        fc2_tokens,
                         tasks,
                         weights,
                         contributions,
