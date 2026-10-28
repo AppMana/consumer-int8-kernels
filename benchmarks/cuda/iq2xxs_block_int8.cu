@@ -22,6 +22,11 @@
 #define IQ2XXS_TASK_GROUP 1
 #endif
 static_assert(IQ2XXS_TASK_GROUP >= 1 && IQ2XXS_TASK_GROUP <= 16);
+// Independently tune output width for shared-expanded per32 IQ decoding.
+#ifndef IQ2XXS_SHARED_N
+#define IQ2XXS_SHARED_N 64
+#endif
+static_assert(IQ2XXS_SHARED_N == 32 || IQ2XXS_SHARED_N == 64 || IQ2XXS_SHARED_N == 128);
 #ifndef IQ2XXS_REGISTER_N8
 #define IQ2XXS_REGISTER_N8 IQ2XXS_REGISTER_N
 #endif
@@ -595,9 +600,9 @@ extern "C" int iq2xxs_routed_int8_slab(const void* x, void* a, float* sa,
   iq2xxs_tiled<M,N,true,true,true,false,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
       static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases))
-  if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
-  else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
-  else { ROUTED_LAUNCH(64,64); }
+  if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_SHARED_N); }
+  else if (tile_m == 32) { ROUTED_LAUNCH(32,IQ2XXS_SHARED_N); }
+  else { ROUTED_LAUNCH(64,IQ2XXS_SHARED_N); }
 #undef ROUTED_LAUNCH
   return cudaGetLastError();
 }
@@ -615,9 +620,9 @@ extern "C" int iq2xxs_routed_int8_slab_weighted(const void* x, void* a, float* s
   iq2xxs_tiled<M,N,true,true,true,false,true,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
       static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases), weights)
-  if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
-  else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
-  else { ROUTED_LAUNCH(64,64); }
+  if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_SHARED_N); }
+  else if (tile_m == 32) { ROUTED_LAUNCH(32,IQ2XXS_SHARED_N); }
+  else { ROUTED_LAUNCH(64,IQ2XXS_SHARED_N); }
 #undef ROUTED_LAUNCH
   return cudaGetLastError();
 }
@@ -859,9 +864,9 @@ extern "C" int iq2xxs_routed_int8_slab_weighted_quantized(const void* x, void* a
   iq2xxs_tiled<M,N,true,true,true,false,true,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
       static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases), weights)
-  if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
-  else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
-  else { ROUTED_LAUNCH(64,64); }
+  if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_SHARED_N); }
+  else if (tile_m == 32) { ROUTED_LAUNCH(32,IQ2XXS_SHARED_N); }
+  else { ROUTED_LAUNCH(64,IQ2XXS_SHARED_N); }
 #undef ROUTED_LAUNCH
   return cudaGetLastError();
 }
@@ -889,7 +894,7 @@ extern "C" int iq2xxs_routed_int8_slab_hybrid1632(const void* x, void* a, float*
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts,
       static_cast<const __half*>(bases));
   tasks += taskcount * 2;
-  iq2xxs_tiled<32,64,true,true,true,false,true,false,false,false><<<dim3((n+64-1)/64,taskcount), (32/16)*(64/32)*32, 0, stream>>>(
+  iq2xxs_tiled<32,IQ2XXS_SHARED_N,true,true,true,false,true,false,false,false><<<dim3((n+IQ2XXS_SHARED_N-1)/IQ2XXS_SHARED_N,taskcount), (32/16)*(IQ2XXS_SHARED_N/32)*32, 0, stream>>>(
       static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts,
       static_cast<const __half*>(bases));
@@ -911,7 +916,7 @@ extern "C" int iq2xxs_routed_int8_slab_hybrid1632_weighted_quantized(const void*
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts,
       static_cast<const __half*>(bases), weights);
   tasks += taskcount * 2;
-  iq2xxs_tiled<32,64,true,true,true,false,true,true,false,false><<<dim3((n+64-1)/64,taskcount), (32/16)*(64/32)*32, 0, stream>>>(
+  iq2xxs_tiled<32,IQ2XXS_SHARED_N,true,true,true,false,true,true,false,false><<<dim3((n+IQ2XXS_SHARED_N-1)/IQ2XXS_SHARED_N,taskcount), (32/16)*(IQ2XXS_SHARED_N/32)*32, 0, stream>>>(
       static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa,
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts,
       static_cast<const __half*>(bases), weights);
