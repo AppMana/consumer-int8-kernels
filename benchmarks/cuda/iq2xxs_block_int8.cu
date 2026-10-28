@@ -16,6 +16,12 @@
 #ifndef IQ2XXS_REGISTER_N
 #define IQ2XXS_REGISTER_N 64
 #endif
+// Group adjacent routed row tasks at each output tile to test L2 weight reuse.
+// Default preserves the original column-fast block order.
+#ifndef IQ2XXS_TASK_GROUP
+#define IQ2XXS_TASK_GROUP 1
+#endif
+static_assert(IQ2XXS_TASK_GROUP >= 1 && IQ2XXS_TASK_GROUP <= 16);
 #ifndef IQ2XXS_REGISTER_N8
 #define IQ2XXS_REGISTER_N8 IQ2XXS_REGISTER_N
 #endif
@@ -111,7 +117,8 @@ __device__ __forceinline__ void iq_async_copy(void* dst, const void* src, bool v
       "r"(shared), "l"(src), "n"(Bytes), "r"(valid ? Bytes : 0) : "memory");
 }
 template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false, bool Fold256=false, bool RegisterDecode=false, bool Acc256=false>
-__global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
+__global__ __launch_bounds__(((BM + 15) / 16) * (BN / 32) * 32)
+void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
     const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr) {
   static_assert(!RegisterDecode || (Slab && SharedLUT && !Fold256));
   static_assert(BM != 8 || RegisterDecode);
@@ -135,15 +142,25 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
   __shared__ float weight_bases[Shuffle ? BN : 1];
   const int lane = threadIdx.x & 31, group = lane >> 2, tid = lane & 3;
   const int warp = threadIdx.x >> 5;
-  int rb = blockIdx.y * BM;
+  int task = blockIdx.y, column = blockIdx.x;
+  if constexpr (Routed && IQ2XXS_TASK_GROUP > 1) {
+    const int linear = blockIdx.y * gridDim.x + blockIdx.x;
+    const int group = linear / (IQ2XXS_TASK_GROUP * gridDim.x);
+    const int first = group * IQ2XXS_TASK_GROUP;
+    const int size = min(IQ2XXS_TASK_GROUP, int(gridDim.y) - first);
+    const int offset = linear - first * gridDim.x;
+    task = first + offset % size;
+    column = offset / size;
+  }
+  int rb = task * BM;
   if constexpr (Routed) {
-    const int expert = tasks[blockIdx.y * 2];
-    rb = tasks[blockIdx.y * 2 + 1];
+    const int expert = tasks[task * 2];
+    rb = tasks[task * 2 + 1];
     if (expert < 0 || expert >= experts || rb < 0 || rb >= m) return;
     w += int64_t(expert) * n * (k / 256) * (Slab ? 64 : 66);
     if constexpr (Slab) wb += int64_t(expert) * n * (k / 256);
   }
-  const int cb = blockIdx.x * BN;
+  const int cb = column * BN;
   const int wr = (warp / (BN / 32)) * 16, wc = (warp % (BN / 32)) * 32;
   constexpr bool CompactLUT = RegisterDecode && IQ2XXS_COMPACT_LUT;
   using LUTWord = typename std::conditional<CompactLUT, uint32_t, uint64_t>::type;
