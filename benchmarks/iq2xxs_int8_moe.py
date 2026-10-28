@@ -33,6 +33,7 @@ class Int8MoE:
         activation_block=32,
         down_activation_block=None,
         register_decode=False,
+        fused_swiglu=False,
     ):
         if (native.first_format, native.second_format) != ("IQ2_XXS", "IQ2_XXS"):
             raise ValueError("Complete INT8 candidate only supports IQ2_XXS pairs")
@@ -73,8 +74,22 @@ class Int8MoE:
             if down_activation_block == 256
             else ""
         )
+        if fused_swiglu and not register_decode:
+            raise ValueError("fused SwiGLU requires the per32 register decoder")
+        self.fused_quant = self.lib.iq2xxs_swiglu_quantize32 if fused_swiglu else None
+        if self.fused_quant is not None:
+            self.fused_quant.argtypes = (
+                [ctypes.c_void_p] * 3
+                + [ctypes.c_int] * 2
+                + [ctypes.c_float, ctypes.c_void_p]
+            )
+            self.fused_quant.restype = ctypes.c_int
         self.fc2 = getattr(
-            self.lib, "iq2xxs_routed_int8_slab" + down_suffix + "_weighted"
+            self.lib,
+            "iq2xxs_routed_int8_slab"
+            + down_suffix
+            + "_weighted"
+            + ("_quantized" if fused_swiglu else ""),
         )
         for fn, pointers in ((self.fc1, 8), (self.fc2, 9)):
             fn.argtypes = (
@@ -131,7 +146,21 @@ class Int8MoE:
             )
             == 0
         )
-        gguf.swiglu(projected, hidden, self.plan.swiglu_limit)
+        if self.fused_quant is None:
+            gguf.swiglu(projected, hidden, self.plan.swiglu_limit)
+        else:
+            assert (
+                self.fused_quant(
+                    projected.data_ptr(),
+                    q2.data_ptr(),
+                    s2.data_ptr(),
+                    r,
+                    i,
+                    self.plan.swiglu_limit,
+                    torch.cuda.current_stream().cuda_stream,
+                )
+                == 0
+            )
         assert (
             self.fc2(
                 *[

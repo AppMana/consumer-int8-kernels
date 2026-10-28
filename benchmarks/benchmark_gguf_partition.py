@@ -157,6 +157,7 @@ def main(args):
             else None
         ),
         int8_register_decode=args.int8_register_decode,
+        int8_fused_swiglu=args.int8_fused_swiglu,
         int8_activation_block=args.int8_activation_block,
         int8_down_activation_block=args.int8_down_activation_block,
         int8_library_sha256=(
@@ -224,6 +225,7 @@ def main(args):
                                 activation_block=args.int8_activation_block,
                                 down_activation_block=args.int8_down_activation_block,
                                 register_decode=register_decode,
+                                fused_swiglu=args.int8_fused_swiglu and register_decode,
                             )
                             output = torch.empty_like(x)
                             calls[
@@ -425,6 +427,7 @@ if __name__ == "__main__":
     parser.add_argument("--int8-library", type=Path)
     parser.add_argument("--int8-control-library", type=Path)
     parser.add_argument("--int8-register-decode", action="store_true")
+    parser.add_argument("--int8-fused-swiglu", action="store_true")
     parser.add_argument(
         "--int8-activation-block", type=int, choices=(32, 256), default=32
     )
@@ -463,4 +466,6 @@ if __name__ == "__main__":
         args.int8_library and args.int8_register_decode
     ):
         parser.error("INT8 control library requires the register decoder comparison")
+    if args.int8_fused_swiglu and not (args.int8_library and args.int8_register_decode):
+        parser.error("Fused SwiGLU requires the register decoder comparison")
     main(args)

@@ -17,6 +17,25 @@
 #endif
 static_assert(IQ2XXS_REGISTER_N == 64 || IQ2XXS_REGISTER_N == 128);
 namespace {
+// Match gguf_swiglu's clipping, expf/division and BF16 product rounding before
+// the existing block32 quantizer. Each warp owns exactly one quantization block.
+__global__ void swiglu_quantize32(const __nv_bfloat16* x, int8_t* q,
+                                float* scales, int blocks, int width, float limit) {
+  const int lane = threadIdx.x & 31;
+  const int block = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  if (block >= blocks) return;
+  const int64_t index = int64_t(block) * 32 + lane;
+  const int64_t source = (index / width) * (2 * int64_t(width)) + index % width;
+  const float gate = fminf(__bfloat162float(x[source]), limit);
+  const float up = fminf(fmaxf(__bfloat162float(x[source + width]), -limit), limit);
+  const float v = __bfloat162float(__float2bfloat16_rn((gate / (1.f + expf(-gate))) * up));
+  float maximum = fabsf(v);
+  for (int delta = 16; delta; delta /= 2)
+    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, delta));
+  const float scale = fmaxf(maximum / 127.f, 1.e-20f);
+  q[index] = static_cast<int8_t>(__float2int_rn(v / scale));
+  if (!lane) scales[block] = scale;
+}
 // Eight values per lane; repeat scales to retain existing benchmark scratch ABI.
 __global__ void quantize256(const __nv_bfloat16* x, int8_t* q, float* scales, int blocks) {
   int lane = threadIdx.x & 31;
@@ -467,6 +486,39 @@ extern "C" int iq2xxs_routed_int8_slab_register_weighted(const void* x, void* a,
     return cudaErrorInvalidValue;
   quantize<<<(xrows * (k / 32) + 7) / 8, 256, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 32));
+#define ROUTED_LAUNCH(M,N) \
+  iq2xxs_tiled<M,N,true,true,true,false,true,true,false,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
+      static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases), weights)
+  if (tile_m == 16) { ROUTED_LAUNCH(16,IQ2XXS_REGISTER_N); }
+  else if (tile_m == 32) { ROUTED_LAUNCH(32,IQ2XXS_REGISTER_N); }
+  else { ROUTED_LAUNCH(64,IQ2XXS_REGISTER_N); }
+#undef ROUTED_LAUNCH
+  return cudaGetLastError();
+}
+
+// Benchmark-only C ABI; caller owns correctly sized, non-overlapping buffers.
+extern "C" int iq2xxs_swiglu_quantize32(const void* x, void* q, float* scales,
+                                      int rows, int width, float limit, cudaStream_t stream) {
+  if (rows < 0 || width <= 0 || width % 32 || !(limit > 0.f) ||
+      // Keep the flattened uint32 CUDA thread index within its range.
+      !isfinite(limit) || int64_t(rows) * (width / 32) > 134217728)
+    return cudaErrorInvalidValue;
+  if (!rows) return cudaSuccess;
+  const int blocks = rows * (width / 32);
+  swiglu_quantize32<<<(int64_t(blocks) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(q), scales, blocks, width, limit);
+  return cudaGetLastError();
+}
+
+extern "C" int iq2xxs_routed_int8_slab_register_weighted_quantized(const void* x, void* a, float* sa,
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, const float* weights, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || (tile_m != 16 && tile_m != 32 && tile_m != 64))
+    return cudaErrorInvalidValue;
+  // x is unused: a/sa already contain the fused quantizer output.
 #define ROUTED_LAUNCH(M,N) \
   iq2xxs_tiled<M,N,true,true,true,false,true,true,false,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
       static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
