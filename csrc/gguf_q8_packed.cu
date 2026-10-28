@@ -385,6 +385,31 @@ __global__ void route_reduce(const __nv_bfloat16* contributions,const int32_t* r
     out[i]=__float2bfloat16_rn(sum);
   }
 }
+__global__ void route_reduce_vec8(const __nv_bfloat16* __restrict__ contributions,
+    const int32_t* __restrict__ rows,__nv_bfloat16* __restrict__ out,
+    int tokens,int cols8,int topk,int routes) {
+  const int total=tokens*cols8;
+  for (int idx=blockIdx.x*blockDim.x+threadIdx.x;idx<total;idx+=gridDim.x*blockDim.x) {
+    const int token=idx/cols8;
+    const int col8=idx%cols8;
+    float sum[8]={};
+    const int32_t* token_rows=rows+token*topk;
+    for (int slot=0;slot<topk;++slot) {
+      const int row=token_rows[slot];
+      if (row>=0 && row<routes) {
+        const uint4 vec=reinterpret_cast<const uint4*>(contributions)[int64_t(row)*cols8+col8];
+        const __nv_bfloat16* vals=reinterpret_cast<const __nv_bfloat16*>(&vec);
+        #pragma unroll
+        for (int k=0;k<8;++k) sum[k]+=__bfloat162float(vals[k]);
+      }
+    }
+    uint4 out_vec;
+    __nv_bfloat16* out_vals=reinterpret_cast<__nv_bfloat16*>(&out_vec);
+    #pragma unroll
+    for (int k=0;k<8;++k) out_vals[k]=__float2bfloat16_rn(sum[k]);
+    reinterpret_cast<uint4*>(out)[idx]=out_vec;
+  }
+}
 int post_blocks(int64_t count) { return int((count+255)/256>65535 ? 65535 : (count+255)/256); }
 }
 void gguf_swiglu(const void* x,void* out,int64_t rows,int width,float limit,cudaStream_t stream) {
@@ -395,6 +420,14 @@ void gguf_swiglu(const void* x,void* out,int64_t rows,int width,float limit,cuda
 void gguf_route_reduce(const void* x,const int32_t* indices,void* out,
     int64_t tokens,int width,int topk,int routes,cudaStream_t stream) {
   if (!tokens || !width) return;
+  if (width%8==0 && tokens*(width/8)<=2147483647LL &&
+      reinterpret_cast<uintptr_t>(x)%16==0 && reinterpret_cast<uintptr_t>(out)%16==0) {
+    const int cols8=width/8;
+    route_reduce_vec8<<<post_blocks(tokens*cols8),256,0,stream>>>(
+        static_cast<const __nv_bfloat16*>(x),indices,static_cast<__nv_bfloat16*>(out),
+        int(tokens),cols8,topk,routes);
+    return;
+  }
   route_reduce<<<post_blocks(tokens*width),256,0,stream>>>(static_cast<const __nv_bfloat16*>(x),
       indices,static_cast<__nv_bfloat16*>(out),tokens*width,width,topk,routes);
 }
@@ -414,66 +447,141 @@ __global__ void route_count_init(const int32_t* ids,const int32_t* map,int32_t* 
   for (int64_t i=index;i<task_capacity*2;i+=stride) tasks[i]=-1;
   int count=0;
   for (int i=t;i<pairs;i+=256) count+=local_expert(ids[i],map,globals,experts)==e;
+  #pragma unroll
   for (int offset=16;offset;offset/=2) count+=__shfl_down_sync(0xffffffff,count,offset);
   __shared__ int sums[8];
   if (t%32==0) sums[t/32]=count;
   __syncthreads();
   if (t==0) {
     int total=0;
+    #pragma unroll
     for (int w=0;w<8;++w) total+=sums[w];
     info[e*2]=total;
   }
 }
 __global__ void route_offsets(int32_t* info,int32_t* tasks,int experts,int tile) {
-  if (threadIdx.x==0) {
-    int offset=0;
-    for (int e=0;e<experts;++e) {
-      info[e*2+1]=offset;
-      offset+=((info[e*2]+tile-1)/tile)*tile;
+  const int t=threadIdx.x;
+  const int warp=t>>5;
+  const int lane=t&31;
+  __shared__ int warp_sums[8];
+  __shared__ int s_tile_offsets[257];
+  if (experts<=256) {
+    const int count=(t<experts) ? info[t*2] : 0;
+    const int tiles=(count+tile-1)/tile;
+    int scan=tiles;
+    #pragma unroll
+    for (int d=1;d<32;d<<=1) {
+      int n=__shfl_up_sync(0xffffffff,scan,d);
+      if (lane>=d) scan+=n;
     }
-  }
-  __syncthreads();
-  for (int e=threadIdx.x;e<experts;e+=blockDim.x) {
-    int offset=info[e*2+1];
-    for (int r=0;r<info[e*2];r+=tile) {
-      int task=(offset+r)/tile;
-      tasks[task*2]=e;
-      tasks[task*2+1]=offset+r;
+    if (lane==31) warp_sums[warp]=scan;
+    __syncthreads();
+    if (warp==0) {
+      int wscan=(lane<8) ? warp_sums[lane] : 0;
+      #pragma unroll
+      for (int d=1;d<8;d<<=1) {
+        int n=__shfl_up_sync(0xffffffff,wscan,d);
+        if (lane>=d) wscan+=n;
+      }
+      if (lane<8) warp_sums[lane]=wscan;
+    }
+    __syncthreads();
+    const int prefix_tiles=scan-tiles+(warp>0 ? warp_sums[warp-1] : 0);
+    if (t<experts) {
+      s_tile_offsets[t]=prefix_tiles;
+      info[t*2+1]=prefix_tiles*tile;
+    }
+    if (t==experts-1) s_tile_offsets[experts]=prefix_tiles+tiles;
+    __syncthreads();
+    const int total_tasks=s_tile_offsets[experts];
+    for (int task=t;task<total_tasks;task+=256) {
+      int lo=0,hi=experts;
+      while (lo+1<hi) {
+        int mid=(lo+hi)>>1;
+        if (s_tile_offsets[mid]<=task) lo=mid;
+        else hi=mid;
+      }
+      tasks[task*2]=lo;
+      tasks[task*2+1]=task*tile;
+    }
+  } else {
+    if (t==0) {
+      int offset=0;
+      for (int e=0;e<experts;++e) {
+        info[e*2+1]=offset;
+        offset+=((info[e*2]+tile-1)/tile)*tile;
+      }
+    }
+    __syncthreads();
+    for (int e=t;e<experts;e+=blockDim.x) {
+      int offset=info[e*2+1];
+      for (int r=0;r<info[e*2];r+=tile) {
+        int task=(offset+r)/tile;
+        tasks[task*2]=e;
+        tasks[task*2+1]=offset+r;
+      }
     }
   }
 }
 __global__ void route_assign(const int32_t* ids,const float* top_weights,const int32_t* map,
     const int32_t* info,int32_t* tokens,float* weights,int32_t* inverse,
     int pairs,int topk,int globals,int experts) {
-  int t=threadIdx.x,e=blockIdx.x,warp=t/32,lane=t%32;
-  if (!info[e*2]) return;
-  __shared__ int warp_offsets[8], cursor;
-  if (t==0) cursor=0;
-  __syncthreads();
-  for (int start=0;start<pairs;start+=256) {
-    int i=start+t;
-    bool match=i<pairs && local_expert(ids[i],map,globals,experts)==e;
-    uint32_t ballot=__ballot_sync(0xffffffff,match);
-    if (lane==0) warp_offsets[warp]=__popc(ballot);
-    __syncthreads();
-    if (t==0) {
-      int running=cursor;
-      for (int w=0;w<8;++w) {
-        int count=warp_offsets[w];
-        warp_offsets[w]=running;
-        running+=count;
+  const int t=threadIdx.x,e=blockIdx.x,warp=t>>5,lane=t&31;
+  const int count=info[e*2];
+  if (!count) return;
+  int cursor=info[e*2+1];
+  const int end=cursor+count;
+  const uint32_t lower=(uint32_t(1)<<lane)-1;
+  __shared__ int warp_counts[8];
+  __shared__ uint16_t s_u[8][64];
+  __shared__ uint32_t s_b[8][64];
+  for (int base_pair=0;base_pair<pairs;base_pair+=16384) {
+    const int chunk_pairs=(pairs-base_pair<16384) ? (pairs-base_pair) : 16384;
+    const int total_chunks=(chunk_pairs+31)>>5;
+    const int chunks_per_warp=(total_chunks+7)>>3;
+    const int u_start=warp*chunks_per_warp;
+    const int u_end=(u_start+chunks_per_warp<total_chunks) ? (u_start+chunks_per_warp) : total_chunks;
+    int wcount=0;
+    int nz=0;
+    for (int u=u_start;u<u_end;++u) {
+      const int i=base_pair+(u<<5)+lane;
+      const bool match=i<pairs && local_expert(ids[i],map,globals,experts)==e;
+      const uint32_t b=__ballot_sync(0xffffffff,match);
+      if (b) {
+        wcount+=__popc(b);
+        if (lane==0) {
+          s_u[warp][nz]=static_cast<uint16_t>(u);
+          s_b[warp][nz]=b;
+        }
+        ++nz;
       }
-      cursor=running;
     }
+    if (lane==0) warp_counts[warp]=wcount;
     __syncthreads();
-    if (match) {
-      uint32_t lower=(uint32_t(1)<<lane)-1;
-      int row=info[e*2+1]+warp_offsets[warp]+__popc(ballot&lower);
-      tokens[row]=i/topk;
-      weights[row]=top_weights[i];
-      inverse[i]=row;
+    int warp_prefix=0,block_total=0;
+    #pragma unroll
+    for (int w=0;w<8;++w) {
+      const int c=warp_counts[w];
+      if (w<warp) warp_prefix+=c;
+      block_total+=c;
     }
-    __syncthreads();
+    if (nz) {
+      int wcursor=cursor+warp_prefix;
+      for (int k=0;k<nz;++k) {
+        const uint32_t b=s_b[warp][k];
+        if (b&(uint32_t(1)<<lane)) {
+          const int i=base_pair+(int(s_u[warp][k])<<5)+lane;
+          const int row=wcursor+__popc(b&lower);
+          tokens[row]=i/topk;
+          weights[row]=top_weights[i];
+          inverse[i]=row;
+        }
+        wcursor+=__popc(b);
+      }
+    }
+    cursor+=block_total;
+    if (cursor>=end) break;
+    if (base_pair+16384<pairs) __syncthreads();
   }
 }
 }

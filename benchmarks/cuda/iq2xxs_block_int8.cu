@@ -119,17 +119,20 @@ __global__ void swiglu_quantize32(const __nv_bfloat16* x, int8_t* q,
   const int lane = threadIdx.x & 31;
   const int block = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
   if (block >= blocks) return;
+  const int w32 = width / 32;
+  const int row = block / w32;
+  const int col = (block % w32) * 32 + lane;
   const int64_t index = int64_t(block) * 32 + lane;
   if constexpr (Masked) {
     // Routing initializes the entire capacity to -1 on each replay.
     // Padded projected rows are mathematically zero; unused rows are not read.
-    if (tokens[index / width] < 0) {
+    if (tokens[row] < 0) {
       q[index] = 0;
       if (!lane) scales[block] = 1.e-20f;
       return;
     }
   }
-  const int64_t source = (index / width) * (2 * int64_t(width)) + index % width;
+  const int64_t source = int64_t(row) * (2 * width) + col;
   const float gate = fminf(__bfloat162float(x[source]), limit);
   const float up = fminf(fmaxf(__bfloat162float(x[source + width]), -limit), limit);
   const float v = __bfloat162float(__float2bfloat16_rn((gate / (1.f + expf(-gate))) * up));
@@ -382,16 +385,17 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
         const int sw = (col % 64 / 16) * 16 + (col % 8) * 2 + col % 16 / 8;
         const int base_col = (col / 16) * 16 + (col % 8) * 2 + col % 16 / 8;
         const float base_scale = valid_col ? __half2float(wb[int64_t(base / 256) * n + base_col]) : 0.f;
-        const int64_t qi_base = (int64_t(col / 64) * (k / 128) + base / 128) * 512 + sw;
-        const int64_t si_base = ((int64_t(col / 64) * (k / 256) + base / 256) * 8 + (base % 256 / 32)) * 64 + sw;
+        const int tile_k = (col / 64) * (k / 128) + base / 128;
+        const int qi_base = tile_k * 512 + sw;
+        const int si_base = tile_k * 256 + sw;
         #pragma unroll
         for (int block = 0; block < Blocks; ++block) {
           uint2 descriptor = make_uint2(0, 0);
           uint32_t indices_high = 0;
           float scale = 0.f;
           if (valid_col) {
-            const int64_t qi = qi_base + block * 128;
-            const int64_t si = si_base + block * 64;
+            const int qi = qi_base + block * 128;
+            const int si = si_base + block * 64;
             const uint32_t meta = b12x_metadata[si];
             if constexpr (IQ3) {
               const auto* words = reinterpret_cast<const uint32_t*>(w);
