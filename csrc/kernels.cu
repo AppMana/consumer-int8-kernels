@@ -38,12 +38,14 @@ __global__ void quantize_rows_kernel(const __nv_bfloat16* x, int8_t* q,
 // fixed widths permit vector loads/stores without a second global read.
 struct alignas(16) Bf16Pack8 { __nv_bfloat16 values[8]; };
 struct alignas(8) Int8Pack8 { int8_t values[8]; };
-template <int K, int Threads = 256>
+template <int K, int Threads = 256, bool Grouped = false>
 __global__ void quantize_rows_vector_kernel(const __nv_bfloat16* x, int8_t* q,
-                                           float* scales) {
+                                           float* scales, int m = 1, int groups = 1) {
   constexpr int Packs = (K + Threads * 8 - 1) / (Threads * 8);
   __shared__ float maxima[Threads / 32];
-  const int64_t row = int64_t(blockIdx.x) * K;
+  const int64_t out_row = int64_t(blockIdx.x) * K;
+  const int64_t row = Grouped
+      ? int64_t(blockIdx.x % m * groups + blockIdx.x / m) * K : out_row;
   float values[Packs][8], maximum = 0.f;
 #pragma unroll
   for (int i = 0; i < Packs; ++i) {
@@ -78,7 +80,7 @@ __global__ void quantize_rows_vector_kernel(const __nv_bfloat16* x, int8_t* q,
       for (int j = 0; j < 8; ++j)
         result.values[j] = static_cast<int8_t>(max(-127, min(127,
             __float2int_rn(values[i][j] / scale))));
-      *reinterpret_cast<Int8Pack8*>(q + row + col) = result;
+      *reinterpret_cast<Int8Pack8*>(q + out_row + col) = result;
     }
   }
 }
@@ -235,6 +237,12 @@ void quantize_rows(const void* x, int8_t* codes, float* scales, int m, int k, cu
 #undef QUANT
   }
   quantize_rows_kernel<<<m, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(x), codes, scales, k);
+}
+void quantize_grouped4096(const void* x, int8_t* codes, float* scales,
+                          int m, int groups, cudaStream_t stream) {
+  if (!m) return;
+  quantize_rows_vector_kernel<4096, 256, true><<<m * groups, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), codes, scales, m, groups);
 }
 void channel_mm(const int8_t* a, const uint8_t* w, const float* sa,
                 const void* sw, void* out, int m, int n, int k, cudaStream_t stream) {

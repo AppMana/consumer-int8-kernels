@@ -5,6 +5,10 @@ GDN states are FP32 [slot, value head, value dim, key dim]. Slot zero and
 negative slots are padding. Active slots must be unique within one launch.
 Inputs q/k are BF16 and normalized inside the kernel. g is the FP32 natural
 log decay and beta is the FP32 sigmoid gate, both computed by the caller.
+
+quantize_grouped4096 reads contiguous BF16[M,G,4096] and writes contiguous
+INT8[G,M,4096] codes plus FP32[G,M] scales. Outputs must not overlap inputs
+or each other; empty M is supported. Quantization matches quantize_rows.
 """
 
 import torch
@@ -14,6 +18,7 @@ from . import _C, _fa2  # noqa: F401
 silu_mul = torch.ops.consumer_int8.silu_mul
 silu_mul_quantize = torch.ops.consumer_int8.silu_mul_quantize
 quantize_rows = torch.ops.consumer_int8.quantize_rows
+quantize_grouped4096 = torch.ops.consumer_int8.quantize_grouped4096
 channel_mm = torch.ops.consumer_int8.channel_mm
 channel_gemv = torch.ops.consumer_int8.channel_gemv
 unpack_allspark = torch.ops.consumer_int8.unpack_allspark
@@ -63,6 +68,11 @@ def _paged_attention_fake(query, cache, table, offsets, lengths, out, max_query,
 
 @torch.library.register_fake("consumer_int8::quantize_rows")
 def _quantize_rows_fake(input, codes, scales):
+    return None
+
+
+@torch.library.register_fake("consumer_int8::quantize_grouped4096")
+def _quantize_grouped4096_fake(input, codes, scales):
     return None
 
 
