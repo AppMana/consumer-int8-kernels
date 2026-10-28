@@ -24,7 +24,9 @@ def install(directory, layers=(2, 3, 4, 30), counts=(128, 512)):
     saved = set()
 
     @functools.wraps(original)
-    def apply(self, layer, x, weights, ids, shared_experts, shared_experts_input):
+    def apply(
+        self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
+    ):
         count = x.shape[0]
         match = re.match(r"blk\.(\d+)\.", self.sources[0].name)
         number = int(match[1]) if match else -1
@@ -46,15 +48,15 @@ def install(directory, layers=(2, 3, 4, 30), counts=(128, 512)):
                 tokens=count,
                 rank=rank,
                 x=x.detach().cpu(),
-                ids=ids.detach().cpu(),
-                weights=weights.detach().cpu(),
+                ids=topk_ids.detach().cpu(),
+                weights=topk_weights.detach().cpu(),
             )
             temporary = path.with_suffix(".tmp")
             torch.save(fixture, temporary)
             temporary.rename(path)
             saved.add(key)
         return original(
-            self, layer, x, weights, ids, shared_experts, shared_experts_input
+            self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
         )
 
     apply._captures_serving_inputs = True
