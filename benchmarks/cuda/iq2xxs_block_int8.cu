@@ -26,6 +26,13 @@ static_assert(IQ2XXS_REGISTER_K == 128 || IQ2XXS_REGISTER_K == 256);
 #ifndef IQ2XXS_SHUFFLE_SCALE
 #define IQ2XXS_SHUFFLE_SCALE 0
 #endif
+#ifndef IQ2XXS_PIPELINE
+#define IQ2XXS_PIPELINE 0
+#endif
+#ifndef IQ2XXS_PIPELINE_STAGES
+#define IQ2XXS_PIPELINE_STAGES 2
+#endif
+static_assert(IQ2XXS_PIPELINE_STAGES == 2 || IQ2XXS_PIPELINE_STAGES == 3);
 static_assert(IQ2XXS_REGISTER_N == 64 || IQ2XXS_REGISTER_N == 128);
 namespace {
 // Match gguf_swiglu's clipping, expf/division and BF16 product rounding before
@@ -81,6 +88,12 @@ __device__ __forceinline__ uint32_t signed_bytes(uint32_t v, uint32_t signs) {
                   ((signs >> 2) & 1) * 0xff0000u | ((signs >> 3) & 1) * 0xff000000u;
   return __vsub4(v ^ mask, mask);
 }
+template<int Bytes>
+__device__ __forceinline__ void iq_async_copy(void* dst, const void* src, bool valid) {
+  const uint32_t shared = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+  asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;" ::
+      "r"(shared), "l"(src), "n"(Bytes), "r"(valid ? Bytes : 0) : "memory");
+}
 template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false, bool Fold256=false, bool RegisterDecode=false>
 __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
     const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr) {
@@ -88,10 +101,14 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
   constexpr int Rows = BM + BN, Threads = (BM / 16) * (BN / 32) * 32;
   constexpr int BK = RegisterDecode ? IQ2XXS_REGISTER_K : 128;
   constexpr int Blocks = BK / 32;
-  __shared__ int8_t tile[RegisterDecode ? BM : Rows][BK + 16];
-  __shared__ uint2 descriptors[RegisterDecode ? BN * Blocks : 1];
+  constexpr bool Pipeline = RegisterDecode && IQ2XXS_PIPELINE;
+  constexpr int Stages = Pipeline ? IQ2XXS_PIPELINE_STAGES : 1;
+  static_assert(!Pipeline || (BK == 128 && !IQ2XXS_SHUFFLE_SCALE));
+  __shared__ int8_t tile_storage[Stages][RegisterDecode ? BM : Rows][BK + 16];
+  __shared__ uint2 descriptor_storage[Stages][RegisterDecode ? BN * Blocks : 1];
   __shared__ int8_t high_tile[Fold256 ? BN : 1][144];
-  __shared__ float scales[RegisterDecode && IQ2XXS_SHUFFLE_SCALE ? BM : Rows][Blocks];
+  __shared__ float scale_storage[Stages][RegisterDecode && IQ2XXS_SHUFFLE_SCALE ? BM : Rows][Blocks];
+  __shared__ float pipeline_bases[Stages][Pipeline ? BN : 1];
   __shared__ float weight_bases[RegisterDecode && IQ2XXS_SHUFFLE_SCALE ? BN : 1];
   const int lane = threadIdx.x & 31, group = lane >> 2, tid = lane & 3;
   const int warp = threadIdx.x >> 5;
@@ -112,7 +129,60 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
   }
   float sum[4][4] = {};
   int low_acc[4][4] = {}, high_acc[4][4] = {};
+  auto prefetch = [&](int base, int stage) {
+    if constexpr (Pipeline) {
+      if (base >= k) {
+        // Empty groups preserve the same wait depth while draining the tail.
+        asm volatile("cp.async.commit_group;" ::: "memory");
+        return;
+      }
+      for (int index = threadIdx.x; index < BM * 8; index += Threads) {
+        int row = index / 8, col = (index % 8) * 16;
+        int input = rb + row;
+        if constexpr (Routed) input = input < m ? tokens[input] : -1;
+        bool valid = input >= 0 && input < (Routed ? xrows : m);
+        iq_async_copy<16>(&tile_storage[stage][row][col],
+            a + (valid ? int64_t(input) * k + base + col : 0), valid);
+      }
+      for (int index = threadIdx.x; index < BM * 4; index += Threads) {
+        int row = index / 4, block = index % 4;
+        int input = rb + row;
+        if constexpr (Routed) input = input < m ? tokens[input] : -1;
+        bool valid = input >= 0 && input < (Routed ? xrows : m);
+        iq_async_copy<4>(&scale_storage[stage][row][block],
+            sa + (valid ? int64_t(input) * (k / 32) + base / 32 + block : 0), valid);
+      }
+      for (int index = threadIdx.x; index < BN * 4; index += Threads) {
+        int row = index / 4, block = index % 4;
+        bool valid = cb + row < n;
+        iq_async_copy<8>(&descriptor_storage[stage][IQ2XXS_TRANSPOSE_DESC ? block * BN + row : index],
+            reinterpret_cast<const uint2*>(w) +
+                (valid ? (int64_t(base / 128) * n + cb + row) * 4 + block : 0), valid);
+      }
+      asm volatile("cp.async.commit_group;" ::: "memory");
+      for (int row = threadIdx.x; row < BN; row += Threads)
+        pipeline_bases[stage][row] = cb + row < n ?
+            __half2float(wb[int64_t(base / 256) * n + cb + row]) : 0;
+    }
+  };
+  if constexpr (Pipeline)
+    for (int stage = 0; stage < Stages - 1; ++stage) prefetch(stage * BK, stage);
   for (int base = 0; base < k; base += BK) {
+    const int stage = Pipeline ? (base / BK) % Stages : 0;
+    auto& tile = tile_storage[stage];
+    auto& descriptors = descriptor_storage[stage];
+    auto& scales = scale_storage[stage];
+    if constexpr (Pipeline) {
+      asm volatile("cp.async.wait_group %0;" :: "n"(Stages - 2) : "memory");
+      __syncthreads();
+      prefetch(base + (Stages - 1) * BK, (stage + Stages - 1) % Stages);
+      for (int index = threadIdx.x; index < BN * Blocks; index += Threads) {
+        int row = index / Blocks, block = index % Blocks;
+        uint32_t metadata = descriptors[IQ2XXS_TRANSPOSE_DESC ? block * BN + row : index].y;
+        scales[BM + row][block] = pipeline_bases[stage][row] *
+            (0.5f + float(metadata >> 28)) * 0.25f;
+      }
+    } else {
     for (int index = threadIdx.x; index < BM * (BK / 16); index += Threads) {
       int row = index / (BK / 16), col = (index % (BK / 16)) * 16;
       int4 value = {};
@@ -215,6 +285,7 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
       }
       }
     }
+    }
     __syncthreads();
     #pragma unroll
     for (int block = 0; block < Blocks; ++block) {
@@ -293,8 +364,11 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
         }
       }
     }
-    __syncthreads();
+    // Pipeline readers rendezvous at the next iteration's post-wait barrier
+    // before any thread can prefetch into this buffer again.
+    if constexpr (!Pipeline) __syncthreads();
   }
+  if constexpr (Pipeline) asm volatile("cp.async.wait_group 0;" ::: "memory");
   #pragma unroll
   for (int j = 0; j < 4; ++j) {
     #pragma unroll
