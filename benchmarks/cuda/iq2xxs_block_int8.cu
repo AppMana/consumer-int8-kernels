@@ -54,6 +54,10 @@ static_assert(IQ2XXS_REGISTER_K == 128 || IQ2XXS_REGISTER_K == 256);
 #ifndef IQ2XXS_SHARED_COMPACT_LUT
 #define IQ2XXS_SHARED_COMPACT_LUT 0
 #endif
+// Experimental padding-free layout; paired full-MoE trials regress on GB10.
+#ifndef IQ2XXS_SHARED_SWIZZLE
+#define IQ2XXS_SHARED_SWIZZLE 0
+#endif
 #ifndef IQ2XXS_SHARED_MIN_BLOCKS
 #define IQ2XXS_SHARED_MIN_BLOCKS 1
 #endif
@@ -146,7 +150,12 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
   constexpr bool Pipeline = RegisterDecode && IQ2XXS_PIPELINE && !Acc256;
   constexpr int Stages = Pipeline ? IQ2XXS_PIPELINE_STAGES : 1;
   static_assert(!Pipeline || (BK == 128 && !IQ2XXS_SHUFFLE_SCALE));
-  __shared__ int8_t tile_storage[Stages][RegisterDecode ? BM : Rows][BK + 16];
+  constexpr bool Swizzle = Slab && !Fold256 && !RegisterDecode && IQ2XXS_SHARED_SWIZZLE;
+  // XOR 16-byte sectors by row: preserve vector alignment without row padding.
+  auto tile_column = [](int row, int col) {
+    return Swizzle ? col ^ ((row & 7) * 16) : col;
+  };
+  __shared__ int8_t tile_storage[Stages][RegisterDecode ? BM : Rows][BK + (Swizzle ? 0 : 16)];
   __shared__ uint2 descriptor_storage[Stages][RegisterDecode ? BN * Blocks : 1];
   __shared__ int8_t high_tile[Fold256 ? BN : 1][144];
   __shared__ float scale_storage[Stages][Shuffle ? BM : Rows][Blocks];
@@ -274,7 +283,7 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
       }
       if (valid)
         value = *reinterpret_cast<const int4*>(a + int64_t(input) * k + base + col);
-      *reinterpret_cast<int4*>(&tile[row][col]) = value;
+      *reinterpret_cast<int4*>(&tile[row][tile_column(row, col)]) = value;
     }
     for (int index = threadIdx.x; index < BM * Blocks; index += Threads) {
       int row = index / Blocks, block = index % Blocks;
@@ -367,7 +376,7 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
       if constexpr (!RegisterDecode) {
       #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        *reinterpret_cast<uint64_t*>(&tile[BM + row][block * 32 + j * 8]) = values[j];
+        *reinterpret_cast<uint64_t*>(&tile[BM + row][tile_column(BM + row, block * 32 + j * 8)]) = values[j];
         if constexpr (Fold256)
           *reinterpret_cast<uint64_t*>(&high_tile[row][block * 32 + j * 8]) = high_values[j];
       }
@@ -381,7 +390,7 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
       #pragma unroll
       for (int r = 0; r < 4; ++r)
         av[r] = BM == 8 && (r & 1) ? 0 :
-            *reinterpret_cast<const uint32_t*>(&tile[wr + group + (r & 1) * 8][block * 32 + tid * 4 + (r >> 1) * 16]);
+            *reinterpret_cast<const uint32_t*>(&tile[wr + group + (r & 1) * 8][tile_column(wr + group + (r & 1) * 8, block * 32 + tid * 4 + (r >> 1) * 16)]);
       #pragma unroll
       for (int j = 0; j < 4; ++j) {
         uint32_t bv[2];
@@ -410,7 +419,7 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
         } else {
           #pragma unroll
           for (int r = 0; r < 2; ++r)
-            bv[r] = *reinterpret_cast<const uint32_t*>(&tile[BM + wc + j * 8 + group][block * 32 + tid * 4 + r * 16]);
+            bv[r] = *reinterpret_cast<const uint32_t*>(&tile[BM + wc + j * 8 + group][tile_column(BM + wc + j * 8 + group, block * 32 + tid * 4 + r * 16)]);
         }
         int acc[4] = {};
         if constexpr (Fold256) {
