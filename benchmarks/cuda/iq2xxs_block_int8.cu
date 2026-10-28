@@ -51,6 +51,13 @@ static_assert(IQ2XXS_REGISTER_K == 128 || IQ2XXS_REGISTER_K == 256);
 #ifndef IQ2XXS_COMPACT_LUT
 #define IQ2XXS_COMPACT_LUT 0
 #endif
+#ifndef IQ2XXS_SHARED_COMPACT_LUT
+#define IQ2XXS_SHARED_COMPACT_LUT 0
+#endif
+#ifndef IQ2XXS_SHARED_MIN_BLOCKS
+#define IQ2XXS_SHARED_MIN_BLOCKS 1
+#endif
+static_assert(IQ2XXS_SHARED_MIN_BLOCKS >= 1 && IQ2XXS_SHARED_MIN_BLOCKS <= 8);
 #ifndef IQ2XXS_SHARED_PREFETCH_L2
 #define IQ2XXS_SHARED_PREFETCH_L2 0
 #endif
@@ -122,7 +129,8 @@ __device__ __forceinline__ void iq_async_copy(void* dst, const void* src, bool v
       "r"(shared), "l"(src), "n"(Bytes), "r"(valid ? Bytes : 0) : "memory");
 }
 template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false, bool Fold256=false, bool RegisterDecode=false, bool Acc256=false>
-__global__ __launch_bounds__(((BM + 15) / 16) * (BN / 32) * 32)
+__global__ __launch_bounds__(((BM + 15) / 16) * (BN / 32) * 32,
+    (Routed && Slab && !Fold256 && !RegisterDecode && BM == 32 && BN == 64) ? IQ2XXS_SHARED_MIN_BLOCKS : 1)
 void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
     const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr) {
   static_assert(!RegisterDecode || (Slab && SharedLUT && !Fold256));
@@ -167,7 +175,8 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
   }
   const int cb = column * BN;
   const int wr = (warp / (BN / 32)) * 16, wc = (warp % (BN / 32)) * 32;
-  constexpr bool CompactLUT = RegisterDecode && IQ2XXS_COMPACT_LUT;
+  constexpr bool CompactLUT = (RegisterDecode && IQ2XXS_COMPACT_LUT) ||
+      (!RegisterDecode && Slab && !Fold256 && IQ2XXS_SHARED_COMPACT_LUT);
   using LUTWord = typename std::conditional<CompactLUT, uint32_t, uint64_t>::type;
   __shared__ LUTWord lut[SharedLUT ? 256 : 1];
   if constexpr (SharedLUT) {
@@ -315,6 +324,11 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
           signs |= (__popc(signs) & 1) << 7;
           uint32_t code = (HalfLoads || Slab) ? (indices >> (j * 8)) & 255 : sub[j];
           uint64_t grid = SharedLUT ? lut[code] : iq2xxs_grid[code];
+          if constexpr (CompactLUT && !RegisterDecode) {
+            const uint32_t selectors = lut[code];
+            grid = uint64_t(__byte_perm(0x002b1908u, 0, selectors)) |
+                (uint64_t(__byte_perm(0x002b1908u, 0, selectors >> 16)) << 32);
+          }
           if constexpr (RegisterDecode) {
             // Decode only the consuming lane's four bytes in the MMA loop.
           } else if constexpr (Fold256) {
