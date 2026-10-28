@@ -1,8 +1,10 @@
 # Consumer INT8 kernels
 
-An independent AOT CUDA package for Qwen3.8-27B on SM86 GPUs, with torch stable
-ABI bindings targeting torch 2.10 and Python 3.10 or newer. It does not import
-vLLM. The serving engine owns allocation, cache scheduling and backend selection.
+An independent AOT CUDA package for Qwen3.8-27B on SM86 GPUs and
+`unsloth/DeepSeek-V4.1-Flash-1017-GGUF` (`UD-Q2_K_XL`) on SM86 and DGX Spark
+GB10 (`SM121`) GPUs, with torch stable ABI bindings targeting torch 2.10 and
+Python 3.10 or newer. It does not import vLLM. The serving engine owns
+allocation, cache scheduling and backend selection.
 
 ## Build and test
 
@@ -14,9 +16,10 @@ TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=2 uv pip install -e . --no-build-isolation --n
 .venv/bin/python -m pytest tests
 ```
 
-Importing `consumer_int8.ops` loads the compiled extension; it never invokes a
-compiler. All operators write caller-owned outputs. Quantization scales,
-workspaces and graph buffers must be allocated before graph capture.
+Importing `consumer_int8.ops` or `consumer_int8.gguf` loads the compiled
+extensions (`_C.abi3.so`, `_fa2.abi3.so`, `_gguf.abi3.so`); it never invokes a
+compiler at import time. All operators write caller-owned outputs. Quantization
+scales, workspaces and graph buffers must be allocated before graph capture.
 
 ## Checkpoint format
 
@@ -42,6 +45,7 @@ quantization format.
 | Operator | Inputs | Computation / storage |
 | --- | --- | --- |
 | `quantize_rows` | BF16 `[M,K]` | Dynamic signed INT8 activations and FP32 row scales |
+| `quantize_grouped_rows` | BF16 `[M,K]` (`K` multiple of 4096) | Dynamic signed INT8 activations and FP32 scales per 4096-channel group |
 | `channel_mm` | Signed INT8 activations, biased UINT8 weights | `m16n8k32` integer MMA, BF16 output; diagnostic candidate |
 | `cutlass_channel_mm` | Signed INT8 activations/weights | SM86 tiled integer MMA, caller-owned INT32 workspace, BF16 output |
 | `fused_channel_mm` | Signed INT8 activations/weights | SM86 integer MMA with fused row/channel scaling to BF16, no INT32 output workspace |
@@ -52,7 +56,10 @@ quantization format.
 | `gdn_prefill` | Normalized BF16 Q/K, BF16 V, FP32 gates and initial state | Chunked BF16/TF32 attention with FP32 final state |
 | `kv_cache_update` | BF16 K/V with head dimension 256 | Packed INT8 cache and inline FP32 scales, HND or NHD strides |
 | `paged_attention` | BF16 Q, packed INT8 paged K/V, device sequence metadata | Experimental D256/GQA6 causal prefill with BF16 tensor cores and FP32 softmax |
+| `paged_decode` | BF16 Q (`max_query <= 8`), packed INT8 paged K/V, device sequence metadata | Native SM86 D256/GQA6 split-KV decode and MTP verification with high-plus-residual BF16 PV accumulation and 2-CTA/SM occupancy |
 | `unpack_kv_cache` | Packed INT8 K/V, page table and device sequence lengths | BF16 active cache rows in caller-owned contiguous scratch pages |
+| `consumer_int8.gguf` | Packed GGUF `Q8_0` / `Q6_K` blocks | Native GPU unpacking, grouped W8A8 integer GEMM (`wo_a`), and shared transient BF16 expansion workspace |
+| `consumer_int8.gguf_moe` | Packed GGUF `IQ2_XXS` / `IQ3_XXS` / `MXFP4` expert blocks | AOT CUDA mixed-IQ routed MoE expert kernels and borrowed-weight `dp4a` INT8 prefill (`iq2xxs_routed_moe_b12x_int8`) |
 
 `gdn_decode` accepts `[batch,key_heads,128]` Q/K,
 `[batch,value_heads,128]` V, and FP32
@@ -180,6 +187,96 @@ vision fixtures. The runner fingerprints image contents as well as prompts;
 other improvements leave aggregate accuracy unchanged.
 Use `--topology pp2` and `--mtp on` to validate pipeline parallelism and MTP
 with the same corpus and fixtures before promoting those serving configurations.
+
+## Native SM86 split-KV decode and MTP verification (`paged_decode`)
+
+`paged_decode` executes short-query (`max_query <= 8`) D256 GQA6 causal
+attention directly over the packed `[blocks,kv_heads,block_size,520]` INT8
+cache. It splits the KV sequence across caller-selected partitions (`4..128`)
+and reduces partial `[token,head,parts,258]` FP32 accumulators (`256` output
+channels plus `maximum` and `sum`) in `merge_kernel`.
+
+- **Scaled-probability residual PV accumulation:** a single BF16 rounding of
+  `P * V_scale` introduces split-dependent rounding differences before PV.
+  `split_kernel` decomposes `scaled_p = hi + residual` into two BF16 tiles and
+  accumulates both tensor-core `m16n8k16` products into FP32.
+- **Two-CTA-per-SM register bounding:** `__launch_bounds__(Rows * 8, 2)` bounds
+  the 32-row verification variant (`max_query in {3..8}`) from 168 to 128
+  registers per thread, raising achieved SM86 occupancy from `16.66%` (`7.99`
+  active warps/SM) to `31.49%` (`15.12` active warps/SM) when paired with the
+  `2 * SMs` partition target in `vllm/v1/attention/backends/triton_attn.py`.
+
+CUDA-graph component timings on RTX A5000 (`SM86`, 64 SMs, 7 repeats of 20
+launches, `benchmarks/microbench_decode_attention.py`):
+
+| `Hkv` | `q` | `C` | Context | Triton `unified_attention` (us) | Native 1-CTA target (us / parts) | Native 2-CTA target (us / parts) | 2-CTA vs 1-CTA | Native vs Triton |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 1 | 1 | 8,000 | 108.18 | 42.09 (64) | 41.88 (64) | 1.005x | 2.58x |
+| 2 | 1 | 2 | 32,000 | 436.12 | 176.23 (32) | 177.05 (32) | 0.995x | 2.46x |
+| 2 | 2 | 2 | 32,000 | 3,742.31 | 181.20 (32) | 185.45 (32) | 0.977x | 20.18x |
+| 2 | 4 | 2 | 32,000 | 3,712.56 | 259.38 (16) | 236.60 (32) | 1.096x | 15.69x |
+| 2 | 4 | 4 | 32,000 | 3,720.45 | 524.24 (8) | 439.50 (16) | 1.193x | 8.47x |
+| 2 | 8 | 1 | 32,000 | 3,696.90 | 261.27 (16) | 229.93 (32) | 1.136x | 16.08x |
+| 2 | 8 | 2 | 32,000 | 3,699.10 | 505.75 (8) | 448.41 (16) | 1.128x | 8.25x |
+| 2 | 8 | 4 | 32,000 | 3,707.90 | 1,020.88 (4) | 889.04 (8) | 1.148x | 4.17x |
+| 4 | 4 | 2 | 32,000 | 3,740.67 | 525.57 (8) | 460.44 (16) | 1.141x | 8.12x |
+| 4 | 4 | 4 | 32,000 | 3,783.22 | 1,075.51 (4) | 955.03 (8) | 1.126x | 3.96x |
+
+## Native GGUF kernels for `unsloth/DeepSeek-V4.1-Flash-1017-GGUF` (`UD-Q2_K_XL`)
+
+`consumer_int8.gguf` and `consumer_int8.gguf_moe` provide AOT CUDA kernels for
+serving `unsloth/DeepSeek-V4.1-Flash-1017-GGUF` (`UD-Q2_K_XL`, revision
+`60ad3651641b5c97679c807e064ab1d7a3ca1455`) across two DGX Spark GB10 (`SM121`)
+nodes (`TP=2/EP=2`) or SM86 GPUs:
+
+- **Grouped `Q8_0` W8A8 (`attn.wo_a`):** `quantize_grouped_rows` +
+  `consumer_int8.gguf` grouped W8A8 integer GEMM over 4,096-channel groups, and
+  shared live-row transient BF16 expansion workspaces for `Q8_0` / `Q6_K`
+  projections.
+- **Borrowed-weight `IQ2_XXS` INT8 `dp4a` MoE prefill (`benchmarks/cuda/iq2xxs_block_int8.cu`):**
+  reads `b12x`'s existing packed `IQ2_XXS` expert storage directly with zero
+  extra persistent weight memory, using:
+  - Vectorized `int4` (`8 x int16_t`) coalesced writes in `route_quantize_kernel`
+    plus compact separated `M=16` (`E_t <= 16`) and `M=32` (`E_t > 16`) task
+    lists;
+  - Hybrid `M=16` (`16x64`) and `M=32` (`32x64`) `dp4a` (`__dp4a`) tile
+    dispatch with padded shared-memory activation/scale/epilogue layouts to
+    eliminate shared-memory bank conflicts;
+  - Fused `iq2xxs_w13_fused_s8_kernel` computing `gate` (`w1`) and `up` (`w3`)
+    simultaneously against a single shared-memory staging of routed INT8
+    activations `a_s` and writing `bf16(silu(gate) * up)` + dynamic per-row
+    `int8` FC2 input in one pass.
+
+### 192-expert `TP=2` MoE prefill microbenchmark on DGX Spark GB10 (`SM121`)
+
+Measured across 5 captured real-routing fixtures from
+`unsloth/DeepSeek-V4.1-Flash-1017-GGUF` (`UD-Q2_K_XL`, `E=192, K=5120, N=1152,
+top_k=8`, 0 `compute-sanitizer` errors, exact bitwise output parity):
+
+| Fixture (`layer_M`) | `b12x` W4A16 (ms) | Old Borrowed `M=16` (ms) | Hybrid Fused `M=16/M=32` (ms) | Speedup vs Old | Speedup vs `b12x` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `layer3_m512` | 3.743 | 3.600 | **2.435** | **1.48x** | **1.54x** |
+| `layer39_m512` | 3.770 | 3.562 | **2.371** | **1.50x** | **1.59x** |
+| `layer3_m1024` | 4.862 | 5.713 | **3.611** | **1.58x** | **1.35x** |
+| `layer3_m2048` | 7.640 | 9.914 | **5.736** | **1.73x** | **1.33x** |
+| `layer39_m2048` | 7.456 | 9.939 | **5.792** | **1.72x** | **1.29x** |
+
+### Live 2x DGX Spark GB10 (`TP=2/EP=2`) 8,192-input / 1,024-output needle-in-haystack
+
+Measured on `leaderworkerset/deepseek-v4-int4-int8` (`spark-2ab3` +
+`spark-5867`, `unsloth/DeepSeek-V4.1-Flash-1017-GGUF` `UD-Q2_K_XL` rev
+`60ad3651641b5c97679c807e064ab1d7a3ca1455`, `int8_ds_mla` KV cache,
+`max_num_batched_tokens=2048`, `max_num_seqs=8`, cold prefix cache per cell,
+`benchmarks/benchmark_dsv41_needle.py`):
+
+| Variant | Cohort | Needle Pass | Median / Last TTFT (s) | Prefill (tok/s) | Post-Prefill Decode (s) | Decode (tok/s) | Total Wall (s) | Aggregate Output (tok/s) | Total (tok/s) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **2048 Control (`b12x` W4A16)** | `B=1` (median of 3) | 3/3 | **4.519** | **1,812.6** | 53.271 | 19.20 | **57.791** | 17.72 | 159.5 |
+| **2048 Borrowed Old (uniform `M=16`)** | `B=1` (median of 3) | 3/3 | 4.989 | 1,642.1 | 53.288 | 19.20 | 58.277 | 17.57 | 158.1 |
+| **2048 Hybrid Fused (`M=16/M=32` + fused FC1)** | `B=1` (median of 3) | 3/3 | **4.710** | **1,739.1** | 53.589 | 19.09 | **58.299** | 17.56 | 158.1 |
+| **2048 Control (`b12x` W4A16)** | `B=7` (`7x 8k/1k`) | 7/7 | 5.303 / **30.515** | **1,879.2** | 99.969 | 71.63 | 130.483 | 54.93 | 494.4 |
+| **2048 Borrowed Old (uniform `M=16`)** | `B=7` (`7x 8k/1k`) | 7/7 | 5.640 / 32.405 | 1,769.6 | 93.045 | 76.96 | 125.450 | 57.14 | 514.2 |
+| **2048 Hybrid Fused (`M=16/M=32` + fused FC1)** | `B=7` (`7x 8k/1k`) | 7/7 | **5.384 / 30.692** | **1,868.3** | 96.311 | 74.35 | **127.004** | **56.44** | **508.0** |
 
 ## Existing full-attention implementations
 
