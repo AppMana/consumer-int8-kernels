@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Benchmark-only complete IQ2_XXS chain using prebuilt INT8 C ABI kernels."""
+
+import ctypes
+
+import torch
+
+from consumer_int8 import gguf
+from consumer_int8.gguf_moe import ExecutionPlan
+
+
+def repack(packed):
+    codes, bases, metadata = packed
+    e, n, code_bytes = codes.shape
+    k = code_bytes * 8
+    chunks = codes.reshape(e, n, k // 128, 4, 4)
+    words = metadata.contiguous().view(torch.uint8).reshape_as(chunks)
+    descriptors = torch.cat((chunks, words), -1).permute(0, 2, 1, 3, 4).contiguous()
+    scales = bases[..., : k // 256].transpose(1, 2).contiguous()
+    assert descriptors.numel() + scales.numel() * 2 == e * n * (k // 256) * 66
+    return descriptors, scales
+
+
+class Int8MoE:
+    def __init__(self, native, packed, library, max_tokens, topk, tile):
+        if (native.first_format, native.second_format) != ("IQ2_XXS", "IQ2_XXS"):
+            raise ValueError("Complete INT8 candidate only supports IQ2_XXS pairs")
+        self.native = native
+        self.packed = packed
+        self.plan = ExecutionPlan(native, max_tokens, topk, tile_rows=tile)
+        self.scratch = self.plan.allocate_scratch()
+        r = self.plan.route_capacity
+        self.quant = tuple(
+            (
+                torch.empty(rows, width, device=native.device, dtype=torch.int8),
+                torch.empty(rows, width // 32, device=native.device),
+            )
+            for rows, width in (
+                (max_tokens, native.hidden_size),
+                (r, native.intermediate_size),
+            )
+        )
+        self.lib = ctypes.CDLL(str(library.resolve()))
+        self.fc1 = self.lib.iq2xxs_routed_int8_slab
+        self.fc2 = self.lib.iq2xxs_routed_int8_slab_weighted
+        for fn, pointers in ((self.fc1, 8), (self.fc2, 9)):
+            fn.argtypes = (
+                [ctypes.c_void_p] * pointers + [ctypes.c_int] * 7 + [ctypes.c_void_p]
+            )
+            fn.restype = ctypes.c_int
+
+    def run(self, x, ids, top_weights, out):
+        (
+            info,
+            tokens,
+            weights,
+            inverse,
+            tasks,
+            identity,
+            projected,
+            hidden,
+            contributions,
+        ) = self.scratch
+        m = x.shape[0]
+        r = self.plan.route_capacity
+        torch.arange(r, device=x.device, dtype=torch.int32, out=identity)
+        gguf.plan_routes(
+            ids,
+            top_weights,
+            self.native.expert_map,
+            info,
+            tokens,
+            weights,
+            inverse[:m],
+            tasks,
+            self.plan.tile_rows,
+        )
+        q1, s1 = self.quant[0]
+        q2, s2 = self.quant[1]
+        h, i = self.native.hidden_size, self.native.intermediate_size
+        tail = (
+            len(self.native.expert_ids),
+            tasks.shape[0],
+            self.plan.tile_rows,
+            torch.cuda.current_stream().cuda_stream,
+        )
+        assert (
+            self.fc1(
+                *[
+                    t.data_ptr()
+                    for t in (x, q1, s1, *self.packed[0], tokens, tasks, projected)
+                ],
+                m,
+                r,
+                2 * i,
+                h,
+                *tail,
+            )
+            == 0
+        )
+        gguf.swiglu(projected, hidden, self.plan.swiglu_limit)
+        assert (
+            self.fc2(
+                *[
+                    t.data_ptr()
+                    for t in (
+                        hidden,
+                        q2,
+                        s2,
+                        *self.packed[1],
+                        identity,
+                        tasks,
+                        weights,
+                        contributions,
+                    )
+                ],
+                r,
+                r,
+                h,
+                i,
+                *tail,
+            )
+            == 0
+        )
+        gguf.route_reduce(contributions, inverse[:m], out)

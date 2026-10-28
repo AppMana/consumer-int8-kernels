@@ -144,6 +144,18 @@ def main(args):
         command=sys.argv,
         manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest(),
         library_sha256=hashlib.sha256(args.library.read_bytes()).hexdigest(),
+        int8_adapter_sha256=(
+            hashlib.sha256(
+                Path(__file__).with_name("iq2xxs_int8_moe.py").read_bytes()
+            ).hexdigest()
+            if args.int8_library
+            else None
+        ),
+        int8_library_sha256=(
+            hashlib.sha256(args.int8_library.read_bytes()).hexdigest()
+            if args.int8_library
+            else None
+        ),
         benchmark_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         torch=torch.__version__,
         device=str(torch.cuda.get_device_properties(device)),
@@ -165,6 +177,12 @@ def main(args):
                 flush=True,
             )
             native = prepare_experts(*sources, owned, device=device)
+            if args.int8_library:
+                from iq2xxs_int8_moe import Int8MoE, repack
+
+                if (gate.quant_type, down.quant_type) != ("IQ2_XXS", "IQ2_XXS"):
+                    raise ValueError("INT8 benchmark requires IQ2_XXS gate/up and down")
+                int8_packed = (repack(native.gate_up), repack(native.down))
             for count in args.tokens:
                 torch.manual_seed(182 + count)
                 x = torch.randn(
@@ -183,23 +201,20 @@ def main(args):
                         out,
                     )
                     owners.append((plan, scratch))
-                b12x = prepare_b12x(
-                    *sources,
-                    gate.quant_type,
-                    down.quant_type,
-                    x,
-                    ids,
-                    weights,
-                    native.expert_map,
-                    args.experts,
-                    expert_ids=owned,
-                )
-                calls["b12x"] = (b12x.run, b12x.output)
-                owners.append(b12x)
-                for capacity in args.b12x_capacities:
-                    if capacity == count:
-                        continue
-                    extra = prepare_b12x(
+                if args.int8_library:
+                    for tile in (16, 32):
+                        int8 = Int8MoE(
+                            native, int8_packed, args.int8_library, count, 6, tile
+                        )
+                        output = torch.empty_like(x)
+                        calls[f"int8{tile}"] = (
+                            partial(int8.run, x, ids, weights, output),
+                            output,
+                        )
+                        owners.append(int8)
+                b12x = None
+                if not args.native_only:
+                    b12x = prepare_b12x(
                         *sources,
                         gate.quant_type,
                         down.quant_type,
@@ -209,11 +224,27 @@ def main(args):
                         native.expert_map,
                         args.experts,
                         expert_ids=owned,
-                        max_tokens=capacity,
-                        prepared=b12x.owners[0],
                     )
-                    calls[f"b12x-capacity{capacity}"] = (extra.run, extra.output)
-                    owners.append(extra)
+                    calls["b12x"] = (b12x.run, b12x.output)
+                    owners.append(b12x)
+                    for capacity in args.b12x_capacities:
+                        if capacity == count:
+                            continue
+                        extra = prepare_b12x(
+                            *sources,
+                            gate.quant_type,
+                            down.quant_type,
+                            x,
+                            ids,
+                            weights,
+                            native.expert_map,
+                            args.experts,
+                            expert_ids=owned,
+                            max_tokens=capacity,
+                            prepared=b12x.owners[0],
+                        )
+                        calls[f"b12x-capacity{capacity}"] = (extra.run, extra.output)
+                        owners.append(extra)
                 for pattern in args.patterns:
                     host_ids = make_routes(count, first, pattern)
                     ids.copy_(torch.from_numpy(host_ids))
@@ -280,6 +311,7 @@ def main(args):
                         identity,
                         layer=layer,
                         tokens=count,
+                        b12x_included=not args.native_only,
                         b12x_capacities=[count, *args.b12x_capacities],
                         pattern=pattern,
                         formats=[gate.quant_type, down.quant_type],
@@ -318,6 +350,8 @@ def main(args):
                 del calls, owners, b12x, plan, scratch, out, run, graph
                 gc.collect()
                 torch.cuda.empty_cache()
+            if args.int8_library:
+                del int8_packed, int8, output
             del native
             gc.collect()
             torch.cuda.empty_cache()
@@ -326,6 +360,12 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--native-only",
+        action="store_true",
+        help="Isolate native kernels for sanitizer runs; exclude b12x",
+    )
+    parser.add_argument("--int8-library", type=Path)
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -354,4 +394,6 @@ if __name__ == "__main__":
         parser.error("Invalid expert count, token count or trials")
     if any(capacity < max(args.tokens) for capacity in args.b12x_capacities):
         parser.error("Every additional capacity must cover all live token counts")
+    if args.native_only and args.b12x_capacities:
+        parser.error("Additional b12x capacities require the b12x comparison")
     main(args)

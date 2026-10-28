@@ -10,9 +10,9 @@ __device__ __forceinline__ uint32_t signed_bytes(uint32_t v, uint32_t signs) {
                   ((signs >> 2) & 1) * 0xff0000u | ((signs >> 3) & 1) * 0xff000000u;
   return __vsub4(v ^ mask, mask);
 }
-template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false>
+template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false>
 __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
-    const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr) {
+    const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr) {
   constexpr int Rows = BM + BN, Threads = (BM / 16) * (BN / 32) * 32;
   __shared__ int8_t tile[Rows][144];
   __shared__ float scales[Rows][4];
@@ -142,7 +142,11 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
     for (int r = 0; r < 4; ++r) {
       int row = rb + wr + group + (r >> 1) * 8;
       int col = cb + wc + j * 8 + tid * 2 + (r & 1);
-      if (row < m && col < n) y[row * n + col] = __float2bfloat16(sum[j][r]);
+      if (row < m && col < n) {
+        float value = sum[j][r];
+        if constexpr (Weighted) value *= route_weights[row];
+        y[row * n + col] = __float2bfloat16(value);
+      }
     }
   }
 }
@@ -269,6 +273,26 @@ extern "C" int iq2xxs_routed_int8_slab(const void* x, void* a, float* sa,
   iq2xxs_tiled<M,N,true,true,true,false,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
       static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases))
+  if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
+  else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
+  else { ROUTED_LAUNCH(64,64); }
+#undef ROUTED_LAUNCH
+  return cudaGetLastError();
+}
+
+extern "C" int iq2xxs_routed_int8_slab_weighted(const void* x, void* a, float* sa,
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, const float* weights, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || (tile_m != 16 && tile_m != 32 && tile_m != 64))
+    return cudaErrorInvalidValue;
+  quantize<<<(xrows * (k / 32) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 32));
+#define ROUTED_LAUNCH(M,N) \
+  iq2xxs_tiled<M,N,true,true,true,false,true,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
+      static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases), weights)
   if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
   else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
   else { ROUTED_LAUNCH(64,64); }
