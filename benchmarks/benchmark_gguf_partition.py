@@ -114,6 +114,28 @@ def check(actual, expected):
     return dict(relative_l2=rel, cosine=cosine)
 
 
+def check_repeat(actual, expected, allow_roundoff=False):
+    if torch.equal(actual, expected):
+        return dict(bitwise_equal=True, changed_elements=0)
+    delta = actual.float() - expected.float()
+    result = dict(
+        bitwise_equal=False,
+        changed_elements=int(torch.count_nonzero(actual != expected)),
+        max_abs_change=float(delta.abs().max()),
+        relative_l2=float(delta.norm() / expected.float().norm()),
+        max_bf16_steps=int(
+            (actual.view(torch.int16).int() - expected.view(torch.int16).int())
+            .abs()
+            .max()
+        ),
+    )
+    assert allow_roundoff and torch.isfinite(actual).all(), result
+    # Cancellation near zero can span several BF16 steps despite a tiny
+    # absolute change. Keep both absolute and whole-output relative bounds.
+    assert result["max_abs_change"] <= 2**-13 and result["relative_l2"] <= 1e-6, result
+    return result
+
+
 def main(args):
     import b12x
     from b12x._lib.runtime_control import kernel_resolution_guard
@@ -205,6 +227,7 @@ def main(args):
         torch=torch.__version__,
         device=str(torch.cuda.get_device_properties(device)),
         rank=args.rank,
+        b12x_repeat_roundoff=args.b12x_repeat_roundoff,
         local_experts=args.experts,
         scope="Distinct resident checkpoint experts; no collectives",
         fixture_sha256=(
@@ -603,11 +626,21 @@ def main(args):
                                 end.record()
                                 end.synchronize()
                                 timings[label].append(begin.elapsed_time(end))
+                        repeatability = {}
                         for label, graph in graphs.items():
                             calls[label][1].fill_(float("nan"))
                             graph.replay()
                             torch.cuda.synchronize()
-                            assert torch.equal(calls[label][1], references[label])
+                            check(calls[label][1][samples], expected)
+                            try:
+                                repeatability[label] = check_repeat(
+                                    calls[label][1],
+                                    references[label],
+                                    allow_roundoff=args.b12x_repeat_roundoff
+                                    and label.startswith("b12x"),
+                                )
+                            except AssertionError as error:
+                                raise AssertionError((label, error.args)) from error
                     record = dict(
                         identity,
                         layer=layer,
@@ -621,6 +654,7 @@ def main(args):
                         routes_per_expert=route_counts.tolist(),
                         routes_sha256=hashlib.sha256(memoryview(host_ids)).hexdigest(),
                         correctness=correctness,
+                        repeatability=repeatability,
                         milliseconds=timings,
                         medians_ms={
                             k: statistics.median(v) for k, v in timings.items()
@@ -664,6 +698,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--fixture", type=Path)
+    parser.add_argument("--b12x-repeat-roundoff", action="store_true")
     parser.add_argument(
         "--native-only",
         action="store_true",
