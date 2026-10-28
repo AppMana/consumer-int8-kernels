@@ -40,6 +40,10 @@ static_assert(IQ2XXS_REGISTER_K == 128 || IQ2XXS_REGISTER_K == 256);
 #ifndef IQ2XXS_COMPACT_LUT
 #define IQ2XXS_COMPACT_LUT 0
 #endif
+#ifndef IQ2XXS_PREFETCH_L2
+#define IQ2XXS_PREFETCH_L2 0
+#endif
+static_assert(IQ2XXS_PREFETCH_L2 >= 0 && IQ2XXS_PREFETCH_L2 <= 8);
 static_assert(IQ2XXS_PIPELINE_STAGES == 2 || IQ2XXS_PIPELINE_STAGES == 3);
 static_assert(IQ2XXS_REGISTER_N == 64 || IQ2XXS_REGISTER_N == 128);
 namespace {
@@ -194,6 +198,19 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
   if constexpr (Pipeline)
     for (int stage = 0; stage < Stages - 1; ++stage) prefetch(stage * BK, stage);
   for (int base = 0; base < k; base += BK) {
+    if constexpr (RegisterDecode && IQ2XXS_PREFETCH_L2 > 0 && !Pipeline) {
+      // Cache-only hint: retain all normal loads and the original arithmetic.
+      const int future = base + IQ2XXS_PREFETCH_L2 * BK;
+      if (future < k) {
+        for (int row = threadIdx.x; row < BN; row += Threads) {
+          if (cb + row < n) {
+            const uint2* next = reinterpret_cast<const uint2*>(w) +
+                (int64_t(future / 128) * n + cb + row) * 4;
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(next));
+          }
+        }
+      }
+    }
     const int stage = Pipeline ? (base / BK) % Stages : 0;
     auto& tile = tile_storage[stage];
     auto& descriptors = descriptor_storage[stage];
