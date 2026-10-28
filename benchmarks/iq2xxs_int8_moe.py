@@ -44,6 +44,7 @@ class Int8MoE:
         down_register_decode=None,
         down_library=None,
         iq3_adaptive=False,
+        external_scratch=False,
     ):
         if (down_register_decode is not None or down_library is not None) and not (
             tile in (16, 32, 64)
@@ -105,17 +106,12 @@ class Int8MoE:
         self.plan = ExecutionPlan(
             native, max_tokens, topk, tile_rows=16 if tile in (0, 8) else tile
         )
-        self.scratch = self.plan.allocate_scratch()
         r = self.plan.route_capacity
-        self.quant = tuple(
-            (
-                torch.empty(rows, width, device=native.device, dtype=torch.int8),
-                torch.empty(rows, width // 32, device=native.device),
-            )
-            for rows, width in (
-                (max_tokens, native.hidden_size),
-                (r, native.intermediate_size),
-            )
+        self._scratch_specs = self.plan.scratch_specs() + (
+            ((max_tokens, native.hidden_size), torch.int8),
+            ((max_tokens, native.hidden_size // 32), torch.float32),
+            ((r, native.intermediate_size), torch.int8),
+            ((r, native.intermediate_size // 32), torch.float32),
         )
         self.lib = ctypes.CDLL(str(library.resolve()))
         self.down_lib = (
@@ -123,14 +119,12 @@ class Int8MoE:
             if down_library is not None
             else self.lib
         )
-        self.small_tasks = None
+        self.retile = None
         if tile in (0, 8) or hybrid1632 or iq3_adaptive:
-            tasks = self.scratch[4]
-            if tasks.shape[0] > 32767:
+            task_count = self.plan.scratch_specs()[4][0][0]
+            if task_count > 32767:
                 raise ValueError("Retiled task capacity exceeds CUDA grid")
-            self.small_tasks = torch.empty(
-                tasks.shape[0] * 2, 2, device=native.device, dtype=torch.int32
-            )
+            self._scratch_specs += (((task_count * 2, 2), torch.int32),)
             self.retile = (
                 self.lib.iq3xxs_classify_full32
                 if iq3_adaptive
@@ -144,6 +138,7 @@ class Int8MoE:
                 [ctypes.c_void_p] * 3 + [ctypes.c_int] * 2 + [ctypes.c_void_p]
             )
             self.retile.restype = ctypes.c_int
+        self.scratch = None if external_scratch else self.allocate_scratch()
         if down_activation_block is None:
             down_activation_block = activation_block
         if activation_block not in (32, 256) or down_activation_block not in (32, 256):
@@ -216,7 +211,31 @@ class Int8MoE:
             )
             fn.restype = ctypes.c_int
 
-    def run(self, x, ids, top_weights, out):
+    def scratch_specs(self):
+        """Simultaneous disjoint views, suitable for a shared worker arena."""
+        return self._scratch_specs
+
+    def allocate_scratch(self):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Scratch allocation must precede capture")
+        return tuple(
+            torch.empty(shape, dtype=dtype, device=self.native.device)
+            for shape, dtype in self.scratch_specs()
+        )
+
+    def run(self, x, ids, top_weights, out, scratch=None):
+        """Accept fresh arena views; never retain caller-owned workspace pointers."""
+        scratch = self.scratch if scratch is None else scratch
+        if scratch is None or len(scratch) != len(self.scratch_specs()):
+            raise ValueError("Supply all INT8 MoE scratch views")
+        for t, (shape, dtype) in zip(scratch, self.scratch_specs(), strict=True):
+            if (
+                tuple(t.shape) != shape
+                or t.dtype != dtype
+                or t.device != self.native.device
+                or not t.is_contiguous()
+            ):
+                raise ValueError("Invalid INT8 MoE scratch view")
         (
             info,
             tokens,
@@ -227,7 +246,7 @@ class Int8MoE:
             projected,
             hidden,
             contributions,
-        ) = self.scratch
+        ) = scratch[:9]
         m = x.shape[0]
         r = self.plan.route_capacity
         torch.arange(r, device=x.device, dtype=torch.int32, out=identity)
@@ -242,21 +261,21 @@ class Int8MoE:
             tasks,
             self.plan.tile_rows,
         )
-        q1, s1 = self.quant[0]
-        q2, s2 = self.quant[1]
-        if self.small_tasks is not None:
+        q1, s1, q2, s2 = scratch[9:13]
+        if self.retile is not None:
+            small_tasks = scratch[13]
             assert (
                 self.retile(
                     tasks.data_ptr(),
                     tokens.data_ptr(),
-                    self.small_tasks.data_ptr(),
+                    small_tasks.data_ptr(),
                     tasks.shape[0],
                     r,
                     torch.cuda.current_stream().cuda_stream,
                 )
                 == 0
             )
-            tasks = self.small_tasks
+            tasks = small_tasks
         h, i = self.native.hidden_size, self.native.intermediate_size
         tail = (
             len(self.native.expert_ids),
@@ -295,7 +314,7 @@ class Int8MoE:
                 == 0
             )
         if self.iq3_adaptive:
-            tasks = self.scratch[4]
+            tasks = scratch[4]
             tail = (tail[0], tasks.shape[0], tail[2], tail[3])
         assert (
             self.fc2(
