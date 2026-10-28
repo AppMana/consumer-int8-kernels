@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 
 
-def install(library, *, enabled=True, borrow_b12x=False):
+def install(library, *, enabled=True, borrow_b12x=False, prefill_tokens=512):
     """Use enabled=False for a matched control; borrow_b12x avoids weight copies."""
     from iq2xxs_int8_moe import Int8MoE, repack
     from vllm.model_executor.layers.quantization.b12x_iq import B12xIQMoEMethod
@@ -24,6 +24,10 @@ def install(library, *, enabled=True, borrow_b12x=False):
 
     from consumer_int8.gguf_moe import PreparedExperts, prepare_experts
 
+    if prefill_tokens not in (512, 1024, 2048) or (
+        prefill_tokens != 512 and not borrow_b12x
+    ):
+        raise ValueError("Larger prefill windows require borrowed weights")
     library = Path(library).resolve(strict=True)
     original_load = B12xIQMoEMethod.process_weights_after_loading
     original_apply = B12xIQMoEMethod.apply
@@ -54,7 +58,7 @@ def install(library, *, enabled=True, borrow_b12x=False):
             or self.moe.swiglu_limit != 10.0
             or self.moe.swiglu_alpha not in (None, 1.0)
             or self.moe.swiglu_beta not in (None, 0.0)
-            or self.moe.max_num_tokens < 512
+            or self.moe.max_num_tokens < prefill_tokens
             or self.moe.experts_per_token != 6
         ):
             raise ValueError("Integer experiment requires qualified IQ2 geometry")
@@ -104,7 +108,7 @@ def install(library, *, enabled=True, borrow_b12x=False):
             native = replace(native, gate_up=(), down=())
         if (native.hidden_size, native.intermediate_size) != (5120, 2304):
             raise ValueError("Unqualified integer expert dimensions")
-        count = 128 if borrow_b12x and number >= 30 else 512
+        count = 128 if borrow_b12x and number >= 30 else prefill_tokens
         plan = Int8MoE(
             native,
             packed,
