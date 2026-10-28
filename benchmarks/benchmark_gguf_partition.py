@@ -276,12 +276,16 @@ def main(args):
                                 count,
                                 6,
                                 tile,
-                                register_decode=True,
+                                register_decode=args.int8_register_decode,
                                 fused_swiglu=args.int8_control_fused_swiglu,
                                 masked_swiglu=args.int8_control_masked_swiglu,
                             )
                             control_output = torch.empty_like(x)
-                            calls[f"int8{tile}-register-control"] = (
+                            calls[
+                                f"int8{tile}-register-control"
+                                if args.int8_register_decode
+                                else f"int8{tile}-shared-unfused-control"
+                            ] = (
                                 partial(control.run, x, ids, weights, control_output),
                                 control_output,
                             )
@@ -448,7 +452,11 @@ def main(args):
                             ):
                                 assert torch.equal(
                                     references[f"int8{tile}"],
-                                    references[f"int8{tile}-register-control"],
+                                    references[
+                                        f"int8{tile}-register-control"
+                                        if args.int8_register_decode
+                                        else f"int8{tile}-shared-unfused-control"
+                                    ],
                                 )
                         if args.int8_eight_row:
                             assert torch.equal(
@@ -612,10 +620,8 @@ if __name__ == "__main__":
         parser.error("Every additional capacity must cover all live token counts")
     if args.native_only and args.b12x_capacities:
         parser.error("Additional b12x capacities require the b12x comparison")
-    if args.int8_control_library and not (
-        args.int8_library and args.int8_register_decode
-    ):
-        parser.error("INT8 control library requires the register decoder comparison")
+    if args.int8_control_library and not args.int8_library:
+        parser.error("INT8 control library requires an INT8 candidate")
     if args.int8_fused_swiglu and not (args.int8_library and args.int8_register_decode):
         parser.error("Fused SwiGLU requires the register decoder comparison")
     if args.int8_masked_swiglu and not args.int8_fused_swiglu:

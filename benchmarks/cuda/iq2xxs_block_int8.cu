@@ -58,6 +58,18 @@ static_assert(IQ2XXS_REGISTER_K == 128 || IQ2XXS_REGISTER_K == 256);
 #ifndef IQ2XXS_SHARED_SWIZZLE
 #define IQ2XXS_SHARED_SWIZZLE 0
 #endif
+// IQ3 lifetime experiments: paired whole-MoE trials do not justify defaults.
+#ifndef IQ3XXS_STREAM_STORE
+#define IQ3XXS_STREAM_STORE 0
+#endif
+#ifndef IQ3XXS_DECODE_UNROLL
+#define IQ3XXS_DECODE_UNROLL 4
+#endif
+static_assert(IQ3XXS_DECODE_UNROLL == 1 || IQ3XXS_DECODE_UNROLL == 4);
+#ifndef IQ3XXS_COOPERATIVE_DECODE
+#define IQ3XXS_COOPERATIVE_DECODE 0
+#endif
+static_assert(!IQ3XXS_COOPERATIVE_DECODE || IQ3XXS_STREAM_STORE);
 #ifndef IQ2XXS_SHARED_MIN_BLOCKS
 #define IQ2XXS_SHARED_MIN_BLOCKS 1
 #endif
@@ -138,6 +150,8 @@ __global__ __launch_bounds__(((BM + 15) / 16) * (BN / 32) * 32,
 void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
     const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr) {
   static_assert(!IQ3 || (Slab && SharedLUT && Routed && !RegisterDecode && !Fold256));
+  constexpr int DecodeUnroll = IQ3 ? IQ3XXS_DECODE_UNROLL : 4;
+  constexpr bool Cooperative = IQ3 && IQ3XXS_COOPERATIVE_DECODE;
   static_assert(!RegisterDecode || (Slab && SharedLUT && !Fold256));
   static_assert(BM != 8 || RegisterDecode);
   static_assert(!Acc256 || (RegisterDecode && !Weighted));
@@ -296,8 +310,11 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
       }
       scales[row][block] = valid ? sa[int64_t(input) * (k / 32) + base / 32 + block] : 0;
     }
-    for (int index = threadIdx.x; index < BN * Blocks; index += Threads) {
-      int row = index / Blocks, block = index % Blocks;
+    for (int index = threadIdx.x; index < BN * Blocks * (Cooperative ? 4 : 1); index += Threads) {
+      const int descriptor_index_in_tile = index / (Cooperative ? 4 : 1);
+      int row = descriptor_index_in_tile / Blocks, block = descriptor_index_in_tile % Blocks;
+      const int first_part = Cooperative ? index % 4 : 0;
+      const int end_part = Cooperative ? first_part + 1 : 4;
       uint64_t values[4] = {}, high_values[4] = {};
       float scale = 0;
       if (cb + row < n) {
@@ -334,8 +351,8 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
         }
         if constexpr (Acc256) subscales[row][block] = 2 * int(metadata >> 28) + 1;
         scale = (Fold256 || Acc256) ? base_scale * 0.125f : base_scale * (0.5f + float(metadata >> 28)) * (IQ3 ? 0.5f : 0.25f);
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
+        #pragma unroll (DecodeUnroll)
+        for (int j = first_part; j < end_part; ++j) {
           uint32_t signs = (metadata >> (j * 7)) & 127;
           signs |= (__popc(signs) & 1) << 7;
           uint32_t code = (HalfLoads || Slab) ? (indices >> (j * 8)) & 255 : sub[j];
@@ -365,8 +382,11 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
               high_values[j] |= uint64_t(uint8_t(hi)) << (t * 8);
             }
           } else if constexpr (Packed) {
-            values[j] = uint64_t(signed_bytes(uint32_t(grid), signs)) |
+            const uint64_t decoded = uint64_t(signed_bytes(uint32_t(grid), signs)) |
                         (uint64_t(signed_bytes(uint32_t(grid >> 32), signs >> 4)) << 32);
+            if constexpr (IQ3 && IQ3XXS_STREAM_STORE)
+              *reinterpret_cast<uint64_t*>(&tile[BM + row][tile_column(BM + row, block * 32 + j * 8)]) = decoded;
+            else values[j] = decoded;
           } else {
           #pragma unroll
           for (int t = 0; t < 8; ++t) {
@@ -385,11 +405,14 @@ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloa
           if (cb + row >= n && block == 0) weight_bases[row] = 0;
       }
       if constexpr (!Shuffle)
-        scales[BM + row][block] = scale;
+        if (!Cooperative || first_part == 0) scales[BM + row][block] = scale;
       if constexpr (!RegisterDecode) {
       #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        *reinterpret_cast<uint64_t*>(&tile[BM + row][tile_column(BM + row, block * 32 + j * 8)]) = values[j];
+      for (int j = first_part; j < end_part; ++j) {
+        if constexpr (IQ3 && IQ3XXS_STREAM_STORE) {
+          if (cb + row >= n)
+            *reinterpret_cast<uint64_t*>(&tile[BM + row][tile_column(BM + row, block * 32 + j * 8)]) = 0;
+        } else *reinterpret_cast<uint64_t*>(&tile[BM + row][tile_column(BM + row, block * 32 + j * 8)]) = values[j];
         if constexpr (Fold256)
           *reinterpret_cast<uint64_t*>(&high_tile[row][block * 32 + j * 8]) = high_values[j];
       }
