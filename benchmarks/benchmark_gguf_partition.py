@@ -151,6 +151,7 @@ def main(args):
             if args.int8_library
             else None
         ),
+        int8_register_decode=args.int8_register_decode,
         int8_activation_block=args.int8_activation_block,
         int8_down_activation_block=args.int8_down_activation_block,
         int8_library_sha256=(
@@ -204,23 +205,34 @@ def main(args):
                     )
                     owners.append((plan, scratch))
                 if args.int8_library:
-                    for tile in (16, 32):
-                        int8 = Int8MoE(
-                            native,
-                            int8_packed,
-                            args.int8_library,
-                            count,
-                            6,
-                            tile,
-                            activation_block=args.int8_activation_block,
-                            down_activation_block=args.int8_down_activation_block,
-                        )
-                        output = torch.empty_like(x)
-                        calls[f"int8{tile}"] = (
-                            partial(int8.run, x, ids, weights, output),
-                            output,
-                        )
-                        owners.append(int8)
+                    for register_decode in (
+                        (False, True) if args.int8_register_decode else (False,)
+                    ):
+                        for tile in (16, 32):
+                            int8 = Int8MoE(
+                                native,
+                                int8_packed,
+                                args.int8_library,
+                                count,
+                                6,
+                                tile,
+                                activation_block=args.int8_activation_block,
+                                down_activation_block=args.int8_down_activation_block,
+                                register_decode=register_decode,
+                            )
+                            output = torch.empty_like(x)
+                            calls[
+                                f"int8{tile}"
+                                + (
+                                    "-shared"
+                                    if args.int8_register_decode and not register_decode
+                                    else ""
+                                )
+                            ] = (
+                                partial(int8.run, x, ids, weights, output),
+                                output,
+                            )
+                            owners.append(int8)
                 b12x = None
                 if not args.native_only:
                     b12x = prepare_b12x(
@@ -297,6 +309,12 @@ def main(args):
                             assert torch.isfinite(out).all()
                             correctness[label] = check(out[samples], expected)
                             references[label] = out.clone()
+                        if args.int8_library and args.int8_register_decode:
+                            for tile in (16, 32):
+                                assert torch.equal(
+                                    references[f"int8{tile}"],
+                                    references[f"int8{tile}-shared"],
+                                )
                         flush = torch.empty(64 << 20, device=device, dtype=torch.uint8)
                         timings = {label: [] for label in graphs}
                         for trial in range(args.trials):
@@ -375,6 +393,7 @@ if __name__ == "__main__":
         help="Isolate native kernels for sanitizer runs; exclude b12x",
     )
     parser.add_argument("--int8-library", type=Path)
+    parser.add_argument("--int8-register-decode", action="store_true")
     parser.add_argument(
         "--int8-activation-block", type=int, choices=(32, 256), default=32
     )

@@ -32,6 +32,7 @@ class Int8MoE:
         tile,
         activation_block=32,
         down_activation_block=None,
+        register_decode=False,
     ):
         if (native.first_format, native.second_format) != ("IQ2_XXS", "IQ2_XXS"):
             raise ValueError("Complete INT8 candidate only supports IQ2_XXS pairs")
@@ -55,9 +56,23 @@ class Int8MoE:
             down_activation_block = activation_block
         if activation_block not in (32, 256) or down_activation_block not in (32, 256):
             raise ValueError("activation_block must be 32 or 256")
-        suffix = "_fold256" if activation_block == 256 else ""
+        if register_decode and (activation_block != 32 or down_activation_block != 32):
+            raise ValueError("register decoder requires per32 activation quantization")
+        suffix = (
+            "_register"
+            if register_decode
+            else "_fold256"
+            if activation_block == 256
+            else ""
+        )
         self.fc1 = getattr(self.lib, "iq2xxs_routed_int8_slab" + suffix)
-        down_suffix = "_fold256" if down_activation_block == 256 else ""
+        down_suffix = (
+            "_register"
+            if register_decode
+            else "_fold256"
+            if down_activation_block == 256
+            else ""
+        )
         self.fc2 = getattr(
             self.lib, "iq2xxs_routed_int8_slab" + down_suffix + "_weighted"
         )

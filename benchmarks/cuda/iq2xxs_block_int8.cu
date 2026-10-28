@@ -30,11 +30,13 @@ __device__ __forceinline__ uint32_t signed_bytes(uint32_t v, uint32_t signs) {
                   ((signs >> 2) & 1) * 0xff0000u | ((signs >> 3) & 1) * 0xff000000u;
   return __vsub4(v ^ mask, mask);
 }
-template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false, bool Fold256=false>
+template<int BM, int BN=64, bool Packed=false, bool SharedLUT=false, bool Routed=false, bool HalfLoads=false, bool Slab=false, bool Weighted=false, bool Fold256=false, bool RegisterDecode=false>
 __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa, __nv_bfloat16* y, int m, int n, int k,
     const int32_t* tokens=nullptr, const int32_t* tasks=nullptr, int xrows=0, int experts=1, const __half* wb=nullptr, const float* route_weights=nullptr) {
+  static_assert(!RegisterDecode || (Slab && SharedLUT && !Fold256));
   constexpr int Rows = BM + BN, Threads = (BM / 16) * (BN / 32) * 32;
-  __shared__ int8_t tile[Rows][144];
+  __shared__ int8_t tile[RegisterDecode ? BM : Rows][144];
+  __shared__ uint2 descriptors[RegisterDecode ? BN : 1][4];
   __shared__ int8_t high_tile[Fold256 ? BN : 1][144];
   __shared__ float scales[Rows][4];
   const int lane = threadIdx.x & 31, group = lane >> 2, tid = lane & 3;
@@ -93,6 +95,7 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
               (int64_t(base / 128) * n + cb + row) * 4 + block];
           indices = descriptor.x;
           metadata = descriptor.y;
+          if constexpr (RegisterDecode) descriptors[row][block] = descriptor;
           base_scale = __half2float(wb[int64_t(base / 256) * n + cb + row]);
         } else {
           const uint8_t* raw = w + (int64_t(cb + row) * (k / 256) + base / 256) * 66;
@@ -114,7 +117,9 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
           signs |= (__popc(signs) & 1) << 7;
           uint32_t code = (HalfLoads || Slab) ? (indices >> (j * 8)) & 255 : sub[j];
           uint64_t grid = SharedLUT ? lut[code] : iq2xxs_grid[code];
-          if constexpr (Fold256) {
+          if constexpr (RegisterDecode) {
+            // Decode only the consuming lane's four bytes in the MMA loop.
+          } else if constexpr (Fold256) {
             // Fold the odd IQ scale exactly: signed v = lo + 64*hi.
             // Max magnitude 43*31=1333; both components fit signed INT8.
             #pragma unroll
@@ -138,12 +143,17 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
           }
         }
       }
+      if constexpr (RegisterDecode) {
+        if (cb + row >= n) descriptors[row][block] = make_uint2(0, 0);
+      }
       scales[BM + row][block] = scale;
+      if constexpr (!RegisterDecode) {
       #pragma unroll
       for (int j = 0; j < 4; ++j) {
         *reinterpret_cast<uint64_t*>(&tile[BM + row][block * 32 + j * 8]) = values[j];
         if constexpr (Fold256)
           *reinterpret_cast<uint64_t*>(&high_tile[row][block * 32 + j * 8]) = high_values[j];
+      }
       }
     }
     __syncthreads();
@@ -156,9 +166,22 @@ __global__ void iq2xxs_tiled(const int8_t* a, const uint8_t* w, const float* sa,
       #pragma unroll
       for (int j = 0; j < 4; ++j) {
         uint32_t bv[2];
-        #pragma unroll
-        for (int r = 0; r < 2; ++r)
-          bv[r] = *reinterpret_cast<const uint32_t*>(&tile[BM + wc + j * 8 + group][block * 32 + tid * 4 + r * 16]);
+        if constexpr (RegisterDecode) {
+          const uint2 descriptor = descriptors[wc + j * 8 + group][block];
+          #pragma unroll
+          for (int r = 0; r < 2; ++r) {
+            int part = tid / 2 + r * 2;
+            uint32_t code = (descriptor.x >> (part * 8)) & 255;
+            uint32_t signs = (descriptor.y >> (part * 7)) & 127;
+            signs |= (__popc(signs) & 1) << 7;
+            uint64_t grid = lut[code];
+            bv[r] = signed_bytes(uint32_t(grid >> ((tid & 1) * 32)), signs >> ((tid & 1) * 4));
+          }
+        } else {
+          #pragma unroll
+          for (int r = 0; r < 2; ++r)
+            bv[r] = *reinterpret_cast<const uint32_t*>(&tile[BM + wc + j * 8 + group][block * 32 + tid * 4 + r * 16]);
+        }
         int acc[4] = {};
         if constexpr (Fold256) {
           #pragma unroll
@@ -394,6 +417,47 @@ extern "C" int iq2xxs_routed_int8_slab_fold256_weighted(const void* x, void* a, 
       static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 256));
 #define ROUTED_LAUNCH(M,N) \
   iq2xxs_tiled<M,N,true,true,true,false,true,true,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
+      static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases), weights)
+  if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
+  else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
+  else { ROUTED_LAUNCH(64,64); }
+#undef ROUTED_LAUNCH
+  return cudaGetLastError();
+}
+
+// Decode compressed IQ descriptors straight into signed INT8 MMA registers.
+extern "C" int iq2xxs_routed_int8_slab_register(const void* x, void* a, float* sa,
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || (tile_m != 16 && tile_m != 32 && tile_m != 64))
+    return cudaErrorInvalidValue;
+  quantize<<<(xrows * (k / 32) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 32));
+#define ROUTED_LAUNCH(M,N) \
+  iq2xxs_tiled<M,N,true,true,true,false,true,false,false,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
+      static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
+      static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases))
+  if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
+  else if (tile_m == 32) { ROUTED_LAUNCH(32,64); }
+  else { ROUTED_LAUNCH(64,64); }
+#undef ROUTED_LAUNCH
+  return cudaGetLastError();
+}
+
+extern "C" int iq2xxs_routed_int8_slab_register_weighted(const void* x, void* a, float* sa,
+    const void* raw, const void* bases, const int32_t* tokens, const int32_t* tasks, const float* weights, void* y,
+    int xrows, int rows, int n, int k, int experts, int taskcount,
+    int tile_m, cudaStream_t stream) {
+  if (xrows <= 0 || rows <= 0 || n <= 0 || k <= 0 || k % 256 || experts <= 0 ||
+      taskcount <= 0 || (tile_m != 16 && tile_m != 32 && tile_m != 64))
+    return cudaErrorInvalidValue;
+  quantize<<<(xrows * (k / 32) + 7) / 8, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<int8_t*>(a), sa, xrows * (k / 32));
+#define ROUTED_LAUNCH(M,N) \
+  iq2xxs_tiled<M,N,true,true,true,false,true,true,false,true><<<dim3((n+N-1)/N,taskcount), (M/16)*(N/32)*32, 0, stream>>>( \
       static_cast<const int8_t*>(a), static_cast<const uint8_t*>(raw), sa, \
       static_cast<__nv_bfloat16*>(y), rows, n, k, tokens, tasks, xrows, experts, static_cast<const __half*>(bases), weights)
   if (tile_m == 16) { ROUTED_LAUNCH(16,64); }
