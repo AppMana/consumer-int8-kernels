@@ -261,22 +261,58 @@ top_k=8`, 0 `compute-sanitizer` errors, exact bitwise output parity):
 | `layer3_m2048` | 7.640 | 9.914 | **5.736** | **1.73x** | **1.33x** |
 | `layer39_m2048` | 7.456 | 9.939 | **5.792** | **1.72x** | **1.29x** |
 
-### Live 2x DGX Spark GB10 (`TP=2/EP=2`) 8,192-input / 1,024-output needle-in-haystack
+### Needle-in-haystack benchmarks (`C = 1, 2, 4, 8, 32` across `8k/1k`, `242k/1k`, `950k/1k`)
+
+#### `Qwen3.8-27B` INT8 (`qwen_int8`), 2x RTX A5000 (`SM86`, 24 GB/GPU)
+
+Measured in vLLM (`consumer_int8_prefill`, `consumer_fa2`, `paged_decode`
+2-CTA/SM split-KV, `int8` KV cache, `2.0 GiB` KV reservation on `MTP=0` and
+`3.35 GiB` on `MTP=7`, 1 warmup + 3 measured cohorts per cell, cold prefix
+cache; `242,000 / 1,000` and `C=32` exceed the `2.98 GiB` post-weight per-GPU
+VRAM ceiling on 2x 24 GB; `950,000 / 1,000` exceeds
+`max_position_embeddings = 262,144`):
+
+| Topology | Input / Output tokens | C | Prefill tok/s per stream | Prefill tok/s aggregate | Decode tok/s per stream | Decode tok/s aggregate | Verbatim |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `TP=2` (`MTP=0`) | 8,000 / 1,000 | 1 | 4,280 | 4,280 | 36.7 | 36.7 | 3/3 |
+| `TP=2` (`MTP=0`) | 8,000 / 1,000 | 2 | 3,496 | 4,181 | 32.8 | 63.5 | 5/6 |
+| `TP=2` (`MTP=0`) | 8,000 / 1,000 | 4 | 2,078 | 4,145 | 29.4 | 108.0 | 12/12 |
+| `TP=2` (`MTP=0`) | 8,000 / 1,000 | 8 | 1,827 | 3,722 | 22.7 | 153.8 | 24/24 |
+| `TP=2` (`MTP=0`) | 8,000 / 1,000 | 32 | OOM | OOM | OOM | OOM | OOM |
+| `TP=2` (`MTP=0`) | 242,000 / 1,000 | 1, 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM |
+| `TP=2` (`MTP=0`) | 950,000 / 1,000 | 1, 2, 4, 8, 32 | N/A | N/A | N/A | N/A | N/A |
+| `TP=2` (`MTP=7`) | 8,000 / 1,000 | 1 | 4,114 | 4,114 | 142.1 | 142.1 | 3/3 |
+| `TP=2` (`MTP=7`) | 8,000 / 1,000 | 2 | 3,034 | 4,048 | 122.7 | 215.7 | 5/6 |
+| `TP=2` (`MTP=7`) | 8,000 / 1,000 | 4 | 2,003 | 4,000 | 89.3 | 272.6 | 12/12 |
+| `TP=2` (`MTP=7`) | 8,000 / 1,000 | 8, 32 | OOM | OOM | OOM | OOM | OOM |
+| `TP=2` (`MTP=7`) | 242,000 / 1,000 | 1, 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM |
+| `TP=2` (`MTP=7`) | 950,000 / 1,000 | 1, 2, 4, 8, 32 | N/A | N/A | N/A | N/A | N/A |
+| `PP=2` (`MTP=0`) | 8,000 / 1,000 | 1 | 3,310 | 3,310 | 20.0 | 20.0 | 3/3 |
+| `PP=2` (`MTP=0`) | 8,000 / 1,000 | 2 | 2,836 | 3,260 | 17.9 | 35.0 | 5/6 |
+| `PP=2` (`MTP=0`) | 8,000 / 1,000 | 4 | 1,895 | 4,251 | 17.7 | 67.7 | 12/12 |
+| `PP=2` (`MTP=0`) | 8,000 / 1,000 | 8 | 1,675 | 3,851 | 14.5 | 105.1 | 24/24 |
+| `PP=2` (`MTP=0`) | 8,000 / 1,000 | 32 | OOM | OOM | OOM | OOM | OOM |
+| `PP=2` (`MTP=0`) | 242,000 / 1,000 | 1, 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM |
+| `PP=2` (`MTP=0`) | 950,000 / 1,000 | 1, 2, 4, 8, 32 | N/A | N/A | N/A | N/A | N/A |
+
+#### `unsloth/DeepSeek-V4.1-Flash-1017-GGUF` (`UD-Q2_K_XL`), 2x DGX Spark GB10 (`TP=2/EP=2`)
 
 Measured on `leaderworkerset/deepseek-v4-int4-int8` (`spark-2ab3` +
-`spark-5867`, `unsloth/DeepSeek-V4.1-Flash-1017-GGUF` `UD-Q2_K_XL` rev
-`60ad3651641b5c97679c807e064ab1d7a3ca1455`, `int8_ds_mla` KV cache,
-`max_num_batched_tokens=2048`, `max_num_seqs=8`, cold prefix cache per cell,
-`benchmarks/benchmark_dsv41_needle.py`):
+`spark-5867`, `quant_method=dsv41_gguf`, `UD-Q2_K_XL` rev
+`60ad3651641b5c97679c807e064ab1d7a3ca1455`, `int8_ds_mla` KV cache, `1 GiB` per
+rank with `95.11 GiB` weights per rank inside the `121 GiB` unified memory
+limit, `max_num_batched_tokens=2048`, `max_num_seqs=8`, cold prefix cache per
+cell, `tools/ampere/dsv4_needle_bench.py`):
 
-| Variant | Cohort | Needle Pass | Median / Last TTFT (s) | Prefill (tok/s) | Post-Prefill Decode (s) | Decode (tok/s) | Total Wall (s) | Aggregate Output (tok/s) | Total (tok/s) |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **2048 Control (`b12x` W4A16)** | `B=1` (median of 3) | 3/3 | **4.519** | **1,812.6** | 53.271 | 19.20 | **57.791** | 17.72 | 159.5 |
-| **2048 Borrowed Old (uniform `M=16`)** | `B=1` (median of 3) | 3/3 | 4.989 | 1,642.1 | 53.288 | 19.20 | 58.277 | 17.57 | 158.1 |
-| **2048 Hybrid Fused (`M=16/M=32` + fused FC1)** | `B=1` (median of 3) | 3/3 | **4.710** | **1,739.1** | 53.589 | 19.09 | **58.299** | 17.56 | 158.1 |
-| **2048 Control (`b12x` W4A16)** | `B=7` (`7x 8k/1k`) | 7/7 | 5.303 / **30.515** | **1,879.2** | 99.969 | 71.63 | 130.483 | 54.93 | 494.4 |
-| **2048 Borrowed Old (uniform `M=16`)** | `B=7` (`7x 8k/1k`) | 7/7 | 5.640 / 32.405 | 1,769.6 | 93.045 | 76.96 | 125.450 | 57.14 | 514.2 |
-| **2048 Hybrid Fused (`M=16/M=32` + fused FC1)** | `B=7` (`7x 8k/1k`) | 7/7 | **5.384 / 30.692** | **1,868.3** | 96.311 | 74.35 | **127.004** | **56.44** | **508.0** |
+| Input / Output tokens | C | TTFT s | Prefill tok/s per stream | Prefill tok/s aggregate | Output tok/s per stream | Output tok/s aggregate | Verbatim |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8,000 / 1,000 | 1 | 4.0 | 1,988 | 1,988 | 19.3 | 17.9 | 1/1 |
+| 8,000 / 1,000 | 2 | 6.2 | 1,429 | 1,943 | 16.3 | 29.6 | 2/2 |
+| 8,000 / 1,000 | 4 | 10.7 | 783 | 1,918 | 13.2 | 46.1 | 3/4 |
+| 8,000 / 1,000 | 8 | 19.2 | 422 | 1,907 | 10.2 | 67.8 | 8/8 |
+| 8,000 / 1,000 | 32 | OOM | OOM | OOM | OOM | OOM | OOM |
+| 242,000 / 1,000 | 1, 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM | OOM |
+| 950,000 / 1,000 | 1, 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM | OOM |
 
 ## Existing full-attention implementations
 
