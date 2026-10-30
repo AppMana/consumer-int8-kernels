@@ -188,6 +188,7 @@ __device__ __forceinline__ float cache_divide(float x, float y) {
   return result;
 }
 
+template <bool Int4 = false>
 __global__ void kv_cache_update_kernel(
     const __nv_bfloat16* key, const __nv_bfloat16* value, int8_t* cache,
     const int64_t* slots, int tokens, int heads, int blocks, int block_size,
@@ -198,32 +199,83 @@ __global__ void kv_cache_update_kernel(
   const int token = row / heads, head = row % heads, lane = threadIdx.x & 31;
   const int64_t slot = slots[token];
   if (slot < 0 || slot >= int64_t(blocks) * block_size) return;
-  float k[8], v[8], km = 0, vm = 0;
-  #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    k[i] = __bfloat162float(key[token * kt + head * kh + lane + i * 32]);
-    v[i] = __bfloat162float(value[token * vt + head * vh + lane + i * 32]);
-    km = fmaxf(km, fabsf(k[i])); vm = fmaxf(vm, fabsf(v[i]));
-  }
-  for (int mask = 16; mask; mask >>= 1) {
-    km = fmaxf(km, __shfl_xor_sync(0xffffffff, km, mask));
-    vm = fmaxf(vm, __shfl_xor_sync(0xffffffff, vm, mask));
-  }
-  const float ks = fmaxf(cache_divide(km, 127.f), 1e-6f);
-  const float vs = fmaxf(cache_divide(vm, 127.f), 1e-6f);
-  const float ki = cache_divide(1.f, ks), vi = cache_divide(1.f, vs);
   int8_t* destination = cache + (slot / block_size) * cb + head * ch + (slot % block_size) * ct;
-  if (!lane) {
-    *reinterpret_cast<float*>(destination + 256) = ks;
-    *reinterpret_cast<float*>(destination + 516) = vs;
-  }
-  #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const float kq = k[i] * ki, vq = v[i] * vi;
-    destination[lane + i * 32] = static_cast<int8_t>(
-        fminf(127.f, fmaxf(-128.f, kq + (kq >= 0 ? 0.5f : -0.5f))));
-    destination[260 + lane + i * 32] = static_cast<int8_t>(
-        fminf(127.f, fmaxf(-128.f, vq + (vq >= 0 ? 0.5f : -0.5f))));
+  if constexpr (Int4) {
+    float k[8], v[8];
+    float kmin = INFINITY, kmax = -INFINITY;
+    float vmin = INFINITY, vmax = -INFINITY;
+    const int d = lane * 8;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      k[i] = __bfloat162float(key[token * kt + head * kh + d + i]);
+      v[i] = __bfloat162float(value[token * vt + head * vh + d + i]);
+      kmin = fminf(kmin, k[i]); kmax = fmaxf(kmax, k[i]);
+      vmin = fminf(vmin, v[i]); vmax = fmaxf(vmax, v[i]);
+    }
+    for (int mask = 16; mask; mask >>= 1) {
+      kmin = fminf(kmin, __shfl_xor_sync(0xffffffff, kmin, mask));
+      kmax = fmaxf(kmax, __shfl_xor_sync(0xffffffff, kmax, mask));
+      vmin = fminf(vmin, __shfl_xor_sync(0xffffffff, vmin, mask));
+      vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffff, vmax, mask));
+    }
+    const float raw_ks = fmaxf(cache_divide(kmax - kmin, 15.f), 1e-6f);
+    const float raw_vs = fmaxf(cache_divide(vmax - vmin, 15.f), 1e-6f);
+    const float kzp_r = cache_divide(-kmin, raw_ks);
+    const float vzp_r = cache_divide(-vmin, raw_vs);
+    const uint32_t kzp = static_cast<uint32_t>(
+        fminf(15.f, fmaxf(0.f, float(int(kzp_r + (kzp_r >= 0 ? 0.5f : -0.5f))))));
+    const uint32_t vzp = static_cast<uint32_t>(
+        fminf(15.f, fmaxf(0.f, float(int(vzp_r + (vzp_r >= 0 ? 0.5f : -0.5f))))));
+    const uint32_t ks_bits = (__float_as_uint(raw_ks) & ~0xFu) | (kzp & 0xFu);
+    const uint32_t vs_bits = (__float_as_uint(raw_vs) & ~0xFu) | (vzp & 0xFu);
+    const float ks = __uint_as_float(ks_bits & ~0xFu);
+    const float vs = __uint_as_float(vs_bits & ~0xFu);
+    const float ki = cache_divide(1.f, ks), vi = cache_divide(1.f, vs);
+    uint32_t k_packed = 0, v_packed = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float kq = k[i] * ki + float(kzp);
+      const float vq = v[i] * vi + float(vzp);
+      const uint32_t kn = static_cast<uint32_t>(
+          fminf(15.f, fmaxf(0.f, float(int(kq + (kq >= 0 ? 0.5f : -0.5f))))));
+      const uint32_t vn = static_cast<uint32_t>(
+          fminf(15.f, fmaxf(0.f, float(int(vq + (vq >= 0 ? 0.5f : -0.5f))))));
+      k_packed |= (kn & 0xFu) << (i * 4);
+      v_packed |= (vn & 0xFu) << (i * 4);
+    }
+    *reinterpret_cast<uint32_t*>(destination + lane * 4) = k_packed;
+    *reinterpret_cast<uint32_t*>(destination + 132 + lane * 4) = v_packed;
+    if (!lane) {
+      *reinterpret_cast<uint32_t*>(destination + 128) = ks_bits;
+      *reinterpret_cast<uint32_t*>(destination + 260) = vs_bits;
+    }
+  } else {
+    float k[8], v[8], km = 0, vm = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      k[i] = __bfloat162float(key[token * kt + head * kh + lane + i * 32]);
+      v[i] = __bfloat162float(value[token * vt + head * vh + lane + i * 32]);
+      km = fmaxf(km, fabsf(k[i])); vm = fmaxf(vm, fabsf(v[i]));
+    }
+    for (int mask = 16; mask; mask >>= 1) {
+      km = fmaxf(km, __shfl_xor_sync(0xffffffff, km, mask));
+      vm = fmaxf(vm, __shfl_xor_sync(0xffffffff, vm, mask));
+    }
+    const float ks = fmaxf(cache_divide(km, 127.f), 1e-6f);
+    const float vs = fmaxf(cache_divide(vm, 127.f), 1e-6f);
+    const float ki = cache_divide(1.f, ks), vi = cache_divide(1.f, vs);
+    if (!lane) {
+      *reinterpret_cast<float*>(destination + 256) = ks;
+      *reinterpret_cast<float*>(destination + 516) = vs;
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float kq = k[i] * ki, vq = v[i] * vi;
+      destination[lane + i * 32] = static_cast<int8_t>(
+          fminf(127.f, fmaxf(-128.f, kq + (kq >= 0 ? 0.5f : -0.5f))));
+      destination[260 + lane + i * 32] = static_cast<int8_t>(
+          fminf(127.f, fmaxf(-128.f, vq + (vq >= 0 ? 0.5f : -0.5f))));
+    }
   }
 }
 }  // namespace
@@ -263,10 +315,17 @@ void gdn_decode(const void* q, const void* k, const void* v, const float* g,
 void kv_cache_update(const void* key, const void* value, int8_t* cache,
                       const int64_t* slots, int tokens, int heads, int blocks,
                       int block_size, int64_t kt, int64_t kh, int64_t vt, int64_t vh,
-                      int64_t cb, int64_t ch, int64_t ct, cudaStream_t stream) {
-  kv_cache_update_kernel<<<(tokens * heads + 3) / 4, 128, 0, stream>>>(
-      static_cast<const __nv_bfloat16*>(key), static_cast<const __nv_bfloat16*>(value),
-      cache, slots, tokens, heads, blocks, block_size, kt, kh, vt, vh, cb, ch, ct);
+                      int64_t cb, int64_t ch, int64_t ct, cudaStream_t stream,
+                      bool int4) {
+  if (int4) {
+    kv_cache_update_kernel<true><<<(tokens * heads + 3) / 4, 128, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(key), static_cast<const __nv_bfloat16*>(value),
+        cache, slots, tokens, heads, blocks, block_size, kt, kh, vt, vh, cb, ch, ct);
+  } else {
+    kv_cache_update_kernel<false><<<(tokens * heads + 3) / 4, 128, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(key), static_cast<const __nv_bfloat16*>(value),
+        cache, slots, tokens, heads, blocks, block_size, kt, kh, vt, vh, cb, ch, ct);
+  }
 }
 
 void gdn_packed_decode(const void* qkv, const void* a, const void* b,

@@ -35,21 +35,29 @@ __device__ __forceinline__ void expand(uint32_t code, bf16 *dst) {
   *reinterpret_cast<__nv_bfloat162 *>(dst + 2) = __floats2bfloat162_rn(
       float(int8_t(code >> 16)), float(int8_t(code >> 24)));
 }
+__device__ __forceinline__ void expand_int4(uint32_t code, int zp, bf16 *dst) {
+#pragma unroll
+  for (int j = 0; j < 8; j += 2) {
+    *reinterpret_cast<__nv_bfloat162 *>(dst + j) = __floats2bfloat162_rn(
+        float(int((code >> (j * 4)) & 0xFu) - zp),
+        float(int((code >> ((j + 1) * 4)) & 0xFu) - zp));
+  }
+}
 
-template <int Rows>
+template <int Rows, bool Int4 = false>
 __device__ __forceinline__ void
 stage(Shared<Rows> &s, const int8_t *cache, const int32_t *table, int seq,
       int kh, int base, int length, int block_size, int table_stride,
       int64_t cb, int64_t ch, int64_t ct) {
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-  // Packed rows are eight-byte aligned even though the V codes start at 260.
+  // Packed rows are eight-byte aligned even though the V codes start at 260/132.
   for (int row = warp; row < 32; row += Rows / 4) {
     const int pos = base + row;
     const bool valid = pos < length;
     const int page = valid ? table[seq * table_stride + pos / block_size] : 0;
     const int8_t *src = cache + page * cb + kh * ch + (pos % block_size) * ct;
 #pragma unroll
-    for (int word = lane; word < 65; word += 32) {
+    for (int word = lane; word < (Int4 ? 33 : 65); word += 32) {
       const uint32_t dst = static_cast<uint32_t>(
           __cvta_generic_to_shared(&s.packed[row][word * 2]));
       asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::"r"(dst),
@@ -62,7 +70,7 @@ stage(Shared<Rows> &s, const int8_t *cache, const int32_t *table, int seq,
 
 // Six query heads share one packed KV tile. Split contexts independently of
 // query count so C=1 decode can occupy every SM. No host metadata reads.
-template <int Rows>
+template <int Rows, bool Int4 = false>
 __global__ __launch_bounds__(Rows * 8, 2)
 void split_kernel(const bf16 *q, const int8_t *cache,
                   const int32_t *table, const int32_t *offsets,
@@ -107,28 +115,52 @@ void split_kernel(const bf16 *q, const int8_t *cache,
   float accum[8][4] = {};
   __syncthreads();
   if (begin < end)
-    stage(s, cache, table, seq, kh, begin, length, block_size, table_stride, cb,
-          ch, ct);
+    stage<Rows, Int4>(s, cache, table, seq, kh, begin, length, block_size,
+                      table_stride, cb, ch, ct);
   for (int base = begin; base < end; base += 32) {
     asm volatile("cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
-    uint32_t k[32 * 64 / Threads], v[32 * 64 / Threads];
+    if constexpr (Int4) {
+      uint32_t k[32 * 32 / Threads], v[32 * 32 / Threads];
+      int kzp[32 * 32 / Threads], vzp[32 * 32 / Threads];
 #pragma unroll
-    for (int j = 0; j < 32 * 64 / Threads; ++j) {
-      const int i = threadIdx.x + j * Threads, row = i / 64, col = i % 64;
-      k[j] = s.packed[row][col];
-      v[j] = s.packed[row][65 + col];
-    }
-    if (threadIdx.x < 32) {
-      s.ks[threadIdx.x] = __uint_as_float(s.packed[threadIdx.x][64]);
-      s.vs[threadIdx.x] = __uint_as_float(s.packed[threadIdx.x][129]);
-    }
-    __syncthreads();
+      for (int j = 0; j < 32 * 32 / Threads; ++j) {
+        const int i = threadIdx.x + j * Threads, row = i / 32, col = i % 32;
+        k[j] = s.packed[row][col];
+        v[j] = s.packed[row][33 + col];
+        kzp[j] = int(s.packed[row][32] & 0xFu);
+        vzp[j] = int(s.packed[row][65] & 0xFu);
+      }
+      if (threadIdx.x < 32) {
+        s.ks[threadIdx.x] = __uint_as_float(s.packed[threadIdx.x][32] & ~0xFu);
+        s.vs[threadIdx.x] = __uint_as_float(s.packed[threadIdx.x][65] & ~0xFu);
+      }
+      __syncthreads();
 #pragma unroll
-    for (int j = 0; j < 32 * 64 / Threads; ++j) {
-      const int i = threadIdx.x + j * Threads;
-      expand(k[j], &s.k[i / 64][(i % 64) * 4]);
-      expand(v[j], &s.v[i / 64][(i % 64) * 4]);
+      for (int j = 0; j < 32 * 32 / Threads; ++j) {
+        const int i = threadIdx.x + j * Threads;
+        expand_int4(k[j], kzp[j], &s.k[i / 32][(i % 32) * 8]);
+        expand_int4(v[j], vzp[j], &s.v[i / 32][(i % 32) * 8]);
+      }
+    } else {
+      uint32_t k[32 * 64 / Threads], v[32 * 64 / Threads];
+#pragma unroll
+      for (int j = 0; j < 32 * 64 / Threads; ++j) {
+        const int i = threadIdx.x + j * Threads, row = i / 64, col = i % 64;
+        k[j] = s.packed[row][col];
+        v[j] = s.packed[row][65 + col];
+      }
+      if (threadIdx.x < 32) {
+        s.ks[threadIdx.x] = __uint_as_float(s.packed[threadIdx.x][64]);
+        s.vs[threadIdx.x] = __uint_as_float(s.packed[threadIdx.x][129]);
+      }
+      __syncthreads();
+#pragma unroll
+      for (int j = 0; j < 32 * 64 / Threads; ++j) {
+        const int i = threadIdx.x + j * Threads;
+        expand(k[j], &s.k[i / 64][(i % 64) * 4]);
+        expand(v[j], &s.v[i / 64][(i % 64) * 4]);
+      }
     }
     __syncthreads();
     float score[4] = {};
@@ -150,8 +182,8 @@ void split_kernel(const bf16 *q, const int8_t *cache,
     }
     __syncthreads();
     if (base + 32 < end)
-      stage(s, cache, table, seq, kh, base + 32, length, block_size,
-            table_stride, cb, ch, ct);
+      stage<Rows, Int4>(s, cache, table, seq, kh, base + 32, length, block_size,
+                        table_stride, cb, ch, ct);
     const int row = threadIdx.x / 8, sub = threadIdx.x % 8;
     float maximum = -INFINITY;
 #pragma unroll
@@ -265,15 +297,29 @@ void paged_decode(const void *query, const int8_t *cache, const int32_t *table,
                   int parts, int block_size, int table_stride, int sequences,
                   int max_query, int64_t qt, int64_t qh, int64_t cb, int64_t ch,
                   int64_t ct, int64_t ot, int64_t oh, float scale,
-                  cudaStream_t stream) {
-  if (max_query <= 2) {
-    split_kernel<16>
+                  cudaStream_t stream, bool int4) {
+  if (int4) {
+    if (max_query <= 2) {
+      split_kernel<16, true>
+          <<<dim3((max_query * 6 + 15) / 16, kv_heads * parts, sequences), 128,
+             0, stream>>>(static_cast<const bf16 *>(query), cache, table,
+                          offsets, lengths, scratch, heads, kv_heads, parts,
+                          block_size, table_stride, qt, qh, cb, ch, ct, scale);
+    } else {
+      split_kernel<32, true>
+          <<<dim3((max_query * 6 + 31) / 32, kv_heads * parts, sequences), 256,
+             0, stream>>>(static_cast<const bf16 *>(query), cache, table,
+                          offsets, lengths, scratch, heads, kv_heads, parts,
+                          block_size, table_stride, qt, qh, cb, ch, ct, scale);
+    }
+  } else if (max_query <= 2) {
+    split_kernel<16, false>
         <<<dim3((max_query * 6 + 15) / 16, kv_heads * parts, sequences), 128, 0,
            stream>>>(static_cast<const bf16 *>(query), cache, table, offsets,
                      lengths, scratch, heads, kv_heads, parts, block_size,
                      table_stride, qt, qh, cb, ch, ct, scale);
   } else {
-    split_kernel<32>
+    split_kernel<32, false>
         <<<dim3((max_query * 6 + 31) / 32, kv_heads * parts, sequences), 256, 0,
            stream>>>(static_cast<const bf16 *>(query), cache, table, offsets,
                      lengths, scratch, heads, kv_heads, parts, block_size,

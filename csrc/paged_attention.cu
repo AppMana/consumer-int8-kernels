@@ -33,6 +33,7 @@ __device__ __forceinline__ void mma(float *c, const uint32_t *a,
 // One head and 64 query tokens per CTA. Codes are exactly representable in
 // BF16; K scales apply after QK, V scales before PV, as in the serving kernel.
 // No expanded KV cache or persistent model workspace is required.
+template <bool Int4 = false>
 __global__ void paged_attention_kernel(
     const bf16 *query, const int8_t *cache, const int32_t *table,
     const int32_t *offsets, const int32_t *lengths, bf16 *out, int heads,
@@ -91,29 +92,63 @@ __global__ void paged_attention_kernel(
           pos < length ? table[seq * table_stride + pos / block_size] : 0;
       const int8_t *src =
           cache + page * cb + key_head * ch + (pos % block_size) * ct;
-#pragma unroll
-      for (int half = 0; half < 2; ++half) {
-        const int d = lane * 4 + half * 128;
+      if constexpr (Int4) {
+        const int d = lane * 8;
         const uint32_t kc =
-            pos < length ? *reinterpret_cast<const uint32_t *>(src + d) : 0;
-        const uint32_t vc =
-            pos < length ? *reinterpret_cast<const uint32_t *>(src + 260 + d)
+            pos < length ? *reinterpret_cast<const uint32_t *>(src + lane * 4)
                          : 0;
+        const uint32_t vc =
+            pos < length
+                ? *reinterpret_cast<const uint32_t *>(src + 132 + lane * 4)
+                : 0;
+        const uint32_t ks_bits =
+            pos < length ? *reinterpret_cast<const uint32_t *>(src + 128)
+                         : 0x3f800000u;
+        const uint32_t vs_bits =
+            pos < length ? *reinterpret_cast<const uint32_t *>(src + 260)
+                         : 0x3f800000u;
+        const int kzp = pos < length ? int(ks_bits & 0xFu) : 0;
+        const int vzp = pos < length ? int(vs_bits & 0xFu) : 0;
 #pragma unroll
-        for (int j = 0; j < 4; j += 2) {
+        for (int j = 0; j < 8; j += 2) {
           *reinterpret_cast<__nv_bfloat162 *>(&ks[r][d + j]) =
-              __floats2bfloat162_rn(float(int8_t(kc >> (j * 8))),
-                                    float(int8_t(kc >> ((j + 1) * 8))));
+              __floats2bfloat162_rn(
+                  float(int((kc >> (j * 4)) & 0xFu) - kzp),
+                  float(int((kc >> ((j + 1) * 4)) & 0xFu) - kzp));
           *reinterpret_cast<__nv_bfloat162 *>(&vs[r][d + j]) =
-              __floats2bfloat162_rn(float(int8_t(vc >> (j * 8))),
-                                    float(int8_t(vc >> ((j + 1) * 8))));
+              __floats2bfloat162_rn(
+                  float(int((vc >> (j * 4)) & 0xFu) - vzp),
+                  float(int((vc >> ((j + 1) * 4)) & 0xFu) - vzp));
         }
-      }
-      if (!lane) {
-        kscale[r] =
-            pos < length ? *reinterpret_cast<const float *>(src + 256) : 1.f;
-        vscale[r] =
-            pos < length ? *reinterpret_cast<const float *>(src + 516) : 1.f;
+        if (!lane) {
+          kscale[r] = __uint_as_float(ks_bits & ~0xFu);
+          vscale[r] = __uint_as_float(vs_bits & ~0xFu);
+        }
+      } else {
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+          const int d = lane * 4 + half * 128;
+          const uint32_t kc =
+              pos < length ? *reinterpret_cast<const uint32_t *>(src + d) : 0;
+          const uint32_t vc =
+              pos < length ? *reinterpret_cast<const uint32_t *>(src + 260 + d)
+                           : 0;
+#pragma unroll
+          for (int j = 0; j < 4; j += 2) {
+            *reinterpret_cast<__nv_bfloat162 *>(&ks[r][d + j]) =
+                __floats2bfloat162_rn(float(int8_t(kc >> (j * 8))),
+                                      float(int8_t(kc >> ((j + 1) * 8))));
+            *reinterpret_cast<__nv_bfloat162 *>(&vs[r][d + j]) =
+                __floats2bfloat162_rn(float(int8_t(vc >> (j * 8))),
+                                      float(int8_t(vc >> ((j + 1) * 8))));
+          }
+        }
+        if (!lane) {
+          kscale[r] =
+              pos < length ? *reinterpret_cast<const float *>(src + 256) : 1.f;
+          vscale[r] =
+              pos < length ? *reinterpret_cast<const float *>(src + 516) : 1.f;
+        }
       }
     }
     __syncthreads();
@@ -210,16 +245,29 @@ void paged_attention(const void *query, const int8_t *cache,
                      int block_size, int table_stride, int sequences,
                      int max_query, int64_t qt, int64_t qh, int64_t cb,
                      int64_t ch, int64_t ct, int64_t ot, int64_t oh,
-                     float scale, cudaStream_t stream) {
+                     float scale, cudaStream_t stream, bool int4) {
   constexpr int shared_bytes = sizeof(AttentionShared);
-  const auto status = cudaFuncSetAttribute(
-      paged_attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      shared_bytes);
-  if (status != cudaSuccess)
-    throw std::runtime_error(cudaGetErrorString(status));
-  paged_attention_kernel<<<dim3((max_query + 63) / 64, heads, sequences), 256,
-                           shared_bytes, stream>>>(
-      static_cast<const bf16 *>(query), cache, table, offsets, lengths,
-      static_cast<bf16 *>(out), heads, kv_heads, block_size, table_stride, qt,
-      qh, cb, ch, ct, ot, oh, scale);
+  if (int4) {
+    const auto status = cudaFuncSetAttribute(
+        paged_attention_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shared_bytes);
+    if (status != cudaSuccess)
+      throw std::runtime_error(cudaGetErrorString(status));
+    paged_attention_kernel<true><<<dim3((max_query + 63) / 64, heads, sequences),
+                                   256, shared_bytes, stream>>>(
+        static_cast<const bf16 *>(query), cache, table, offsets, lengths,
+        static_cast<bf16 *>(out), heads, kv_heads, block_size, table_stride, qt,
+        qh, cb, ch, ct, ot, oh, scale);
+  } else {
+    const auto status = cudaFuncSetAttribute(
+        paged_attention_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shared_bytes);
+    if (status != cudaSuccess)
+      throw std::runtime_error(cudaGetErrorString(status));
+    paged_attention_kernel<false><<<dim3((max_query + 63) / 64, heads, sequences),
+                                    256, shared_bytes, stream>>>(
+        static_cast<const bf16 *>(query), cache, table, offsets, lengths,
+        static_cast<bf16 *>(out), heads, kv_heads, block_size, table_stride, qt,
+        qh, cb, ch, ct, ot, oh, scale);
+  }
 }

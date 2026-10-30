@@ -438,9 +438,11 @@ void boxed_kv_cache_update(StableIValue* stack, uint64_t, uint64_t) {
   STD_TORCH_CHECK(value.sizes() == key.sizes() && slots.dim() == 1 &&
       slots.size(0) == key.size(0), "Key, value and slot shapes must match");
   STD_TORCH_CHECK(cache.is_cuda() && cache.get_device_index() == device &&
-      cache.scalar_type() == ScalarType::Char && cache.dim() == 4 &&
-      cache.size(1) == key.size(1) && cache.size(3) == 520 && cache.stride(3) == 1 &&
-      cache.size(0) > 0 && cache.size(2) > 0, "Expected packed INT8 cache [blocks,H,block_size,520]");
+      (cache.scalar_type() == ScalarType::Char || cache.scalar_type() == ScalarType::Byte) &&
+      cache.dim() == 4 &&
+      cache.size(1) == key.size(1) &&
+      (cache.size(3) == 520 || cache.size(3) == 264) && cache.stride(3) == 1 &&
+      cache.size(0) > 0 && cache.size(2) > 0, "Expected packed INT8/INT4 cache [blocks,H,block_size,520|264]");
   STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(cache.data_ptr()) % 4 == 0 &&
       cache.stride(0) % 4 == 0 && cache.stride(1) % 4 == 0 && cache.stride(2) % 4 == 0,
       "Cache scales require four-byte alignment");
@@ -451,7 +453,8 @@ void boxed_kv_cache_update(StableIValue* stack, uint64_t, uint64_t) {
   kv_cache_update(key.data_ptr(), value.data_ptr(), static_cast<int8_t*>(cache.data_ptr()),
       static_cast<int64_t*>(slots.data_ptr()), key.size(0), key.size(1), cache.size(0),
       cache.size(2), key.stride(0), key.stride(1), value.stride(0), value.stride(1),
-      cache.stride(0), cache.stride(1), cache.stride(2), stream_for(device));
+      cache.stride(0), cache.stride(1), cache.stride(2), stream_for(device),
+      cache.size(3) == 264);
   launch_check();
 }
 void boxed_gdn_prefill(StableIValue* stack, uint64_t, uint64_t) {
@@ -501,13 +504,14 @@ void boxed_unpack_kv_cache(StableIValue* stack, uint64_t, uint64_t) {
   check(key, ScalarType::BFloat16, device);
   check(value, ScalarType::BFloat16, device);
   check(lengths, ScalarType::Int, device);
-  STD_TORCH_CHECK(cache.is_cuda() && cache.scalar_type() == ScalarType::Char &&
+  STD_TORCH_CHECK(cache.is_cuda() &&
+      (cache.scalar_type() == ScalarType::Char || cache.scalar_type() == ScalarType::Byte) &&
       cache.dim() == 4 && cache.size(0) > 0 &&
       (cache.size(1) == 2 || cache.size(1) == 4) && cache.size(2) > 0 &&
-      cache.size(3) == 520 && cache.stride(3) == 1 &&
+      (cache.size(3) == 520 || cache.size(3) == 264) && cache.stride(3) == 1 &&
       cache.stride(0) % 4 == 0 && cache.stride(1) % 4 == 0 && cache.stride(2) % 4 == 0 &&
       reinterpret_cast<uintptr_t>(cache.data_ptr()) % 4 == 0,
-      "Expected aligned packed INT8 [pages,Hkv,block_size,520] cache");
+      "Expected aligned packed INT8/INT4 [pages,Hkv,block_size,520|264] cache");
   STD_TORCH_CHECK(lengths.dim() == 1 && lengths.size(0) > 0 && lengths.size(0) <= 65535 &&
       table.is_cuda() && table.get_device_index() == device &&
       table.scalar_type() == ScalarType::Int && table.dim() == 2 &&
@@ -523,7 +527,7 @@ void boxed_unpack_kv_cache(StableIValue* stack, uint64_t, uint64_t) {
       static_cast<int32_t*>(table.data_ptr()), static_cast<int32_t*>(lengths.data_ptr()),
       key.data_ptr(), value.data_ptr(), cache.size(1), key.size(1), lengths.size(0),
       cache.size(2), table.stride(0), cache.stride(0), cache.stride(1), cache.stride(2),
-      stream_for(device));
+      stream_for(device), cache.size(3) == 264);
   launch_check();
 }
 template <bool Decode>
@@ -544,12 +548,13 @@ void boxed_paged_attention(StableIValue* stack, uint64_t, uint64_t) {
       (q.size(1) == 12 || q.size(1) == 24) && max_query > 0 && max_query <= q.size(0),
       "Unsupported Qwen query geometry");
   STD_TORCH_CHECK(cache.is_cuda() && cache.get_device_index() == device &&
-      cache.scalar_type() == ScalarType::Char && cache.dim() == 4 &&
+      (cache.scalar_type() == ScalarType::Char || cache.scalar_type() == ScalarType::Byte) &&
+      cache.dim() == 4 &&
       cache.size(0) > 0 && cache.size(1) * 6 == q.size(1) && cache.size(2) > 0 &&
-      cache.size(3) == 520 && cache.stride(3) == 1 &&
+      (cache.size(3) == 520 || cache.size(3) == 264) && cache.stride(3) == 1 &&
       cache.stride(0) % 4 == 0 && cache.stride(1) % 4 == 0 && cache.stride(2) % 4 == 0 &&
       reinterpret_cast<uintptr_t>(cache.data_ptr()) % 4 == 0,
-      "Expected aligned packed INT8 [pages,Hkv,block_size,520] cache");
+      "Expected aligned packed INT8/INT4 [pages,Hkv,block_size,520|264] cache");
   check(offsets, ScalarType::Int, device);
   check(lengths, ScalarType::Int, device);
   STD_TORCH_CHECK(table.is_cuda() && table.get_device_index() == device &&
@@ -558,6 +563,7 @@ void boxed_paged_attention(StableIValue* stack, uint64_t, uint64_t) {
       table.size(0) == lengths.size(0) && table.size(1) > 0 &&
       offsets.size(0) == lengths.size(0) + 1, "Invalid page/sequence metadata");
   torch::stable::accelerator::DeviceGuard guard(device);
+  const bool int4 = cache.size(3) == 264;
   if constexpr (Decode) {
     auto scratch = to<Tensor>(stack[8]);
     check(scratch, ScalarType::Float, device);
@@ -571,14 +577,14 @@ void boxed_paged_attention(StableIValue* stack, uint64_t, uint64_t) {
         static_cast<int32_t*>(lengths.data_ptr()), out.data_ptr(), static_cast<float*>(scratch.data_ptr()),
         q.size(0), q.size(1), cache.size(1), scratch.size(2), cache.size(2), table.stride(0),
         lengths.size(0), max_query, q.stride(0), q.stride(1), cache.stride(0), cache.stride(1),
-        cache.stride(2), out.stride(0), out.stride(1), scale, stream_for(device));
+        cache.stride(2), out.stride(0), out.stride(1), scale, stream_for(device), int4);
   } else {
   paged_attention(q.data_ptr(), static_cast<int8_t*>(cache.data_ptr()),
       static_cast<int32_t*>(table.data_ptr()), static_cast<int32_t*>(offsets.data_ptr()),
       static_cast<int32_t*>(lengths.data_ptr()), out.data_ptr(),
       q.size(1), cache.size(1), cache.size(2), table.stride(0), lengths.size(0), max_query,
       q.stride(0), q.stride(1), cache.stride(0), cache.stride(1), cache.stride(2),
-      out.stride(0), out.stride(1), scale, stream_for(device));
+      out.stride(0), out.stride(1), scale, stream_for(device), int4);
   }
   launch_check();
 }

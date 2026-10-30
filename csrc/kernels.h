@@ -30,13 +30,15 @@ void fused_channel_mm(const int8_t* a, const int8_t* w, const float* sa,
 void unpack_kv_cache(const int8_t* cache, const int32_t* table,
     const int32_t* lengths, void* key, void* value, int heads, int capacity,
     int sequences, int block_size, int table_stride,
-    int64_t cb, int64_t ch, int64_t ct, cudaStream_t stream);
+    int64_t cb, int64_t ch, int64_t ct, cudaStream_t stream,
+    bool int4 = false);
 
 void paged_attention(const void* query, const int8_t* cache,
     const int32_t* table, const int32_t* offsets, const int32_t* lengths, void* out,
     int heads, int kv_heads, int block_size, int table_stride, int sequences, int max_query,
     int64_t qt, int64_t qh, int64_t cb, int64_t ch, int64_t ct,
-    int64_t ot, int64_t oh, float scale, cudaStream_t stream);
+    int64_t ot, int64_t oh, float scale, cudaStream_t stream,
+    bool int4 = false);
 
 cudaError_t gdn_prefill(const void* q, const void* k, const void* v,
     const float* g, const float* beta, const float* initial, float* final,
@@ -66,7 +68,8 @@ void kv_cache_update(const void* key, const void* value, int8_t* cache,
                       int block_size, int64_t key_token_stride, int64_t key_head_stride,
                       int64_t value_token_stride, int64_t value_head_stride,
                       int64_t cache_block_stride, int64_t cache_head_stride,
-                      int64_t cache_token_stride, cudaStream_t stream);
+                      int64_t cache_token_stride, cudaStream_t stream,
+                      bool int4 = false);
 
 void gdn_packed_decode(const void* qkv, const void* a, const void* b,
     const float* A_log, const void* dt_bias, float* state, const void* slots,
@@ -79,4 +82,4 @@ void paged_decode(const void* query, const int8_t* cache, const int32_t* table,
     int tokens, int heads, int kv_heads, int parts, int block_size,
     int table_stride, int sequences, int max_query, int64_t qt, int64_t qh,
     int64_t cb, int64_t ch, int64_t ct, int64_t ot, int64_t oh, float scale,
-    cudaStream_t stream);
+    cudaStream_t stream, bool int4 = false);

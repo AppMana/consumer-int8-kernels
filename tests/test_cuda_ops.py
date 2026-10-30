@@ -637,6 +637,102 @@ def test_cache_writer_matches_per_head_encoding_and_preserves_padding(layout, he
                 assert (cache[block, :, offset] == 55).all()
 
 
+@pytest.mark.parametrize("layout", ["HND", "NHD"])
+@pytest.mark.parametrize("heads", [2, 4])
+@pytest.mark.parametrize("decode", [False, True])
+def test_int4_cache_unpack_and_paged_attention(layout, heads, decode):
+    torch.manual_seed(911)
+    query_lens, seq_lens = ([1, 2], [97, 255]) if decode else ([33, 65], [97, 255])
+    tokens, block_size = sum(query_lens), 32
+    pages_per_seq = (max(seq_lens) + block_size - 1) // block_size
+    blocks = len(seq_lens) * pages_per_seq
+    shape = (blocks, heads, block_size, 264)
+    cache = torch.empty(
+        shape if layout == "HND" else (blocks, block_size, heads, 264),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    if layout == "NHD":
+        cache = cache.transpose(1, 2)
+    key = torch.randn(
+        blocks * block_size, heads, 256, device="cuda", dtype=torch.bfloat16
+    )
+    value = torch.randn_like(key)
+    ops.kv_cache_update(key, value, cache, torch.arange(key.shape[0], device="cuda"))
+    table = torch.randperm(blocks, device="cuda", dtype=torch.int32).reshape(
+        len(seq_lens), -1
+    )
+    offsets = torch.tensor(
+        [0, *torch.tensor(query_lens).cumsum(0).tolist()],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    lengths = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
+    capacity = max(seq_lens)
+    unpacked_k = torch.empty(
+        (len(seq_lens), capacity, heads, 256), device="cuda", dtype=torch.bfloat16
+    )
+    unpacked_v = torch.empty_like(unpacked_k)
+    ops.unpack_kv_cache(cache, table, lengths, unpacked_k, unpacked_v)
+
+    query = torch.randn(tokens, heads * 12, 256, device="cuda", dtype=torch.bfloat16)[
+        :, : heads * 6
+    ]
+    out = torch.empty_like(query)
+    scratch = torch.empty((tokens, heads * 6, 32, 258), device="cuda")
+    if decode:
+        ops.paged_decode(
+            query, cache, table, offsets, lengths, out, max(query_lens), 1 / 16, scratch
+        )
+    else:
+        ops.paged_attention(
+            query, cache, table, offsets, lengths, out, max(query_lens), 1 / 16
+        )
+
+    expected = torch.empty_like(query, dtype=torch.float64)
+    start = 0
+    for seq, (count, length) in enumerate(zip(query_lens, seq_lens, strict=True)):
+        packed = (
+            cache[table[seq].long()].transpose(1, 2).reshape(-1, heads, 264)[:length]
+        )
+        k_bytes = packed[..., :128]
+        ks_bits = packed[..., 128:132].contiguous().view(torch.int32)
+        kzp = (ks_bits & 0xF).double()
+        ks = (ks_bits & ~0xF).view(torch.float32).double()
+        k_codes = torch.stack([k_bytes & 0xF, (k_bytes >> 4) & 0xF], dim=-1).reshape(
+            length, heads, 256
+        )
+        k_seq = (k_codes.double() - kzp) * ks
+        torch.testing.assert_close(
+            unpacked_k[seq, :length], k_seq.bfloat16(), atol=0, rtol=0
+        )
+
+        v_bytes = packed[..., 132:260]
+        vs_bits = packed[..., 260:264].contiguous().view(torch.int32)
+        vzp = (vs_bits & 0xF).double()
+        vs = (vs_bits & ~0xF).view(torch.float32).double()
+        v_codes = torch.stack([v_bytes & 0xF, (v_bytes >> 4) & 0xF], dim=-1).reshape(
+            length, heads, 256
+        )
+        v_seq = (v_codes.double() - vzp) * vs
+        torch.testing.assert_close(
+            unpacked_v[seq, :length], v_seq.bfloat16(), atol=0, rtol=0
+        )
+
+        causal = torch.arange(length, device="cuda")[None] <= (
+            length - count + torch.arange(count, device="cuda")[:, None]
+        )
+        for head in range(heads):
+            q_seq = query[start : start + count, head * 6 : (head + 1) * 6].double()
+            score = torch.einsum("qhd,nd->qhn", q_seq, k_seq[:, head]) / 16
+            score.masked_fill_(~causal[:, None], -torch.inf)
+            expected[start : start + count, head * 6 : (head + 1) * 6] = torch.einsum(
+                "qhn,nd->qhd", score.softmax(-1), v_seq[:, head]
+            )
+        start += count
+    torch.testing.assert_close(out, expected.bfloat16(), atol=0.002, rtol=0.008)
+
+
 @pytest.mark.parametrize("heads,layout", [(2, "HND"), (4, "NHD")])
 def test_unpack_kv_cache_preserves_scales_pages_and_graph_updates(heads, layout):
     """FlashAttention's BF16 scratch pages must reflect current device metadata."""
